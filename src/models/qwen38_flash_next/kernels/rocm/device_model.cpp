@@ -26,6 +26,8 @@ struct Conversion {
   void* source;
   void* destination;
   std::size_t count;
+  std::size_t source_bytes;
+  bool bf16_source;
 };
 
 /// The trunk and the optional MTP block as one traversal's output.
@@ -153,10 +155,12 @@ struct Uploader {
   }
 
   /// Uploads matrices of one type stacked along rows; every input shares
-  /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
-  /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
-  /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV.
+  /// `cols`. An F32 stack (router logits, GDN alpha/beta) is narrowed to
+  /// F16, which the wide-batch GEMM tier runs at speed; a BF16 stack
+  /// (GSQ-RCO stores those projections as BF16) rounds to F16 the same
+  /// way, exact for every in-range BF16 value, so both take the GEMM tier
+  /// whose per-row K reduction does not depend on the batch shape. A Q8_0
+  /// stack merges projections of one input into a single decode GEMV.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -167,8 +171,8 @@ struct Uploader {
     const core::GgmlType type = (*parts.begin())->type;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kBF16)) {
+        Fail("stacked upload needs F32 or BF16 tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -205,7 +209,9 @@ struct Uploader {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
       return d;
     }
-    const std::size_t count = size / sizeof(float);
+    const bool bf16_source = type == core::GgmlType::kBF16;
+    const std::size_t count =
+        bf16_source ? size / sizeof(std::uint16_t) : size / sizeof(float);
     void* half = nullptr;
     if (Allocate(&half, count * sizeof(std::uint16_t) + kTailMargin) !=
         hipSuccess) {
@@ -217,9 +223,10 @@ struct Uploader {
     }
     allocations.push_back(half);
     bytes += count * sizeof(std::uint16_t) + kTailMargin;
-    // Keep the small F32 stacks until the disk pipeline drains. Converting
-    // each router immediately would serialize every layer's uploads.
-    conversions.push_back({ptr, half, count});
+    // Keep the small F32/BF16 stacks until the disk pipeline drains.
+    // Converting each router immediately would serialize every layer's
+    // uploads.
+    conversions.push_back({ptr, half, count, size, bf16_source});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
                          kTailMargin, nullptr);
     d.data = half;
@@ -357,8 +364,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
+  // Dense projections (including the LM head) take Q6_K through the adapter,
+  // and the routed adapter has Q6_K MMVQ/MMQ/gated cases. Rejecting token_embd
+  // and routed experts here is deliberate: no supported mix stores Q6_K in
+  // those roles, and their expert paths are untested. Reject before
+  // allocating device weights.
   const auto supported = [&](const TensorRef& t) {
     if (t.type != core::GgmlType::kQ6_K)
       return true;
@@ -370,7 +380,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
            supported(l.ffn_down_exps);
   };
-  if (!supported(w.token_embd) || !supported(w.output) ||
+  if (!supported(w.token_embd) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;
@@ -427,8 +437,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   m->mtp_ = uploaded.mtp;
   m->has_mtp_ = mtp != nullptr;
   for (const auto& c : conversions) {
-    NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
-                      c.count, nullptr);
+    if (c.bf16_source) {
+      NarrowBf16Weights(c.source, c.destination, c.count, nullptr);
+    } else {
+      NarrowActivations(static_cast<const float*>(c.source), c.destination,
+                        false, c.count, nullptr);
+    }
   }
   const auto status = hipDeviceSynchronize();
   if (status != hipSuccess) {
@@ -441,7 +455,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   for (const auto& c : conversions) {
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
-    m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+    m->bytes_ -= c.source_bytes + kTailMargin;
   }
   return m;
 }

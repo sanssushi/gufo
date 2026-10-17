@@ -181,6 +181,12 @@ bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream);
 
+/// Converts `count` BF16 rows to F16, exact for every BF16 value in F16's
+/// range. Staged weight rows take the F16 GEMM tier, whose per-row K
+/// reduction does not depend on the batch shape.
+void NarrowBf16Weights(const void* x, void* out, std::size_t count,
+                       hipStream_t stream);
+
 /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
 /// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
 /// bytes, padded to the GEMM's 128-token macro tile), then an int8 WMMA
