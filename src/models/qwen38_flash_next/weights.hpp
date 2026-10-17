@@ -24,6 +24,14 @@ struct MtpTrace {
   std::span<float> head;
   std::span<float> ffn_input;
   std::span<float> ffn_output;
+  std::span<float> ffn_gate;
+  std::span<float> ffn_shared;
+  // Inputs to the FFN HC combine (the MoE epilogue's operands).
+  std::span<float> moe_router;
+  std::span<float> moe_ids;
+  std::span<float> moe_weights;
+  std::span<float> moe_shared;
+  std::span<float> moe_inject;
   [[nodiscard]] bool Valid(std::size_t H, std::size_t D) const noexcept {
     for (const auto row : {normalized_hidden, fused, attention, hidden})
       if (!row.empty() && row.size() != D)
