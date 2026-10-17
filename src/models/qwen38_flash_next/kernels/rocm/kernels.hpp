@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
@@ -37,6 +38,7 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
                      hipStream_t stream);
 
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
+/// Values mirror core::GgmlType and the adapter's ggml_type; keep in sync.
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
@@ -44,7 +46,16 @@ enum class WeightType : std::uint32_t {
   kQ8_0 = 8,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
+  kIQ2_XXS = 16,
+  kIQ2_XS = 17,
+  kIQ3_XXS = 18,
+  kIQ4_NL = 20,
+  kIQ3_S = 21,
+  kIQ2_S = 22,
+  kIQ4_XS = 23,
   kBF16 = 30,
+  kQ2_0 = 42,
 };
 
 /// res[t][s][hidden] = table[tokens[t]] for every stream s (Q8_0 rows).
@@ -146,6 +157,16 @@ bool HcCombineMoeF16(
     std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
     const float* prior_out = nullptr, const float* prior_w = nullptr,
     float* inject_out = nullptr, const float* inject_w = nullptr);
+/// HcCombineMoeF16 over F32 expert rows (the quantized mixes' MMQ down
+/// projection): the block output is MoeEpilogueVec4's result, formed in
+/// registers and never written.
+bool HcCombineMoeF32(float* res, const float* expert_out, const float* weights,
+                     const float* shared_out, const float* gate,
+                     std::uint32_t gate_stride, std::uint32_t used,
+                     const float* inject, std::uint32_t inject_parts,
+                     const float* gamma, __half* xn, void* xn_q8,
+                     std::uint32_t n_tokens, std::uint32_t hidden,
+                     std::uint32_t streams, float eps, hipStream_t stream);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
@@ -281,9 +302,7 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
-/// or 64 for Q5_1/Q8_0.
-/// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
-/// and tile widths return false.
+/// or 64 for every format but Q4_K/Q5_K.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,
@@ -291,12 +310,18 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
-/// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
-/// routing layout as RoutedF16Gemm, with 128 token rows per tile. The two
+/// True when the compacted routed F16 WMMA route runs `type` matrices whose
+/// rows hold `k` elements (whole quant blocks and a whole two-block K stage).
+/// This is the canonical format set of RoutedF16Gemm/RoutedGatedF16Gemm.
+bool RoutedF16Type(core::GgmlType type, std::size_t k);
+
+/// Paired gate/up GEMM with SwiGLU and F16 output. Uses the same routing
+/// layout as RoutedF16Gemm, with 64 or 128 token rows per tile. The two
 /// projections share one launch and never materialize the gate output.
 bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const __half* x, const std::int32_t* tiles,
-                        std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+                        std::uint32_t n_tiles, std::uint32_t tile_rows,
+                        const std::int32_t* pad_bounds,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream);

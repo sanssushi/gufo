@@ -306,6 +306,38 @@ int main() {
         }
       }
     }
+    // The MMQ down projection writes F32 expert rows; its fused combine
+    // must reproduce MoeEpilogueVec4 + HcCombine byte for byte as well.
+    HipBuffer<float> d_res_f32(kResidual);
+    HipBuffer<float> d_res_f32_norm(kResidual);
+    Upload(&d_res_f32, residual);
+    Upload(&d_res_f32_norm, residual);
+    for (bool normalize : {true, false}) {
+      if (!q::HcCombineMoeF32(
+              normalize ? d_res_f32_norm.get() : d_res_f32.get(),
+              d_expert.get(), d_weights.get(), d_shared.get(), d_gate.get(),
+              kGateStride, kSlots, d_inject.get(), parts,
+              normalize ? d_gamma.get() : nullptr,
+              normalize ? d_norm.get() : nullptr,
+              normalize ? d_q8.get() : nullptr, kTokens, kHidden, 4, 1e-6F,
+              nullptr)) {
+        throw std::runtime_error("fused F32 MoE residual rejected");
+      }
+    }
+    if (Download(&d_res_f32_norm, kResidual) !=
+        Download(&d_res_f32, kResidual)) {
+      throw std::runtime_error("norm pass changed the F32 fused residual");
+    }
+    Upload(&d_res_separate, residual);
+    q::MoeEpilogueVec4(d_expert.get(), d_weights.get(), d_shared.get(),
+                       d_gate.get(), kGateStride, d_vec.get(), kTokens, kSlots,
+                       kHidden, nullptr);
+    q::HcCombine(d_res_separate.get(), d_vec.get(), d_inject.get(), parts,
+                 nullptr, nullptr, kTokens, kHidden, 4, 1e-6F, nullptr);
+    if (Download(&d_res_separate, kResidual) !=
+        Download(&d_res_f32, kResidual)) {
+      throw std::runtime_error("fusing the F32 combine changed it");
+    }
     return worst == 0.0 ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

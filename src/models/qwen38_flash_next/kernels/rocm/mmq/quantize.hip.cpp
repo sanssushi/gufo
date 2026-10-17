@@ -115,9 +115,17 @@ static __global__ void quantize_q8_1_by_expert(
     y[ib].ds = make_half2(d, d*sumq);
 }
 
+// qwen38 local: x * sigmoid(x) * up, matching gufo's SiluF/SwigluKernel
+// exactly so a SwiGLU formed here leaves the same codes as the separate
+// activation pass feeding the plain quantize.
+static __device__ __forceinline__ float silu_mul(const float x, const float u) {
+    return (x * (1.0f / (1.0f + __expf(-x)))) * u;
+}
+
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const float * __restrict__ x, const float * __restrict__ x_up,
+        const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2) {
 
@@ -148,7 +156,13 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 xv = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = xv;
+    if (x_up && i0 < ne00) {
+        const float4 u = ((const float4 *) x_up)[(i03*s03 + i02*s02 + i01*s01 + i00)/4];
+        xi = make_float4(silu_mul(xv.x, u.x), silu_mul(xv.y, u.y),
+                         silu_mul(xv.z, u.z), silu_mul(xv.w, u.w));
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -241,7 +255,7 @@ void quantize_row_q8_1_by_expert_hip(
 }
 
 void quantize_mmq_q8_1_hip(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const float * x, const float * x_up, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, hipStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
@@ -254,15 +268,15 @@ void quantize_mmq_q8_1_hip(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, x_up, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, x_up, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, x_up, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         default:
             GGML_ABORT("fatal error");

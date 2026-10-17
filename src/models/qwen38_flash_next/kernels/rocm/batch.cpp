@@ -122,6 +122,7 @@ void Executor::UseScratch(const Scratch& scratch) const {
   half_src_ = nullptr;
   xn_half_ = false;
   moe_pending_ = false;
+  moe_f32_rows_ = false;
 }
 
 bool Executor::AllocateBatch(std::string* error) const {
