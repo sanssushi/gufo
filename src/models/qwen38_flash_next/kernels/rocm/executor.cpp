@@ -1222,10 +1222,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   // The wide mixer route (F16 norm for the epilogue, tiled Q8 norm for the
   // W8A8 down projection) needs the four-stream geometry, 32-wide blocks and
-  // a Q8_0 down projection.
+  // a Q8_0 or BF16 down projection (the GSQ mixes).
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
-                   model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+                   (model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0 ||
+                    model.layers()[0].hc_ffn.down.type == GgmlType::kBF16);
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -2159,25 +2160,66 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   }
   const bool extras = n_tokens <= options_.max_batch &&
                       c.hidden_size <= model_->max_half_cols();
+  // The mixed row's tiled Q8 copy needs the Q8 staging buffer to cover
+  // K = hidden; a mix without Q8_0 matrices does not size it.
+  const bool q8t_copy = extras && c.hidden_size <= model_->max_q8_cols();
+  const bool down_half =
+      m.down.type == GgmlType::kBF16 || m.down.type == GgmlType::kF16;
   const bool fused_projection =
       xn_half_ && n_tokens >= 96 && extras && c.hc_count == 4 &&
       c.hidden_size == 2560 && c.hc_low_rank == 320 &&
-      m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
-      m.up.cols == c.hc_low_rank;
+      (m.down.type == GgmlType::kQ8_0 || down_half) &&
+      (m.up.type == GgmlType::kQ8_0 || m.up.type == GgmlType::kBF16) &&
+      m.up.rows == c.HcDim() && m.up.cols == c.hc_low_rank;
+  const WeightType half_type =
+      m.down.type == GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kF16;
   if (fused_projection) {
     // The up projection writes x_half; keep its input in the gate buffer.
-    if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
-                       reinterpret_cast<__half*>(s_.hc_gate), n_tokens,
-                       stream_)) {
-      AssignError(error_msg, "fused HC down projection failed");
-      return false;
+    if (m.down.type == GgmlType::kQ8_0) {
+      if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
+                         reinterpret_cast<__half*>(s_.hc_gate), n_tokens,
+                         stream_)) {
+        AssignError(error_msg, "fused HC down projection failed");
+        return false;
+      }
+    } else {
+      // The BF16/F16 down reads the F16 norm; its SiLU'd rank rows reach
+      // the gate buffer as F16 like the Q8_0 fused projection's.
+      if (!UnquantizedF16Gemm(
+              m.down.data, static_cast<const __half*>(s_.xn_half), s_.lo,
+              n_tokens, m.down.rows, m.down.cols, stream_, half_type)) {
+        AssignError(error_msg, "fused HC down projection failed");
+        return false;
+      }
+      SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
+                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      NarrowActivations(s_.lo, s_.hc_gate, false,
+                        static_cast<std::size_t>(n_tokens) * c.hc_low_rank,
+                        stream_);
     }
   } else {
     if (xn_half_) {
-      if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
-                    m.down.cols, stream_)) {
-        AssignError(error_msg, "W8A8 mixer down projection failed");
-        return false;
+      if (m.down.type == GgmlType::kQ8_0) {
+        if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
+                      m.down.cols, stream_)) {
+          AssignError(error_msg, "W8A8 mixer down projection failed");
+          return false;
+        }
+      } else if (down_half) {
+        if (!UnquantizedF16Gemm(
+                m.down.data, static_cast<const __half*>(s_.xn_half), s_.lo,
+                n_tokens, m.down.rows, m.down.cols, stream_, half_type)) {
+          AssignError(error_msg, "mixer down projection failed");
+          return false;
+        }
+      } else {
+        // An F32 down needs the norm in F32; the wide combine only staged
+        // F16, so norm again.
+        RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
+                    c.rms_eps, stream_);
+        if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
+          return false;
+        }
       }
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
@@ -2202,12 +2244,15 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     }
   }
   const bool fused_inject =
-      inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
+      inject != nullptr && !m.inject.empty() &&
+      (m.inject.type == GgmlType::kF32 || m.inject.type == GgmlType::kBF16);
   // The previous combine already wrote these partials from the same norm.
   const bool inject_done = fused_inject && inject == s_.inject &&
                            inject_fused_ != nullptr &&
                            inject_fused_ == m.inject.f32();
   inject_fused_ = nullptr;
+  const WeightType inject_type =
+      m.inject.type == GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kF32;
   // A separate inject projection can overwrite the cached half input. Keep
   // the full mixed row available for the following projection in that case.
   half_only =
@@ -2223,45 +2268,48 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   half_src_ = nullptr;
   if (xn_half_) {
     if (fused_projection) {
+      const WeightType up_type =
+          m.up.type == GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kQ8_0;
       if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
                         s_.xn_half,
-                        fused_inject && !inject_done ? m.inject.f32() : nullptr,
+                        fused_inject && !inject_done ? m.inject.data : nullptr,
                         half_only || no_f32 ? nullptr : mixed,
                         static_cast<__half*>(s_.x_half),
-                        half_only ? nullptr : s_.x_q8t, inject, n_tokens,
-                        c.hidden_size, c.hc_low_rank, stream_)) {
+                        half_only || !q8t_copy ? nullptr : s_.x_q8t, inject,
+                        n_tokens, c.hidden_size, c.hc_low_rank, stream_,
+                        up_type, inject_type)) {
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
     } else {
       HcMixEpilogueVec4F16(s_.xn_half, s_.hc_gate,
-                           fused_inject ? m.inject.f32() : nullptr, mixed,
+                           fused_inject ? m.inject.data : nullptr, mixed,
                            extras ? static_cast<__half*>(s_.x_half) : nullptr,
-                           extras ? s_.x_q8t : nullptr, inject, n_tokens,
-                           c.hidden_size, stream_);
+                           q8t_copy ? s_.x_q8t : nullptr, inject, n_tokens,
+                           c.hidden_size, stream_, inject_type);
     }
     if (extras) {
       half_src_ = mixed;
       half_rows_ = n_tokens;
       half_cols_ = c.hidden_size;
       half_bf16_ = false;
-      if (!half_only || !fused_projection) {
+      if (q8t_copy && (!half_only || !fused_projection)) {
         q8t_src_ = mixed;
         q8t_rows_ = n_tokens;
         q8t_cols_ = c.hidden_size;
       }
     }
   } else if (vectorized) {
-    HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
+    HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.data : nullptr,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
-                      stream_);
+                      stream_, inject_type);
   } else {
     // A decode batch's projections of `mixed` share its Q8_1 rows, which
     // the epilogue writes as it stores them.
     const bool q8 = !MatrixRows(n_tokens) && UnpaddedQ8(c.hidden_size);
-    HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_,
-                  q8 ? s_.mixed_q8_1 : nullptr);
+    HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.data : nullptr, mixed,
+                  inject, n_tokens, c.hidden_size, c.hc_count, stream_,
+                  q8 ? s_.mixed_q8_1 : nullptr, inject_type);
     if (q8) {
       mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
     }
