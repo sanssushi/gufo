@@ -163,8 +163,11 @@ struct Uploader {
   /// F16, which the wide-batch GEMM tier runs at speed; a BF16 stack
   /// (GSQ-RCO stores those projections as BF16) rounds to F16 the same
   /// way, exact for every in-range BF16 value, so both take the GEMM tier
-  /// whose per-row K reduction does not depend on the batch shape. A Q8_0
-  /// stack merges projections of one input into a single decode GEMV.
+  /// whose per-row K reduction does not depend on the batch shape. A
+  /// quantized stack (Q8_0, or the GSQ-RCO dense formats, which store
+  /// attention and SSM tensors per tensor so only same-type groups stack)
+  /// merges projections of one input into one GEMM; the executor's dense
+  /// set gates the formats it can dispatch.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -173,10 +176,13 @@ struct Uploader {
     std::size_t rows = 0;
     std::size_t size = 0;
     const core::GgmlType type = (*parts.begin())->type;
+    const bool quantized = qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kBF16)) {
-        Fail("stacked upload needs F32 or BF16 tensors of one shape");
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kBF16 &&
+           !quantized)) {
+        Fail(
+            "stacked upload needs F32, BF16 or quantized tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -200,7 +206,7 @@ struct Uploader {
         offset += t->SizeBytes();
       }
     }
-    if (type == core::GgmlType::kQ8_0) {
+    if (quantized) {
       if (Measuring()) {
         return d;
       }
@@ -210,7 +216,13 @@ struct Uploader {
       d.type = type;
       d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
       d.rows = static_cast<std::uint32_t>(rows);
-      max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      if (type == core::GgmlType::kQ8_0) {
+        max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      } else if (KQuantWmmaType(type)) {
+        // The K-quant stacks run the dense F16-tile WMMA GEMM, whose F16
+        // activation rows this column count must size.
+        max_half_cols = std::max<std::size_t>(max_half_cols, d.cols);
+      }
       return d;
     }
     const bool bf16_source = type == core::GgmlType::kBF16;
@@ -250,12 +262,17 @@ struct Uploader {
     d.linear = l.linear;
     d.hc_attn = Mixer(l.hc_attn);
     d.hc_ffn = Mixer(l.hc_ffn);
-    // Projections of one input are stacked into one Q8_0 GEMV where the
-    // quantization allows; otherwise they stay separate.
+    // Projections of one input are stacked into one GEMM where the
+    // quantization allows: Q8_0 (the unsloth control) and the GSQ-RCO dense
+    // formats, which store attention and SSM projections per tensor, so
+    // only same-type groups stack. Others stay separate.
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
+      const core::GgmlType type = (*parts.begin())->type;
+      const bool quantized =
+          qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
-            t->cols != (*parts.begin())->cols) {
+        if (t->empty() || t->type != type ||
+            t->cols != (*parts.begin())->cols || !quantized) {
           return false;
         }
       }

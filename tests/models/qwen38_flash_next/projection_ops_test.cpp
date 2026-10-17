@@ -1450,6 +1450,123 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
       CheckHip(hipFree(p), "chunk exact free");
 }
 
+/// A stacked upload (device_model Stack) merges same-type projections of
+/// one input into one weight matrix whose rows are the concatenated parts:
+/// the attention stack is [q|gate; k; v] and the SSM stack [qkv; gate].
+/// Every tier must produce each output row from its own weight row alone --
+/// the K order is per row -- so the stacked GEMM writes the same rows as
+/// the separate projections it merges, and a sliced call over one part of
+/// the stack (the MTP catch-up route) matches both.
+void CheckDenseStackExact(q::WeightType type,
+                          const std::vector<std::size_t>& parts, std::size_t k,
+                          std::size_t n_tokens, std::uint32_t seed) {
+  std::size_t stacked = 0;
+  std::vector<DenseWeights> w;
+  for (std::size_t m : parts) {
+    stacked += m;
+    w.push_back(MakeQuant(type, m, k, seed++));
+  }
+  std::vector<float> x(n_tokens * k);
+  std::uint32_t state = seed ^ 0x5A5A5A5AU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  const std::size_t bytes = QuantBlockBytes(type);
+  const std::size_t elements = QuantBlockElements(type);
+  std::vector<std::uint8_t> packed;
+  for (const DenseWeights& part : w) {
+    packed.insert(packed.end(), part.packed.begin(), part.packed.end());
+  }
+  constexpr std::size_t tail = 4096;
+  packed.resize(packed.size() + tail, 0);
+  const bool wmma = q::KQuantWmmaType(
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)));
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_stacked = nullptr;
+  float* d_part = nullptr;
+  std::uint16_t* d_half = nullptr;
+  CheckHip(hipMalloc(&d_w, packed.size()), "stack exact weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "stack exact input");
+  CheckHip(hipMalloc(&d_stacked, n_tokens * stacked * 4),
+           "stack exact stacked output");
+  CheckHip(hipMalloc(&d_part, n_tokens * stacked * 4), "stack exact part");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_half, n_tokens * k * sizeof(__half)),
+             "stack exact F16 input");
+  }
+  CheckHip(hipMemcpy(d_w, packed.data(), packed.size(), hipMemcpyHostToDevice),
+           "stack exact weights upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "stack exact input upload");
+  if (wmma) {
+    q::NarrowActivations(d_x, d_half, false, n_tokens * k, nullptr);
+  }
+  const char* tier = "";
+  const auto check_tier = [&](const char* name, auto&& gemm) {
+    tier = name;
+    gemm(d_w, stacked, d_stacked);
+    const auto full = Download(d_stacked, n_tokens * stacked);
+    std::size_t base = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const std::size_t m = parts[i];
+      gemm(d_w + base * (k / elements) * bytes, m, d_part);
+      CheckHip(hipDeviceSynchronize(), "stack exact GEMMs");
+      const auto part = Download(d_part, n_tokens * m);
+      for (std::size_t t = 0; t < n_tokens; ++t) {
+        if (std::memcmp(full.data() + t * stacked + base, part.data() + t * m,
+                        m * sizeof(float)) != 0) {
+          for (std::size_t r = 0; r < m; ++r) {
+            if (full[t * stacked + base + r] != part[t * m + r]) {
+              std::cerr << "MISMATCH type=" << static_cast<unsigned>(type)
+                        << " part=" << i << " m=" << m << " k=" << k
+                        << " n=" << n_tokens << " token=" << t << " row=" << r
+                        << " stacked=" << full[t * stacked + base + r]
+                        << " sliced=" << part[t * m + r] << " tier=" << tier
+                        << "\n";
+              throw std::runtime_error(
+                  "stacked projection row differs from its separate GEMM");
+            }
+          }
+        }
+      }
+      base += m;
+    }
+  };
+  check_tier("mmq", [&](const void* weights, std::size_t m, float* out) {
+    if (qfn_mmq_dense(static_cast<int>(type), weights, d_x, out,
+                      static_cast<int>(m), static_cast<int>(n_tokens),
+                      static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error(std::string("stack exact MMQ failed: ") + tier);
+  });
+  check_tier("mmvq", [&](const void* weights, std::size_t m, float* out) {
+    if (qfn_mmq_dense_vec(static_cast<int>(type), weights, d_x, out,
+                          static_cast<int>(m), static_cast<int>(n_tokens),
+                          static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error(std::string("stack exact MMVQ failed: ") + tier);
+  });
+  if (wmma) {
+    check_tier("wmma", [&](const void* weights, std::size_t m, float* out) {
+      if (!q::DenseQuantF16Gemm(static_cast<gufo::core::GgmlType>(
+                                    static_cast<std::uint32_t>(type)),
+                                weights,
+                                reinterpret_cast<const __half*>(d_half), out,
+                                n_tokens, m, k, nullptr))
+        throw std::runtime_error(std::string("stack exact WMMA failed: ") +
+                                 tier);
+    });
+  }
+  std::cout << "dense stack exact " << static_cast<unsigned>(type)
+            << " m=" << stacked << " k=" << k << " n=" << n_tokens
+            << " parts=" << parts.size()
+            << (wmma ? " wmma+mmq+mmvq" : " mmq+mmvq") << "\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_stacked), static_cast<void*>(d_part),
+                  static_cast<void*>(d_half)})
+    if (p != nullptr)
+      CheckHip(hipFree(p), "stack exact free");
+}
+
 /// Embedding gather for a GSQ-RCO token table against the CPU oracle.
 void CheckEmbedQuant(q::WeightType type, std::size_t rows, std::size_t hidden,
                      std::uint32_t seed) {
@@ -1598,6 +1715,17 @@ int main() {
                          true);
     CheckDenseChunkExact(q::WeightType::kIQ4_NL, 2560, 640, 136, 94, seed++,
                          true);
+    // Stacked-vs-separate exactness for the formats the GSQ-RCO mixes
+    // actually stack (same-type attention triples and SSM pairs), at the
+    // production shapes: [12288; 512; 512] attention and [10240; 6144]
+    // SSM projections over k=2560.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_XS}) {
+      CheckDenseStackExact(type, {12288, 512, 512}, 2560, 7, seed++);
+      CheckDenseStackExact(type, {12288, 512, 512}, 2560, 96, seed++);
+      CheckDenseStackExact(type, {10240, 6144}, 2560, 7, seed++);
+      CheckDenseStackExact(type, {10240, 6144}, 2560, 96, seed++);
+    }
     // Token-table gathers for the GSQ embedding formats.
     CheckEmbedQuant(q::WeightType::kIQ3_S, 17, 2560, seed++);
     CheckEmbedQuant(q::WeightType::kIQ4_XS, 17, 2560, seed++);
