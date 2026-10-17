@@ -90,6 +90,15 @@ stdenv.mkDerivation {
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
+    # Start files from the toolchain's own lib: a non-NixOS host's detected
+    # GCC otherwise hands the purity-checking link wrapper /lib/... crt.
+    "-DCMAKE_HIP_FLAGS=-B${rocmPackages.llvm.clang}/lib"
+    # The source tree prefers a host /opt/rocm when present; pin the ROCm
+    # packages here so an unsandboxed build never links host libraries.
+    "-Dhip_DIR=${rocmPackages.clr}/lib/cmake/hip"
+    "-Dhipblas_DIR=${rocmPackages.hipblas}/lib/cmake/hipblas"
+    "-Dhipblaslt_DIR=${rocmPackages.hipblaslt}/lib/cmake/hipblaslt"
+    "-Drocblas_DIR=${rocmPackages.rocblas}/lib/cmake/rocblas"
   ];
 
   doInstallCheck = true;
