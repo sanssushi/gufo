@@ -1761,8 +1761,9 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     }
     return true;
   }
-  // GSQ-RCO dense mixes arrive quantized: MMVQ at decode width and the
-  // adapter's MMQ at wide batch.
+  // GSQ-RCO dense mixes arrive quantized: the K-quant/IQ formats run the
+  // dense F16-tile WMMA GEMM at wide batch (the control's F16 class),
+  // MMVQ at decode width and the adapter's MMQ for the remaining formats.
   if (w.type != GgmlType::kF32 && w.type != GgmlType::kBF16 &&
       w.type != GgmlType::kF16) {
     const int t = static_cast<int>(w.type);
@@ -1775,6 +1776,24 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       AssignError(error_msg, "unsupported dense matrix format " +
                                  std::string(core::ToString(w.type)));
       return false;
+    }
+    if (MatrixRows(n_tokens) && KQuantWmmaType(w.type)) {
+      const std::uint32_t piece =
+          static_cast<std::uint32_t>(options_.max_batch);
+      for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
+        const std::uint32_t rows = std::min(piece, n_tokens - r0);
+        const float* src = x + static_cast<std::size_t>(r0) * w.cols;
+        PrepareHalfInput(src, rows, w.cols);
+        if (!DenseQuantF16Gemm(w.type, w.data,
+                               static_cast<const __half*>(s_.x_half),
+                               out + static_cast<std::size_t>(r0) * w.rows,
+                               rows, w.rows, w.cols, stream_)) {
+          AssignError(error_msg, "dense F16 quantized projection failed for " +
+                                     std::string(core::ToString(w.type)));
+          return false;
+        }
+      }
+      return true;
     }
     const int rc = MatrixRows(n_tokens)
                        ? qfn_mmq_dense(t, w.data, x, out, m, n, k, stream_)
@@ -1793,7 +1812,8 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     return true;
   }
   // Wide batches of the unquantized projections (router, alpha/beta,
-  // indexer): out[t][m] = sum_k w[m][k] x[t][k].
+  // indexer): out[t][m] = sum_k w[m][k] x[t][k], with the weights read as
+  // half precision except for F32.
   const int m = static_cast<int>(w.rows);
   const int k = static_cast<int>(w.cols);
   const int n = static_cast<int>(n_tokens);
@@ -1809,15 +1829,38 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     return true;
   }
   const bool bf16 = w.type == GgmlType::kBF16;
-  const hipDataType type = bf16 ? HIP_R_16BF : HIP_R_16F;
+  if (bf16) {
+    // BF16 weight rows (GSQ-RCO mixer, indexer and gate-in projections) take
+    // the one-K-reduction kernel over the same F16 activation rows as the
+    // fused HC projection, with the weights staged as F16. The library
+    // kernel's per-token K rotation changes the sums with the batch shape,
+    // so mixer and indexer results would diverge across prefill chunk
+    // widths, and the fused and separate mixer chains would disagree.
+    if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
+          !half_bf16_)) {
+      NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(n) * k,
+                        stream_);
+      half_src_ = x;
+      half_rows_ = n_tokens;
+      half_cols_ = w.cols;
+      half_bf16_ = false;
+    }
+    if (!UnquantizedF16Gemm(w.data, static_cast<const __half*>(s_.x_half), out,
+                            n, m, k, stream_, WeightType::kBF16)) {
+      AssignError(error_msg, "BF16 matrix projection failed");
+      return false;
+    }
+    return true;
+  }
+  const hipDataType type = HIP_R_16F;
   if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
-        half_bf16_ == bf16)) {
-    NarrowActivations(x, s_.x_half, bf16, static_cast<std::size_t>(n) * k,
+        !half_bf16_)) {
+    NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(n) * k,
                       stream_);
     half_src_ = x;
     half_rows_ = n_tokens;
     half_cols_ = w.cols;
-    half_bf16_ = bf16;
+    half_bf16_ = false;
   }
   return blaslt_->Gemm(w.data, s_.x_half, out, type, m, n, k, error_msg);
 }
@@ -2427,15 +2470,29 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   bool convolved = false;
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
-    // boundary rows remain available for the rolling history update.
+    // boundary rows remain available for the rolling history update. The
+    // GSQ-RCO K-quant/IQ stacks take the same fused convolution through the
+    // quantized F16-tile entry (their F16 activation rows are staged the
+    // same way); a shape it rejects falls back to the separate projection.
+    const bool quant_ssm = KQuantWmmaType(l.ssm_in.type) &&
+                           l.ssm_in.cols <= model_->max_half_cols();
     if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
+        n_tokens <= options_.max_batch &&
+        (DenseF16Route(l.ssm_in, n_tokens) || quant_ssm)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
-      convolved = DenseF16SsmGemm(
-          l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-          l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
-          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_,
-          checkpoint.tokens);
+      convolved =
+          quant_ssm
+              ? DenseQuantF16SsmGemm(l.ssm_in.type, l.ssm_in.data,
+                                     static_cast<const __half*>(s_.x_half),
+                                     l.ssm_conv1d.f32(), s.conv_state, s_.qkvz,
+                                     s_.conv_scratch, n_tokens, l.ssm_in.rows,
+                                     l.ssm_in.cols, channels, c.ssm_conv_kernel,
+                                     stream_, checkpoint.tokens)
+              : DenseF16SsmGemm(
+                    l.ssm_in.data, static_cast<const __half*>(s_.x_half),
+                    l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
+                    n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels,
+                    c.ssm_conv_kernel, stream_, checkpoint.tokens);
     }
     if (!projections_ready && !convolved &&
         !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {

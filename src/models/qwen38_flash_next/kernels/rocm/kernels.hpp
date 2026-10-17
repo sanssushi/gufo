@@ -225,6 +225,19 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
                     std::size_t batch, std::size_t m, std::size_t k,
                     hipStream_t stream);
 
+/// K-quant/IQ formats that run the dense F16-tile WMMA GEMM at wide batch:
+/// Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and IQ3_S. Everything else in
+/// the adapter's dense set stays on its MMQ/MMVQ paths.
+bool KQuantWmmaType(core::GgmlType type);
+/// Dense GEMM over K-quant/IQ weights whose tiles are dequantized to F16 at
+/// the LDS commit (DecodeQuantSub16 codes with one (scale, -offset) pair per
+/// 16-element sub-block) against F16 activation rows [batch][k]. out is
+/// [batch][m]. Returns false, launching nothing, for other types or a k that
+/// is not a whole weight block.
+bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
+                       float* out, std::size_t batch, std::size_t m,
+                       std::size_t k, hipStream_t stream);
+
 /// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
 /// Matches the separate operators' rounding. Supports at least 96 tokens.
 bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
@@ -252,11 +265,12 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
 
-/// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
+/// F16 activation rows [batch][k], F16 or BF16 (staged as F16) weight rows,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream);
+                        hipStream_t stream,
+                        WeightType wtype = WeightType::kF16);
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
@@ -281,6 +295,19 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream, std::uint32_t checkpoint_tokens = 0);
+/// The GSQ-RCO K-quant/IQ ssm_in stacks (Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
+/// IQ3_S — the dense F16-tile set) take the same fused projection and
+/// boundary pass: their weight tiles decode through DecodeQuantSub16 into
+/// F16 as they are staged, so the convolution sees the same accumulated
+/// values as the separate projection. Same geometry contract as
+/// DenseF16SsmGemm; other types launch nothing.
+bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
+                          const float* conv_w, const float* history,
+                          float* qkvz, float* convolved, std::uint32_t n_tokens,
+                          std::uint32_t m, std::uint32_t k,
+                          std::uint32_t channels, std::uint32_t kernel,
+                          hipStream_t stream,
+                          std::uint32_t checkpoint_tokens = 0);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,

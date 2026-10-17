@@ -101,9 +101,13 @@ struct Uploader {
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
-    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
+    // F16 activation rows are staged for the unquantized weights and the
+    // K-quant F16-tile dense route, so all of their K ranges size the buffer.
+    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16 ||
+        (KQuantWmmaType(t.type) && t.experts == 1)) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
+    // The Q8_0 dense route stages its activations in the tiled Q8 scratch.
     if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }

@@ -80,9 +80,12 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed,
 
 // Reuse the wide projection fixture to check the fused convolution through
 // its actual consumer, including the state carried into the next chunk.
-void CheckSsmProjection(const void* w, const __half* x, float* projected,
-                        const std::vector<float>& reference,
-                        std::uint32_t batch) {
+// `quant_type` picks the fused entry: kQ8_0 (the Q8 control stack) runs
+// DenseF16SsmGemm; every GSQ-RCO K-quant/IQ stack runs DenseQuantF16SsmGemm.
+void CheckSsmProjection(
+    const void* w, const __half* x, float* projected,
+    const std::vector<float>& reference, std::uint32_t batch,
+    gufo::core::GgmlType quant_type = gufo::core::GgmlType::kQ8_0) {
   constexpr std::uint32_t m = 16384, k = 2560, channels = 10240;
   constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
   const std::size_t conv_count = std::size_t(batch) * channels;
@@ -174,8 +177,14 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
              "poison fused projection");
     CheckHip(hipMemset(scratch, 0xFF, conv_count * sizeof(float)),
              "poison fused convolution");
-    if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
-                            k, channels, 4, nullptr)) {
+    const bool launched =
+        quant_type == gufo::core::GgmlType::kQ8_0
+            ? q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch,
+                                 batch, m, k, channels, 4, nullptr)
+            : q::DenseQuantF16SsmGemm(quant_type, w, x, conv_w, conv_state,
+                                      fused, scratch, batch, m, k, channels, 4,
+                                      nullptr);
+    if (!launched) {
       throw std::runtime_error("SSM projection rejected the shape");
     }
     exact(expected_conv, scratch, "convolution");
@@ -1036,10 +1045,54 @@ DenseWeights MakeQuant(q::WeightType type, std::size_t m, std::size_t k,
   return w;
 }
 
+/// The GSQ-RCO ssm_in stacks store the K-quant/IQ dense formats and fuse the
+/// four-tap convolution into the quantized F16-tile projection. The fused
+/// pass must stay bit-identical to the separate dense F16-tile projection
+/// (same decode, same K order per output) through its consumer.
+void CheckSsmProjectionQuant(gufo::core::GgmlType type, std::uint32_t batch) {
+  constexpr std::uint32_t m = 16384, k = 2560;
+  const auto wtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  const DenseWeights w = MakeQuant(wtype, m, k, 0x51D6C0DEU);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t state = 0xC0FFEEU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  // The MMQ tier reads whole 256-element k-iterations past short rows;
+  // production uploads carry a zeroed tail (device_model.cpp kTailMargin).
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  __half* d_x_half = nullptr;
+  float* d_ref = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "SSM quant weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "SSM quant input");
+  CheckHip(hipMalloc(&d_x_half, x.size() * sizeof(__half)), "SSM quant halves");
+  CheckHip(hipMalloc(&d_ref, x.size() / k * m * 4), "SSM quant projection");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "SSM quant weights upload");
+  CheckHip(hipMemset(d_w + w.packed.size(), 0, tail), "SSM quant weights tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "SSM quant input upload");
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  if (!q::DenseQuantF16Gemm(type, d_w, d_x_half, d_ref, batch, m, k, nullptr)) {
+    throw std::runtime_error("SSM quant projection rejected the shape");
+  }
+  const auto reference = Download(d_ref, x.size() / k * m);
+  CheckSsmProjection(d_w, d_x_half, d_ref, reference, batch, type);
+  CheckHip(hipFree(d_w), "SSM quant free");
+  CheckHip(hipFree(d_x), "SSM quant free");
+  CheckHip(hipFree(d_x_half), "SSM quant free");
+  CheckHip(hipFree(d_ref), "SSM quant free");
+}
+
 /// Formats outside the adapter set (Q5_1 is routed down-projection only,
 /// Q4_0 has no GPU kernels) must fail the executor's format probe and both
 /// dense entry points, so a widened whitelist cannot make decode and prefill
-/// disagree.
+/// disagree. The F16-tile dense set is the K-quant/IQ family: the Q8_0 route
+/// has its own GEMM and the low-bit formats stay on the adapter's MMQ.
 void CheckDenseRejectsNonDense() {
   for (int type : {static_cast<int>(q::WeightType::kQ5_1),
                    static_cast<int>(gufo::core::GgmlType::kQ4_0)}) {
@@ -1050,11 +1103,46 @@ void CheckDenseRejectsNonDense() {
     if (qfn_mmq_dense_vec(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) ==
         0)
       throw std::runtime_error("qfn_mmq_dense_vec accepted a non-dense type");
+    if (q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(type)))
+      throw std::runtime_error("KQuantWmmaType accepted a non-dense type");
+    if (q::DenseQuantF16Gemm(static_cast<gufo::core::GgmlType>(type), nullptr,
+                             nullptr, nullptr, 1, 1, 32, nullptr))
+      throw std::runtime_error("DenseQuantF16Gemm accepted a non-dense type");
   }
+  for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                             q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                             q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS}) {
+    if (!q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(
+            static_cast<std::uint32_t>(type))))
+      throw std::runtime_error("KQuantWmmaType rejected a K-quant format");
+  }
+  for (q::WeightType type : {q::WeightType::kQ8_0, q::WeightType::kQ2_0,
+                             q::WeightType::kIQ2_XXS, q::WeightType::kIQ2_XS,
+                             q::WeightType::kIQ2_S, q::WeightType::kIQ3_XXS}) {
+    if (q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(
+            static_cast<std::uint32_t>(type))))
+      throw std::runtime_error("KQuantWmmaType accepted a non-K-quant format");
+    if (q::DenseQuantF16Gemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            nullptr, nullptr, nullptr, 1, 1, 32, nullptr))
+      throw std::runtime_error(
+          "DenseQuantF16Gemm accepted a non-K-quant format");
+    if (q::DenseQuantF16SsmGemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1024, 16384,
+            2560, 10240, 4, nullptr))
+      throw std::runtime_error(
+          "DenseQuantF16SsmGemm accepted a non-K-quant format");
+  }
+  if (q::DenseQuantF16SsmGemm(gufo::core::GgmlType::kQ4_K, nullptr, nullptr,
+                              nullptr, nullptr, nullptr, nullptr, 1023, 16384,
+                              2560, 10240, 4, nullptr))
+    throw std::runtime_error("DenseQuantF16SsmGemm accepted a short batch");
 }
 
-/// MMQ and MMVQ dense projections for a GSQ-RCO format over random packed
-/// blocks, against an F64 reference over the CPU-dequantized weights.
+/// MMQ, MMVQ and (for the K-quant/IQ formats production routes there) WMMA
+/// dense projections for a GSQ-RCO format over random packed blocks, against
+/// an F64 reference over the CPU-dequantized weights.
 void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
                      std::size_t n_tokens, std::uint32_t seed) {
   const DenseWeights w = MakeQuant(type, m, k, seed);
@@ -1070,6 +1158,10 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   float* d_x = nullptr;
   float* d_mmq = nullptr;
   float* d_vec = nullptr;
+  float* d_wmma = nullptr;
+  std::uint16_t* d_half = nullptr;
+  const bool wmma = q::KQuantWmmaType(
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)));
   // The MMQ tier reads whole 256-element k-iterations, so short rows
   // over-read past the tensor; production uploads carry a zeroed tail for
   // this (device_model.cpp kTailMargin).
@@ -1078,6 +1170,11 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   CheckHip(hipMalloc(&d_x, x.size() * 4), "dense quant input");
   CheckHip(hipMalloc(&d_mmq, zeros.size() * 4), "dense quant MMQ output");
   CheckHip(hipMalloc(&d_vec, zeros.size() * 4), "dense quant MMVQ output");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_wmma, zeros.size() * 4), "dense quant WMMA output");
+    CheckHip(hipMalloc(&d_half, n_tokens * k * sizeof(__half)),
+             "dense quant F16 input");
+  }
   CheckHip(
       hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
       "dense quant weights upload");
@@ -1092,6 +1189,11 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   CheckHip(
       hipMemcpy(d_vec, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
       "dense quant MMVQ guards");
+  if (wmma) {
+    CheckHip(hipMemcpy(d_wmma, zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "dense quant WMMA guards");
+  }
   if (qfn_mmq_dense(static_cast<int>(type), d_w, d_x, d_mmq,
                     static_cast<int>(m), static_cast<int>(n_tokens),
                     static_cast<int>(k), nullptr) != 0)
@@ -1100,14 +1202,25 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
                         static_cast<int>(m), static_cast<int>(n_tokens),
                         static_cast<int>(k), nullptr) != 0)
     throw std::runtime_error("dense MMVQ failed");
+  if (wmma) {
+    q::NarrowActivations(d_x, d_half, false, n_tokens * k, nullptr);
+    if (!q::DenseQuantF16Gemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            d_w, reinterpret_cast<const __half*>(d_half), d_wmma, n_tokens, m,
+            k, nullptr))
+      throw std::runtime_error("dense F16-tile WMMA failed");
+  }
   CheckHip(hipDeviceSynchronize(), "dense quant GEMMs");
   const auto mmq = Download(d_mmq, zeros.size());
   const auto vec = Download(d_vec, zeros.size());
+  const auto wmma_out = wmma ? Download(d_wmma, zeros.size())
+                             : std::vector<float>(zeros.size(), 0.0F);
   for (std::size_t i = n_tokens * m; i < zeros.size(); ++i) {
-    if (mmq[i] != poison || vec[i] != poison)
+    if (mmq[i] != poison || vec[i] != poison || (wmma && wmma_out[i] != poison))
       throw std::runtime_error("dense quant projection overwrote its guard");
   }
   double vs_mmq = 0.0, vs_ref = 0.0, mmq_vs_ref = 0.0, scale = 0.0;
+  double wmma_vs_ref = 0.0, wmma_vs_mmq = 0.0;
   for (std::size_t t = 0; t < n_tokens; ++t) {
     for (std::size_t row = 0; row < m; ++row) {
       double ref = 0.0;
@@ -1125,27 +1238,44 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
       vs_ref = std::max(vs_ref, std::abs(ref - static_cast<double>(u)));
       mmq_vs_ref = std::max(mmq_vs_ref, std::abs(ref - static_cast<double>(v)));
       scale = std::max(scale, std::abs(ref));
+      if (wmma) {
+        const float q = wmma_out[t * m + row];
+        if (!std::isfinite(q)) {
+          throw std::runtime_error("dense quant WMMA output is not finite");
+        }
+        wmma_vs_ref =
+            std::max(wmma_vs_ref, std::abs(ref - static_cast<double>(q)));
+        wmma_vs_mmq =
+            std::max(wmma_vs_mmq, std::abs(static_cast<double>(v - q)));
+      }
     }
   }
   // The vector/MMQ tiers approximate the F64 reference through the same
   // activation quantization, so each may sit a full quantization step from
-  // it and two apart from each other.
+  // it and two apart from each other. The F16-tile tier rounds its weight
+  // tiles and activation rows to F16 instead, a finer step on the same
+  // contract.
   if (!(vs_ref < 1e-2 * scale && mmq_vs_ref < 1e-2 * scale &&
-        vs_mmq < 2e-2 * scale)) {
+        vs_mmq < 2e-2 * scale && wmma_vs_ref < 1e-2 * scale &&
+        wmma_vs_mmq < 2e-2 * scale)) {
     throw std::runtime_error(
         "dense quant projection differs from the F64 oracle: m=" +
         std::to_string(m) + " k=" + std::to_string(k) +
         " n=" + std::to_string(n_tokens) + " vs_mmq=" + std::to_string(vs_mmq) +
-        " vs_ref=" + std::to_string(vs_ref) + " mmq_vs_ref=" +
-        std::to_string(mmq_vs_ref) + " scale=" + std::to_string(scale));
+        " vs_ref=" + std::to_string(vs_ref) +
+        " mmq_vs_ref=" + std::to_string(mmq_vs_ref) +
+        " wmma_vs_ref=" + std::to_string(wmma_vs_ref) + " wmma_vs_mmq=" +
+        std::to_string(wmma_vs_mmq) + " scale=" + std::to_string(scale));
   }
   std::cout << "dense " << std::to_string(static_cast<unsigned>(type))
             << " m=" << m << " k=" << k << " n=" << n_tokens
             << ": worst |MMVQ - MMQ| " << vs_mmq << ", worst |MMVQ - F64| "
-            << vs_ref << ", worst |MMVQ - F64| " << mmq_vs_ref << " (scale "
-            << scale << ")\n";
+            << vs_ref << ", worst |MMQ - F64| " << mmq_vs_ref
+            << ", worst |WMMA - F64| " << wmma_vs_ref << ", worst |WMMA - MMQ| "
+            << wmma_vs_mmq << " (scale " << scale << ")\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
-                  static_cast<void*>(d_mmq), static_cast<void*>(d_vec)})
+                  static_cast<void*>(d_mmq), static_cast<void*>(d_vec),
+                  static_cast<void*>(d_wmma), static_cast<void*>(d_half)})
     if (p != nullptr)
       CheckHip(hipFree(p), "dense quant free");
 }
@@ -1225,7 +1355,7 @@ void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
 /// adapter MMQ tier, or the F16-tile WMMA tier production uses at wide batch.
 void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
                           std::size_t length, std::size_t boundary,
-                          std::uint32_t seed) {
+                          std::uint32_t seed, bool wmma = false) {
   const DenseWeights w = MakeQuant(type, m, k, seed);
   std::vector<float> x(length * k);
   std::uint32_t state = seed ^ 0x5A5A5A5AU;
@@ -1238,12 +1368,17 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
   float* d_bulk = nullptr;
   float* d_head = nullptr;
   float* d_tail = nullptr;
+  std::uint16_t* d_half = nullptr;
   CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "chunk exact weights");
   CheckHip(hipMalloc(&d_x, x.size() * 4), "chunk exact input");
   CheckHip(hipMalloc(&d_bulk, length * m * 4), "chunk exact bulk output");
   CheckHip(hipMalloc(&d_head, boundary * m * 4), "chunk exact head output");
   CheckHip(hipMalloc(&d_tail, (length - boundary) * m * 4),
            "chunk exact tail output");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_half, length * k * sizeof(__half)),
+             "chunk exact F16 input");
+  }
   CheckHip(
       hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
       "chunk exact weights upload");
@@ -1254,9 +1389,16 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
            "chunk exact input upload");
   const auto run_tier = [&](float* out, std::size_t rows,
                             std::size_t row_offset) {
-    return qfn_mmq_dense(static_cast<int>(type), d_w, d_x + row_offset * k, out,
-                         static_cast<int>(m), static_cast<int>(rows),
-                         static_cast<int>(k), nullptr) == 0;
+    if (!wmma) {
+      return qfn_mmq_dense(static_cast<int>(type), d_w, d_x + row_offset * k,
+                           out, static_cast<int>(m), static_cast<int>(rows),
+                           static_cast<int>(k), nullptr) == 0;
+    }
+    q::NarrowActivations(d_x + row_offset * k, d_half, false, rows * k,
+                         nullptr);
+    return q::DenseQuantF16Gemm(
+        static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+        d_w, reinterpret_cast<const __half*>(d_half), out, rows, m, k, nullptr);
   };
   if (!run_tier(d_bulk, length, 0))
     throw std::runtime_error("chunk exact bulk projection failed");
@@ -1300,10 +1442,10 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
   }
   std::cout << "dense chunk exact " << static_cast<unsigned>(type) << " m=" << m
             << " k=" << k << " length=" << length << " boundary=" << boundary
-            << " mmq\n";
+            << (wmma ? " wmma" : " mmq") << "\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_bulk), static_cast<void*>(d_head),
-                  static_cast<void*>(d_tail)})
+                  static_cast<void*>(d_tail), static_cast<void*>(d_half)})
     if (p != nullptr)
       CheckHip(hipFree(p), "chunk exact free");
 }
@@ -1437,6 +1579,25 @@ int main() {
     CheckDenseChunkExact(q::WeightType::kIQ4_XS, 2560, 6144, 32, 16, seed++);
     CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 4096, 2048, seed++);
     CheckDenseChunkExact(q::WeightType::kQ2_0, 2560, 640, 136, 94, seed++);
+    // The F16-tile WMMA tier production runs at wide batch must keep the
+    // same contract, including across its 96-token launch-config boundary
+    // and the row-tile groups its production shapes draw.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                               q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS}) {
+      CheckDenseChunkExact(type, 64, 512, 160, 80, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 96, 32, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 136, 94, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 136, 135, seed++, true);
+    }
+    CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 136, 94, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 130, 97, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kQ4_K, 2560, 6144, 136, 94, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kIQ4_NL, 2560, 640, 136, 94, seed++,
+                         true);
     // Token-table gathers for the GSQ embedding formats.
     CheckEmbedQuant(q::WeightType::kIQ3_S, 17, 2560, seed++);
     CheckEmbedQuant(q::WeightType::kIQ4_XS, 17, 2560, seed++);
@@ -1476,6 +1637,15 @@ int main() {
       ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
       ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
     }
+    // The GSQ-RCO ssm stacks fuse the same convolution over every dense
+    // F16-tile weight format, at a full and a partial final token tile.
+    for (auto type :
+         {gufo::core::GgmlType::kQ4_K, gufo::core::GgmlType::kQ5_K,
+          gufo::core::GgmlType::kQ6_K, gufo::core::GgmlType::kIQ4_NL,
+          gufo::core::GgmlType::kIQ4_XS, gufo::core::GgmlType::kIQ3_S}) {
+      CheckSsmProjectionQuant(type, 1024);
+    }
+    CheckSsmProjectionQuant(gufo::core::GgmlType::kIQ4_XS, 1025);
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.
