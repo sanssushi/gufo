@@ -71,6 +71,10 @@ WeightType SmallType(GgmlType type) {
       return WeightType::kF16;
     case GgmlType::kQ8_0:
       return WeightType::kQ8_0;
+    case GgmlType::kIQ3_S:
+      return WeightType::kIQ3_S;
+    case GgmlType::kIQ4_XS:
+      return WeightType::kIQ4_XS;
     case GgmlType::kF32:
       return WeightType::kF32;
     default:
@@ -129,6 +133,13 @@ constexpr std::uint32_t kAttnSplits = 8;
 /// 0.40 -> 1.3, which keep the int8 route.
 constexpr std::uint32_t kDenseF16MinRows = 2048;
 constexpr std::uint32_t kDenseF16MaxCols = 2560;
+
+/// Decode GEMVs of 16-bit mixes run the vectorized row path below this row
+/// count: the F16-staged GEMM's few row tiles leave the device idle on the
+/// few-row, long-K shapes (measured at batch 1: [320,10240]'s five tiles at
+/// 203 us vs the row waves' 74, while [10240,320]'s 160 tiles run at 39 and
+/// keep the GEMM).
+constexpr std::uint32_t kDecodeGemvMaxRows = 2048;
 
 /// Token rows per routed F16 expert GEMM tile: the narrow tile for batches
 /// whose buckets pad to one or two 16-row tiles, the wide one when the
@@ -1750,7 +1761,33 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     }
     return true;
   }
-  if (!MatrixRows(n_tokens)) {
+  // GSQ-RCO dense mixes arrive quantized: MMVQ at decode width and the
+  // adapter's MMQ at wide batch.
+  if (w.type != GgmlType::kF32 && w.type != GgmlType::kBF16 &&
+      w.type != GgmlType::kF16) {
+    const int t = static_cast<int>(w.type);
+    const int m = static_cast<int>(w.rows);
+    const int k = static_cast<int>(w.cols);
+    const int n = static_cast<int>(n_tokens);
+    // The adapter's dense set is its routed set; probe it so an unsupported
+    // type is reported as such instead of masking a launch failure.
+    if (qfn_mmq_moe_gated_type(t) == 0) {
+      AssignError(error_msg, "unsupported dense matrix format " +
+                                 std::string(core::ToString(w.type)));
+      return false;
+    }
+    const int rc = MatrixRows(n_tokens)
+                       ? qfn_mmq_dense(t, w.data, x, out, m, n, k, stream_)
+                       : qfn_mmq_dense_vec(t, w.data, x, out, m, n, k, stream_);
+    if (rc != 0) {
+      AssignError(error_msg, "dense matrix projection failed for " +
+                                 std::string(core::ToString(w.type)));
+      return false;
+    }
+    return true;
+  }
+  if (!MatrixRows(n_tokens) &&
+      (w.type != GgmlType::kBF16 || w.rows < kDecodeGemvMaxRows)) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,
               stream_);
     return true;
@@ -2366,8 +2403,8 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
     HistoryPrefix(s_.ple_norm, hc_dim, session.ple_history_,
                   checkpoint->state->ple_history_, checkpoint->tokens, hc_dim,
                   c.PleConvHistory(), stream_);
-  PleConv(s_.ple_norm, l.ple_conv1d.f32(), session.ple_history_,
-          s_.ple_history_scratch, s_.ple_conv,
+  PleConv(s_.ple_norm, l.ple_conv1d.data, SmallType(l.ple_conv1d.type),
+          session.ple_history_, s_.ple_history_scratch, s_.ple_conv,
           speculative ? session.ple_snapshots_ : RollbackRows{}, n, hc_dim,
           c.ple_conv_kernel, c.ple_ngram_size, stream_);
   PleInject(res, s_.ple_gated, s_.ple_conv,

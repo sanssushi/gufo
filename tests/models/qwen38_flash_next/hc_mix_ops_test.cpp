@@ -75,7 +75,8 @@ std::vector<float> MakeValues(std::size_t count, std::uint32_t seed,
   return values;
 }
 
-void Upload(HipBuffer<float>* destination, const std::vector<float>& source) {
+template<typename T>
+void Upload(HipBuffer<T>* destination, const std::vector<T>& source) {
   CheckHip(hipMemcpy(destination->get(), source.data(), destination->bytes(),
                      hipMemcpyHostToDevice),
            "upload");
@@ -87,6 +88,21 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
                      hipMemcpyDeviceToHost),
            "download");
   return values;
+}
+
+std::uint16_t FloatToBf16(float v) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  // Round to nearest even over the seven BF16 mantissa bits.
+  bits += 0x7FFFu + ((bits >> 16) & 1u);
+  return static_cast<std::uint16_t>(bits >> 16);
+}
+
+float Bf16ToFloat(std::uint16_t h) {
+  const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+  float v = 0.0F;
+  std::memcpy(&v, &bits, sizeof(v));
+  return v;
 }
 
 // Fusing the projection must preserve every downstream representation,
@@ -186,12 +202,83 @@ void CheckFusedProjection(std::uint32_t tokens) {
   std::cerr << "HC projection fusion exact at " << tokens << " tokens\n";
 }
 
+// The decode 16-bit GEMV tier (vectorized row waves over F32 activations):
+// every encoding follows the F64 oracle, and an output row must not depend
+// on the token count, which is the batched-decode contract.
+void CheckDecodeGemv(std::uint32_t tokens, std::size_t rows, std::size_t cols,
+                     const char* label) {
+  const std::size_t x_count = static_cast<std::size_t>(tokens) * cols;
+  const std::size_t out_count = static_cast<std::size_t>(tokens) * rows;
+  const auto x = MakeValues(x_count, 0x12345678U, 1.0F);
+  const auto w = MakeValues(rows * cols, 0x13572468U, 0.02F);
+  std::vector<std::uint16_t> w_bf16(w.size());
+  std::vector<__half> w_half(w.size());
+  std::vector<float> w_bf16_exact(w.size()), w_half_exact(w.size());
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    w_bf16[i] = FloatToBf16(w[i]);
+    w_half[i] = __float2half_rn(w[i]);
+    w_bf16_exact[i] = Bf16ToFloat(w_bf16[i]);
+    w_half_exact[i] = __half2float(w_half[i]);
+  }
+  HipBuffer<std::uint16_t> d_bf16(w_bf16.size());
+  HipBuffer<__half> d_half(w_half.size());
+  HipBuffer<float> d_x(x.size()), d_out(out_count), d_one(rows);
+  Upload(&d_bf16, w_bf16);
+  Upload(&d_half, w_half);
+  Upload(&d_x, x);
+  for (int encoding = 0; encoding < 2; ++encoding) {
+    const auto& exact = encoding == 0 ? w_bf16_exact : w_half_exact;
+    const void* w_ptr = encoding == 0 ? static_cast<const void*>(d_bf16.get())
+                                      : static_cast<const void*>(d_half.get());
+    const q::WeightType type =
+        encoding == 0 ? q::WeightType::kBF16 : q::WeightType::kF16;
+    q::SmallGemm(w_ptr, type, d_x.get(), d_out.get(), tokens, rows, cols,
+                 nullptr);
+    const auto out = Download(&d_out, out_count);
+    double scale = 0.0;
+    double worst = 0.0;
+    const std::size_t sample_rows[4] = {0, rows / 3, 2 * rows / 3, rows - 1};
+    for (std::uint32_t t = 0; t < tokens; t += std::max(1U, tokens / 4)) {
+      for (std::size_t r : sample_rows) {
+        double expected = 0.0;
+        for (std::size_t i = 0; i < cols; ++i) {
+          expected += static_cast<double>(exact[r * cols + i]) *
+                      x[static_cast<std::size_t>(t) * cols + i];
+        }
+        const double actual = out[static_cast<std::size_t>(t) * rows + r];
+        scale = std::max(scale, std::abs(expected));
+        worst = std::max(worst, std::abs(expected - actual));
+      }
+    }
+    if (!std::isfinite(worst) || worst > 1e-4 * std::max(1.0, scale)) {
+      throw std::runtime_error(std::string(label) +
+                               " differs from the F64 oracle");
+    }
+    // The same row at one token and at a full decode batch: separate
+    // templates, one reduction.
+    q::SmallGemm(w_ptr, type, d_x.get(), d_one.get(), 1, rows, cols, nullptr);
+    const auto one = Download(&d_one, rows);
+    if (!std::equal(one.begin(), one.end(), out.begin())) {
+      throw std::runtime_error(std::string(label) +
+                               " row depends on the token count");
+    }
+  }
+  std::cerr << label << " GEMV exact at " << tokens << " tokens\n";
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
+    constexpr std::size_t kRank = 320;
+    constexpr std::size_t kDim = kStreams * kHidden;
+    CheckDecodeGemv(1, kRank, kDim, "decode HC down");
+    CheckDecodeGemv(8, kRank, kDim, "decode HC down");
+    CheckDecodeGemv(8, kDim, kRank, "decode HC up");
+    CheckDecodeGemv(8, 512, kHidden, "decode router");
+    CheckDecodeGemv(3, 96, 344, "decode tail-K");
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;

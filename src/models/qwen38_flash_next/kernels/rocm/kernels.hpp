@@ -345,8 +345,9 @@ void PleGate(const float* key_n, const float* query_n, const float* value,
 /// oldest first). `history` is then advanced past the chunk.
 /// `snapshots`, when populated, receives the history as it stands after
 /// each proper prefix: [n_tokens-1][hist][channels]. The full batch's
-/// history remains in `history`.
-void PleConv(const float* in, const float* w, float* history,
+/// history remains in `history`. `w` holds `channels * kernel` weights in
+/// `wtype` encoding, K-major within a channel.
+void PleConv(const float* in, const void* w, WeightType wtype, float* history,
              float* history_scratch, float* out, RollbackRows snapshots,
              std::uint32_t n_tokens, std::uint32_t channels,
              std::uint32_t kernel, std::uint32_t dilation, hipStream_t stream);
