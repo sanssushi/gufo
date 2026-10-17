@@ -1,4 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <cstdlib>
+
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 
 namespace gufo::hip {
@@ -1425,7 +1427,7 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     default:
-      return;
+      std::abort();
   }
 }
 
@@ -1502,7 +1504,7 @@ void LaunchKQuantWmmaGEMM(core::GgmlType type, const void* w,
                                                         k, stream);
       return;
     default:
-      return;
+      std::abort();
   }
 }
 
@@ -1522,9 +1524,7 @@ void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
   // BatchedQuantGEMVKernel, one warp per (row, token), which re-reads the whole
   // weight matrix once per token and is unusable at prefill batch.
   if (type != core::GgmlType::kQ8_0) {
-    if (::gufo::quant::QuantizedBlockElements(type) != 0) {
-      LaunchKQuantWmmaGEMM(type, w, q8_1_x, y, batch, m, k, stream);
-    }
+    LaunchKQuantWmmaGEMM(type, w, q8_1_x, y, batch, m, k, stream);
     return;
   }
   if (batch <= 8) {

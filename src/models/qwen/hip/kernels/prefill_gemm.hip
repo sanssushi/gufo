@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "src/models/qwen/hip/kernels/small_batch_gemm.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -459,7 +460,7 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
 
   if (type == core::GgmlType::kQ8_0) {
     if (n_elems % kQ8_0BlockSize != 0) {
-      return;
+      std::abort();
     }
     const std::size_t n_blocks = n_elems / kQ8_0BlockSize;
     constexpr unsigned int blocks_per_tb = warps_per_block * 8u;
@@ -471,7 +472,7 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
   if (type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
       type == core::GgmlType::kQ8_K) {
     if (n_elems % kQ5KBlockSize != 0) {
-      return;
+      std::abort();
     }
     const std::size_t n_blocks = n_elems / kQ5KBlockSize;
     const std::size_t grid =
@@ -487,7 +488,9 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
     }
     return;
   }
-  // Unsupported quant type: no-op.
+  // Unsupported quant type: no staging decoder exists, so accepting the launch
+  // would leave `out` stale for the hipBLASLt GEMM that consumes it.
+  std::abort();
 }
 
 }  // namespace gufo::hip

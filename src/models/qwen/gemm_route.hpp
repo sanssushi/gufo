@@ -94,7 +94,12 @@ struct QwenGemmFormatCapabilities {
     case core::GgmlType::kQ8_1:
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
-      return {.quantized = true};
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kQ2_0:
+      return {.quantized = true,
+              .block_elements = ::gufo::quant::QuantizedBlockElements(type)};
   }
   return {};
 }
