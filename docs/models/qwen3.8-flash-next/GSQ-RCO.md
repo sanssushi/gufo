@@ -1,6 +1,6 @@
 # GSQ-RCO support in gufo — state of the solution
 
-Branch `feat/gsq-rco` (off `main`), state as of 2026-10-18.
+Branch `feat/gsq-rco` (off `main`).
 
 This is the state-of-the-solution reference for the fork's GSQ-RCO feature.
 It describes what the solution is now — types, loader, kernel dispatch,
@@ -18,14 +18,16 @@ image input (BF16 mmproj sidecar), chat template, graph capture, batched
 sessions, serving modes. All in-repo quality gates are green on both mixes, and
 the UD-Q4_K_XL control is regression-free vs `main`. Speed (see
 "Performance"): AR token generation is at parity or within about 6% on both
-mixes; MTP token generation at depth 32768 measures -9..-11% after upstream's
-prompt-lookup draft copies removed the neural draft phase from that cell, so it
-now times the multi-row verification forward — the formats' low-bit decode
-cost, not a draft or dispatch deficit (before the prompt-lookup copies the same
-cell measured -3..+1%). MTP tg at depth 0 rides the draft-trajectory measurement
-class — accept-rate driven, not kernel speed. Prefill sits at -25..-29%,
-measured compute-bound — the residual is the formats' F16-WMMA arithmetic
-cost, not a byte, launch or dispatch deficit.
+mixes; MTP token generation at depth 32768 times the multi-row verification
+forward, because upstream's prompt-lookup draft copies bypass the neural draft
+head for greedy runs (identical 17 cycles / 111 accepted across all three
+models): the residual (about -2% xxs, -6..-6.5% s) is the low-bit formats'
+per-element decode at eight verification rows with the shared-expert
+weight-fragment reuse in place, not a draft, attention or dispatch deficit.
+MTP tg at depth 0 rides the
+draft-trajectory measurement class — accept-rate driven, not kernel speed.
+Prefill sits at -25..-29%, measured compute-bound — the residual is the
+formats' F16-WMMA arithmetic cost, not a byte, launch or dispatch deficit.
 
 ## Targets and artifacts
 
@@ -127,7 +129,11 @@ additions to vendored files are recorded as re-import obligations in
 - Decode (≤ 8 rows): MMVQ — `moe_vector_projection` covers every routed
   format (its supported set is the gated set plus Q5_1); the fused SwiGLU
   gated vector path in `mmvq.hip.cpp` runs for every routed format except
-  Q5_1; the vec paths take rows ≤ 8 except Q4_K. `qfn_mmq_moe_gated_type` is
+  Q5_1; the vec paths take rows ≤ 8 except Q4_K. The grouped gated kernel
+  walking a group's shared expert decodes its weight fragment once per row
+  and K block and reuses it across the group's tokens: `Q4MoeFragment` for
+  Q4_K, `IqMoeFragment` for IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S
+  (`vecdotq.hpp`). `qfn_mmq_moe_gated_type` is
   the single gated-format definition (adapter, exported via `qfn_mmq.h`);
   the executor's `GatedMoeType` delegates to it, so the sets cannot drift.
 - Prefill (wide): MMQ — `mul_mat_q_case` instantiations plus the type-generic
@@ -315,7 +321,12 @@ session/audit replay.
   split spelling diverged at Q8 rounding boundaries in this compilation
   context); the routed SwiGLU-in-down-quantize codes are bit-identical to
   SwigluKernel + the plain entry for all thirteen routed formats
-  (`CheckSiluDownMmq`).
+  (`CheckSiluDownMmq`). The grouped gated vector's IQ2/IQ3 fragment reuse
+  keeps each format's integer scale formula, dp4a order and float scale
+  product — the product pinned with an asm barrier (`IqMoeScale`) to the
+  scalar routed path's association — so its output is byte-exact against the
+  separate projections plus SwiGLU at every width, including duplicate and
+  invalid slots and nonfinite scales (`routed_wmma_ops`).
 - Type-id bridges: every `WeightType` value is pinned against both
   `core::GgmlType` and the adapter's `ggml_type` in enum order (raw-cast
   bridge in `routed_wmma_ops_test`); GGUF type ids are pinned in
@@ -368,9 +379,10 @@ cmake --preset release && cmake --build --preset release   # -> build/release/gu
 
 ## Performance state
 
-Measured on the release binary, 2026-10-18, AMD Strix Halo (`gfx1151`).
+Measured on the release binary, AMD Strix Halo (`gfx1151`).
 Measurement shape: `gufo bench`, greedy, `-p 2048 -n 128 -d 0,32768 -r 1 -v`,
-single-user, shared-Q8_0 MTP sidecar attached in MTP mode, one binary for
+single-user, shared-Q8_0 MTP sidecar attached in MTP mode for the MTP cells
+and detached (`--speculative off`) for the AR cells, one binary for
 all three models; every cell is the delta against the unsloth UD-Q4_K_XL
 control measured in interleaved rounds on that binary (two rounds, r1/r2).
 
@@ -378,27 +390,27 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
 
 | cell | xxs | s |
 | --- | ---: | ---: |
-| AR tg128 | -0.7/-0.9% | -5.9/-5.8% |
-| AR tg128 @ d32768 | -1.2/-1.7% | -6.1/-6.3% |
-| MTP tg128 | +1.8/-13.2% | -8.2/-21.1% |
-| MTP tg128 @ d32768 | -8.7/-8.8% | -11.5/-11.0% |
+| AR tg128 | -6.1/-1.5% | -5.9/-6.0% |
+| AR tg128 @ d32768 | -1.5/-1.9% | -6.3/-6.4% |
+| MTP tg128 | -9.4/-22.8% | -19.0/-19.1% |
+| MTP tg128 @ d32768 | -2.0/-2.4% | -6.5/-6.2% |
 | pp (all cells, both modes/depths) | ≈ -25..-29% | ≈ -25..-29% |
 
-- Decode reading: AR tg is at parity to about -6%. The s cells read
-  -5.8/-5.9% at depth 0 and -6.1/-6.3% at depth 32768; the same binary's
-  absolute s tg improved 1.8% over the previous measurement, the control gained
-  more (+5.5%). MTP tg depth-0 cells sit in the draft-trajectory class:
-  speed tracks draft accept-rate, not kernel speed (the control itself read
-  36.89 vs 43.18 t/s between rounds with identical cycles and accepted
-  counts; each model's counters are deterministic per binary). At depth
-  32768 upstream's prompt-lookup draft copies bypass the neural draft head
-  for greedy runs (identical 17 cycles / 111 accepted across all three
-  models), so that cell times the multi-row verification forward: the
-  -9..-11% residual is the low-bit formats' per-element decode at 8
-  verification rows (the LUT-ceiling class below), not a draft, attention
-  or dispatch regression; absolute MTP tg improved 37-38% over the previous
-  measurement. One r1 AR tg128 d0 s cell read 21.64 t/s in an earlier round — a
-  run-noise one-off (its d32768 cell and two clean reruns read ~25).
+- Decode reading: AR tg is at parity to about -6%; the s cells read
+  -5.9/-6.0% at depth 0 and -6.3/-6.4% at depth 32768. MTP tg depth-0 cells
+  sit in the draft-trajectory class: speed tracks draft accept-rate, not
+  kernel speed (the control itself reads 37-43 t/s across rounds with
+  identical cycles and accepted counts; each model's counters are
+  deterministic per binary). At depth 32768 upstream's prompt-lookup draft
+  copies bypass the neural draft head for greedy runs (identical 17 cycles /
+  111 accepted across all three models), so that cell times the multi-row
+  verification forward: the -2..-2.4% (xxs) / -6.2..-6.5% (s) residual is the
+  low-bit formats' per-element decode at 8 verification rows with the
+  shared-expert weight-fragment reuse in place (the routed gate/up stage is
+  434 ms per 17 copied-32K verification cycles on xxs, at that stage's
+  decode-bound ceiling), not a draft, attention or dispatch deficit. One r1
+  AR tg128 d0 s cell read 21.64 t/s — a run-noise one-off (its d32768 cell
+  and reruns read ~25).
 - Decode ceilings (standalone per-format saturation cells measured with
   canonical block accounting, real GGUF weight blocks and per-cell CPU-dot
   validation): the practical DRAM read peak is 216.2 GB/s;
@@ -412,14 +424,14 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
   the per-lane grid-LUT decode of the IQ vec-dot family, and it exceeds
   what the known techniques (wider loads, wave scheduling) could recover
   — the LUT decode cost is that family's ceiling. The one genuinely slow
-  decode shape was the BF16 hc-down 16-bit GEMV (629 MB at 84 GB/s vs the
-  control's Q8_0 320 MB at 182); it is fixed by a two-rows-per-wave
-  retune (82 → 116 GB/s cold), and a faster double-tile variant was
-  rejected as code that does not pay for itself.
+  decode shape is the BF16 hc-down 16-bit GEMV (629 MB at 84 GB/s vs the
+  control's Q8_0 320 MB at 182); its two-rows-per-wave form runs at
+  116 GB/s cold, and the faster double-tile variant does not pay for its
+  code.
 - Prefill: the residual -25..-29% is measured compute-bound, not byte- or
   launch-bound. The dequant-to-F16 route runs at 13-14 TFLOPS ≈ the
-  F16-WMMA ceiling at these shapes (the HC down widening cut bytes ~-25%
-  for -3% time); the pp window idles 5-8% on both mixes (not
+  F16-WMMA ceiling at these shapes (the wide HC down moves ~25% fewer bytes
+  for ~3% less time); the pp window idles 5-8% on both mixes (not
   launch-bound); +21% dispatches vs the control is the mixed-type-stack
   class. The unquantized narrow plan stays 64x128; upstream's <128,128>
   wide plan is not used (the 64x128 plan serves the same shapes, and the
@@ -434,11 +446,7 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
   20.1 vs 28.3, Q4_K 21.4 vs 28.3; an earlier BM=128 route measured 856
   vs 1108 t/s) — the per-accumulator-element fixups eat the 2x int8
   WMMA rate; the routed compact-Q8 tier was gated on it and not built.
-- Control health: UD-Q4_K_XL is regression-free vs `main`. Against the
-  previous measurement its absolute cells improved too (pp +2..5%, AR tg +5%,
-  MTP tg at depth +49%) — upstream's decode, attention and prompt-lookup
-  changes, not a GSQ regression; the GSQ cells improved alongside (AR tg
-  +2..4%, MTP tg at depth +37..38%).
+- Control health: UD-Q4_K_XL is regression-free vs `main`.
 
 ## Vendored-code obligations
 
