@@ -575,6 +575,12 @@ __launch_bounds__(64) static __global__
   }
 
   constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
+  // The low-bit IQ formats decode each weight fragment once per row and K
+  // block, then reuse it across the group's tokens.
+  constexpr bool iq_fragment =
+      type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+      type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+      type == GGML_TYPE_IQ3_S;
   constexpr int columns = single_request ? 1 : tokens;
   int token = 0;
   if constexpr (split) {
@@ -602,6 +608,20 @@ __launch_bounds__(64) static __global__
       const Q4MoeFragment w0(
           weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
       const Q4MoeFragment w1(
+          weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+          kqs);
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const auto* x = input + t * input_stride + kb * (qk / QK8_1);
+        sum[t][0] += w0.Dot(x, kqs);
+        sum[t][1] += w1.Dot(x, kqs);
+      }
+    } else if constexpr (iq_fragment && !single_request) {
+      const IqMoeFragment<type> w0(
+          weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+      const IqMoeFragment<type> w1(
           weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
           kqs);
 #pragma unroll
