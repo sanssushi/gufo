@@ -16,6 +16,7 @@
 
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -250,6 +251,68 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
         Require(candidates.ids[i] == ids[i] &&
                     candidates.logits[i] == all_logits[ids[i]],
                 "MTP candidates differ from full Q8 head");
+      // Direct table oracle: the full projection supplies each real row's
+      // score. A one-row prefix guarantees rare candidates without assuming
+      // anything about a generated continuation. Reverse table order between
+      // steps and replace a larger table to exercise stale-slot masking.
+      Require(device.draft_output().rows == 1, "table oracle needs prefix=1");
+      std::vector<std::int32_t> table(q::kMtpCandidates + 17);
+      for (std::size_t i = 0; i < table.size(); ++i)
+        table[i] = static_cast<std::int32_t>(
+            q::kMtpDraftVocab + (i * 7919 + step * 31 + sequence) %
+                                    (c.vocab_size - q::kMtpDraftVocab));
+      table.front() = c.vocab_size - 1;
+      for (auto* session : {sessions[sequence].get(), serial[sequence].get()})
+        Require(exec.AppendDraftRows(*session, 0, table, &error), error);
+      table.resize(q::kMtpCandidates);
+      if (step % 2)
+        std::reverse(table.begin(), table.end());
+      for (auto* session : {sessions[sequence].get(), serial[sequence].get()})
+        Require(exec.ClearDraftRows(*session, 0, &error) &&
+                    exec.AppendDraftRows(*session, 0, table, &error),
+                error);
+      std::vector<std::uint32_t> subset{0};
+      subset.insert(subset.end(), table.begin(), table.end());
+      std::stable_sort(subset.begin(), subset.end(), [&](auto a, auto b) {
+        return all_logits[a] > all_logits[b];
+      });
+      const auto check_table = [&](const q::MtpCandidateLogits& actual,
+                                   std::int32_t token) {
+        Require(actual.size == q::kMtpCandidates &&
+                    token == static_cast<std::int32_t>(subset.front()),
+                "draft table argmax differs from full projection");
+        for (std::size_t i = 0; i < actual.size; ++i)
+          Require(actual.ids[i] == subset[i] &&
+                      actual.logits[i] == all_logits[subset[i]],
+                  "draft table IDs or scores differ from full projection");
+      };
+      for (const unsigned width : {1U, 2U}) {
+        for (const bool mixed : {false, true}) {
+          std::array<q::MtpCandidateLogits, 2> subset_candidates;
+          std::array<std::int32_t, 2> subset_tokens{};
+          std::array<q::rocm::Executor::MtpHeadItem, 2> heads{{
+              {sessions[sequence].get(),
+               {.token = &subset_tokens[0],
+                .candidates = &subset_candidates[0],
+                .draft_subset = true}},
+              {serial[sequence].get(),
+               {.token = &subset_tokens[1],
+                .candidates = &subset_candidates[1],
+                .draft_subset = !mixed}},
+          }};
+          Require(exec.MtpHeads(std::span(heads).first(width), &error), error);
+          check_table(subset_candidates[0], subset_tokens[0]);
+          if (width == 2 && !mixed)
+            check_table(subset_candidates[1], subset_tokens[1]);
+          if (width == 2 && mixed)
+            Require(subset_candidates[1].ids == candidates.ids &&
+                        subset_candidates[1].logits == candidates.logits,
+                    "table peer changed the full-head candidates");
+        }
+      }
+      std::puts(
+          "MTP draft table: real row scores, rare IDs, masked slots and "
+          "scalar/all-small/mixed heads exact");
       next[sequence] = candidates.ids[0];
     }
   }

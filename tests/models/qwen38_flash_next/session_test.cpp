@@ -1088,24 +1088,32 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     return std::vector<sampling::TokenId>(tokens.begin(), tokens.end());
   };
 
-  // Rare tokens in the prompt were misses, but the window has passed, so the
-  // greedy continuation drafts its rare tokens through the table. It also
-  // repeats the prompt, so lookup copies supply some of its chains.
+  // The window has passed, so these cycles use the small head. The target
+  // may switch languages or reject drafts; compare it against full-head AR
+  // instead of assuming a rare-token fraction or draft acceptance rate.
+  // The MTP audit checks table row scores and remapped IDs directly.
   auto t = create();
   Require(t->Sync(thai, &error), error);
   sampling::SamplerState greedy({}, history(thai));
   HeadUse tabled;
   const auto thai_out = decode_counted(*t, greedy, 8, &tabled);
   const auto& ts = t->Statistics();
+  auto ar = model->CreateSession(gufo::core::SessionMode::kAutoregressive, 6145,
+                                 &error);
+  Require(ar && ar->Sync(thai, &error), error);
+  sampling::SamplerState ar_greedy({}, history(thai));
+  for (const auto token : thai_out) {
+    Require(
+        ar_greedy.Sample(ar->Logits()) == static_cast<sampling::TokenId>(token),
+        "tabled draft head changed the greedy target continuation");
+    ar_greedy.Accept(static_cast<sampling::TokenId>(token));
+    Require(ar->Evaluate(token, &error), error);
+  }
+  RequireExact(ar->Logits(), t->Logits(),
+               "tabled draft head changed target frontier logits");
   Require(tabled.drafting > 0, "no tabled cycle drafted through the MTP head");
   Require(tabled.small_head == tabled.drafting,
           "tabled text did not return to the small head");
-  Require(RareTokens(thai_out) * 3 >= thai_out.size(),
-          "the repeated Thai continuation has too few rare tokens");
-  // Wrong table IDs would reject every drafted rare token. Accepted copies
-  // are not drafts of the head, so they are left out.
-  Require((ts.accepted - ts.lookup_accepted) * 2 >= ts.drafted - ts.lookup,
-          "small-head drafts of tabled tokens were rejected");
   // Later restores into this session replace its statistics.
   const auto tabled_copies = ts.lookup;
 

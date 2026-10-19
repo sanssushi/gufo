@@ -341,6 +341,13 @@ session/audit replay.
   a tight `ffn-experts` compare (5e-5) — ulp-level GPU-vs-F64 noise otherwise
   flips one Q8_1 code and amplifies to 5e-4 divergence (a probe-only class;
   production is GPU-only and deterministic).
+- Draft-vocabulary checks compare the small-head greedy continuation and
+  final logits byte-exactly with full-head AR. The MTP audit compares real
+  table-row scores and remapped rare-token IDs with an independent full-head
+  projection, including empty-slot masking, table replacement, scalar heads,
+  all-small-head batches and mixed full/small-head batches. Its one-row prefix
+  guarantees rare-token candidate coverage independently of generated language
+  or neural-draft acceptance rate.
 - Determinism profile: greedy traces are deterministic per binary; the bench
   d32768 128-token completion is bit-identical (sha `d856f78e…`) across all
   three models, AR and MTP. d0 traces diverge per model/binary in the
