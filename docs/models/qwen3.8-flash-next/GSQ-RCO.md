@@ -21,12 +21,12 @@ the UD-Q4_K_XL control is regression-free vs `main`. Speed (see
 mixes; MTP token generation at depth 32768 times the multi-row verification
 forward, because upstream's prompt-lookup draft copies bypass the neural draft
 head for greedy runs (identical 17 cycles / 111 accepted across all three
-models): the residual (about -3..-3.5% xxs, -6.5..-6.9% s) is the low-bit
+models): the residual (about -3..-3.5% xxs, -6..-6.5% s) is the low-bit
 formats' per-element decode at eight verification rows with the shared-expert
 weight-fragment reuse in place, not a draft, attention or dispatch deficit.
 MTP tg at depth 0 rides the
 draft-trajectory measurement class — accept-rate driven, not kernel speed.
-Prefill sits at -25..-29%, measured compute-bound — the residual is the
+Prefill sits at about -19..-24%, measured compute-bound — the residual is the
 formats' F16-WMMA arithmetic cost, not a byte, launch or dispatch deficit.
 
 ## Targets and artifacts
@@ -246,7 +246,10 @@ Three fused paths accept BF16 where Q4_K_XL used Q8_0:
   with `kStageBf16` on `DenseF16GEMMKernel` (BF16 rows rounded to F16 at the
   LDS commit — exact for every BF16 value in F16's range, same two-chain K
   order as the F16 path); `HcMixF16Gemm` runs the up as
-  `kHalfWeights + kStageBf16`; the SiLU'd rank rows reach the gate buffer as
+  `kHalfWeights + kStageBf16`, the BF16 up on the 128-row `kHcMix` tile
+  (32 hidden channels per tile across the four streams, the same two K16
+  chains and 128-token width as the Q8_0 256-row specialization); the
+  SiLU'd rank rows reach the gate buffer as
   F16 via SiluScale + NarrowActivations. F32 downs re-norm into the F32
   scratch on the wide route.
 - Two pinned hazards: the mixed row's tiled-Q8 copy is gated on
@@ -394,31 +397,36 @@ and detached (`--speculative off`) for the AR cells, one binary for
 all three models; every cell is the delta against the unsloth UD-Q4_K_XL
 control measured in interleaved rounds on that binary (two rounds, r1/r2).
 
-Δ vs UD-Q4_K_XL control (r1/r2):
+Δ vs UD-Q4_K_XL control (canonical alternating rounds, r1/r2 unless marked
+steady):
 
 | cell | xxs | s |
 | --- | ---: | ---: |
-| AR tg128 | -2.5/-2.2% | -6.9/-6.9% |
-| AR tg128 @ d32768 | -2.2/-2.2% | -6.7/-6.7% |
-| MTP tg128 | -11.3/-10.4% | -19.8/-20.0% |
-| MTP tg128 @ d32768 | -3.0/-3.5% | -6.9/-6.5% |
-| pp (all cells, both modes/depths) | ≈ -25..-29% | ≈ -25..-29% |
+| AR tg128 (steady) | ≈ -1% | ≈ -6% |
+| AR tg128 @ d32768 | -2.0/-2.0% | -6.5/-6.6% |
+| MTP tg128 (draft-trajectory) | -11.8/-10.3% | -19.1/-18.8% |
+| MTP tg128 @ d32768 | -2.9/-3.3% | -6.2/-5.7% |
+| pp2048 @ d32768 (off) | -20.8/-19.7% | -21.1/-19.5% |
+| pp2048 @ d32768 (mtp) | -19.2/-19.0% | -19.0/-18.7% |
+| pp2048 d0 (steady) | ≈ -23% | ≈ -22..-23% |
 
-- Decode reading: AR tg is at parity to about -7%; the s cells read
-  -6.9/-6.9% at depth 0 and -6.7/-6.7% at depth 32768. MTP tg depth-0 cells
+- Decode reading: AR tg is at parity to about -7%; steady depth-0 cells
+  measure about -1% (xxs) and -6% (s), and the depth-32768 cells read
+  -2.0/-2.0% (xxs) and -6.5/-6.6% (s). Depth-0 AR cells carry launch
+  run-noise: individual multi-depth-round cells read as low as 22.7 t/s
+  (xxs) and 21.8 t/s (s) while focused alternating reruns read 26.7-26.9
+  and 25.4-25.5 t/s against the control's ~27. MTP tg depth-0 cells
   sit in the draft-trajectory class: speed tracks draft accept-rate, not
   kernel speed (the control itself reads 37-43 t/s across rounds with
   identical cycles and accepted counts; each model's counters are
   deterministic per binary). At depth 32768 upstream's prompt-lookup draft
   copies bypass the neural draft head for greedy runs (identical 17 cycles /
   111 accepted across all three models), so that cell times the multi-row
-  verification forward: the -3..-3.5% (xxs) / -6.5..-6.9% (s) residual is the
+  verification forward: the -3..-3.5% (xxs) / -6..-6.5% (s) residual is the
   low-bit formats' per-element decode at 8 verification rows with the
   shared-expert weight-fragment reuse in place (the routed gate/up stage is
   434 ms per 17 copied-32K verification cycles on xxs, at that stage's
-  decode-bound ceiling), not a draft, attention or dispatch deficit. One r1
-  AR tg128 d0 s cell read 21.64 t/s — a run-noise one-off (its d32768 cell
-  and reruns read ~25).
+  decode-bound ceiling), not a draft, attention or dispatch deficit.
 - Decode ceilings (standalone per-format saturation cells measured with
   canonical block accounting, real GGUF weight blocks and per-cell CPU-dot
   validation): the practical DRAM read peak is 216.2 GB/s;
@@ -436,17 +444,22 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
   control's Q8_0 320 MB at 182); its two-rows-per-wave form runs at
   116 GB/s cold, and the faster double-tile variant does not pay for its
   code.
-- Prefill: the residual -25..-29% is measured compute-bound, not byte- or
-  launch-bound. The dequant-to-F16 route runs at 13-14 TFLOPS ≈ the
+- Prefill: the residual about -19..-24% is measured compute-bound, not byte-
+  or launch-bound. The dequant-to-F16 route runs at 13-14 TFLOPS ≈ the
   F16-WMMA ceiling at these shapes (the wide HC down moves ~25% fewer bytes
   for ~3% less time); the pp window idles 5-8% on both mixes (not
   launch-bound); +21% dispatches vs the control is the mixed-type-stack
   class. The unquantized narrow plan stays 64x128; upstream's <128,128>
-  wide plan is not used (the 64x128 plan serves the same shapes, and the
-  control pp showed no regression). Cell-to-cell pp ratios span about
-  -19..-31% across the measured rounds; the control's pp rate varies more
-  than the mixes' between rounds, so that spread is measurement variance,
-  not a path difference.
+  wide plan is not used for that route (the 64x128 plan serves the same
+  shapes, and the control pp showed no regression). The warmed xxs pp2048
+  forward carries HC-up at 71.6 ms (control 51.4; the BF16 128-row tile
+  keeps both K16 chains spill-free), the half-weights HC-down family at
+  +161 ms, the mixed-type dense stacks at +178 ms and routed gate/up at
+  +62 ms. Depth-32768 pp cells are tightly -19..-21%; depth-0 cells read
+  about -22..-23.5% in steady alternating cells and read wider when the
+  control's d0 rate runs low (the control's pp rate varies more between
+  rounds than the mixes'), so that spread is measurement variance, not a
+  path difference.
 - Measured-negative routes (not built, and why): the HC up conversion is
   not conversion-bound (v_cvt 2.8% of the kernel body; an F16-weights
   variant of the same shape runs 3.2x faster on 1.9x bytes — the

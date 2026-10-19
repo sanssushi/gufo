@@ -7366,94 +7366,105 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   }
 
   if constexpr (kHcMix) {
-    static_assert(BM == 256 && BN == 128 && BK == 1 && WM == 4 && WN == 2);
+    static_assert((BM == 128 || BM == 256) && BN == 128 && BK == 1 && WM == 4 &&
+                  WN == 2);
     constexpr unsigned kHiddenTile = BM / 4;
+    // 256 threads cover kHiddenTile/4 tokens per pass, four hidden values
+    // each: 16 tokens for a 256-row tile, 32 for the 128-row BF16 tile.
+    constexpr unsigned kEpilogueTokens = 1024 / kHiddenTile;
+    constexpr unsigned kTilesPerPass = kEpilogueTokens / 16;
+    constexpr unsigned kPassesPerGroup = kWaveTokTiles / kTilesPerPass;
+    static_assert(4096 % BM == 0 && BN % kEpilogueTokens == 0);
+    static_assert(kWaveTokTiles % kTilesPerPass == 0);
     constexpr unsigned kStreamStride = kHiddenTile + 1;
-    constexpr unsigned kPlane = 16 * kStreamStride;
+    constexpr unsigned kPlane = kEpilogueTokens * kStreamStride;
     static_assert(4 * kPlane * sizeof(float) <= sizeof(s_lds));
     float* gates = reinterpret_cast<float*>(s_lds);
     const std::size_t hidden = m / 4;
 #pragma unroll
-    for (int j = 0; j < kWaveTokTiles; ++j) {
+    for (unsigned pass = 0; pass < BN / kEpilogueTokens; ++pass) {
+      const unsigned token_group = pass / kPassesPerGroup;
+      if (wave_tok == token_group) {
+        const unsigned j0 = (pass % kPassesPerGroup) * kTilesPerPass;
 #pragma unroll
-      for (int token_group = 0; token_group < WN; ++token_group) {
-        if (wave_tok == token_group) {
+        for (unsigned q = 0; q < kTilesPerPass; ++q) {
 #pragma unroll
           for (int i = 0; i < kWaveRowTiles; ++i) {
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
               const unsigned row =
                   (wave_row * kWaveRowTiles + i) * 16 + 2 * l + half_id;
-              gates[(row % 4) * kPlane + sub_lane * kStreamStride + row / 4] =
-                  acc[i][j][l];
+              gates[(row % 4) * kPlane + (q * 16 + sub_lane) * kStreamStride +
+                    row / 4] = acc[i][j0 + q][l];
             }
           }
         }
-        __syncthreads();
-        // A half-wave writes all 64 hidden values of one token. The stream
-        // planes are padded to avoid the gate transpose's LDS bank conflicts.
-        const unsigned token_in_tile = tid / (kHiddenTile / 4);
-        const unsigned h_local = (tid % (kHiddenTile / 4)) * 4;
-        const std::size_t token =
-            t_block + (token_group * kWaveTokTiles + j) * 16 + token_in_tile;
-        const std::size_t h = r_block / 4 + h_local;
-        if (token < batch) {
-          float4 value{0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
-          for (unsigned stream = 0; stream < 4; ++stream) {
-            const float* g = gates + stream * kPlane +
-                             token_in_tile * kStreamStride + h_local;
-            const float4 v = Load4(xn + token * m + stream * hidden + h);
-            // Preserve the separate mixer's F32 FMA rounding.
-            value.x = __fmaf_rn(v.x, SigmoidF(g[0]), value.x);
-            value.y = __fmaf_rn(v.y, SigmoidF(g[1]), value.y);
-            value.z = __fmaf_rn(v.z, SigmoidF(g[2]), value.z);
-            value.w = __fmaf_rn(v.w, SigmoidF(g[3]), value.w);
-          }
-          value.x *= 0.25F;
-          value.y *= 0.25F;
-          value.z *= 0.25F;
-          value.w *= 0.25F;
-          if (y != nullptr)
-            *reinterpret_cast<float4*>(y + token * hidden + h) = value;
-          if (mixed_half != nullptr) {
-            *reinterpret_cast<__half2*>(mixed_half + token * hidden + h) =
-                __floats2half2_rn(value.x, value.y);
-            *reinterpret_cast<__half2*>(mixed_half + token * hidden + h + 2) =
-                __floats2half2_rn(value.z, value.w);
-          }
-          if (mixed_q8 != nullptr) {
-            float max_abs = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
-                                  fmaxf(fabsf(value.z), fabsf(value.w)));
-#pragma unroll
-            for (int off = 4; off > 0; off >>= 1) {
-              max_abs = fmaxf(max_abs, XorLane(max_abs, off));
-            }
-            const float d = max_abs / 127.0F;
-            const float id = d != 0.0F ? 1.0F / d : 0.0F;
-            const auto q0 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.x * id))));
-            const auto q1 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.y * id))));
-            const auto q2 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.z * id))));
-            const auto q3 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.w * id))));
-            const unsigned pos = h % 32;
-            auto* tile = Q8ActTile(mixed_q8, hidden / 32,
-                                   token / kQ8ActTileTokens, h / 32);
-            const std::size_t tl = token % kQ8ActTileTokens;
-            *reinterpret_cast<unsigned*>(tile + (pos >> 4) * 256 + tl * 16 +
-                                         (pos & 15)) =
-                q0 | q1 << 8 | q2 << 16 | q3 << 24;
-            if (pos == 0) {
-              *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
-                                        tl * sizeof(float)) = d;
-            }
-          }
-        }
-        __syncthreads();
       }
+      __syncthreads();
+      // A half-wave writes all kHiddenTile hidden values of one token. The
+      // stream planes are padded to avoid the gate transpose's LDS bank
+      // conflicts.
+      const unsigned token_in_tile = tid / (kHiddenTile / 4);
+      const unsigned h_local = (tid % (kHiddenTile / 4)) * 4;
+      const std::size_t token =
+          t_block + pass * kEpilogueTokens + token_in_tile;
+      const std::size_t h = r_block / 4 + h_local;
+      if (token < batch) {
+        float4 value{0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+        for (unsigned stream = 0; stream < 4; ++stream) {
+          const float* g =
+              gates + stream * kPlane + token_in_tile * kStreamStride + h_local;
+          const float4 v = Load4(xn + token * m + stream * hidden + h);
+          // Preserve the separate mixer's F32 FMA rounding.
+          value.x = __fmaf_rn(v.x, SigmoidF(g[0]), value.x);
+          value.y = __fmaf_rn(v.y, SigmoidF(g[1]), value.y);
+          value.z = __fmaf_rn(v.z, SigmoidF(g[2]), value.z);
+          value.w = __fmaf_rn(v.w, SigmoidF(g[3]), value.w);
+        }
+        value.x *= 0.25F;
+        value.y *= 0.25F;
+        value.z *= 0.25F;
+        value.w *= 0.25F;
+        if (y != nullptr)
+          *reinterpret_cast<float4*>(y + token * hidden + h) = value;
+        if (mixed_half != nullptr) {
+          *reinterpret_cast<__half2*>(mixed_half + token * hidden + h) =
+              __floats2half2_rn(value.x, value.y);
+          *reinterpret_cast<__half2*>(mixed_half + token * hidden + h + 2) =
+              __floats2half2_rn(value.z, value.w);
+        }
+        if (mixed_q8 != nullptr) {
+          float max_abs = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                fmaxf(fabsf(value.z), fabsf(value.w)));
+#pragma unroll
+          for (int off = 4; off > 0; off >>= 1) {
+            max_abs = fmaxf(max_abs, XorLane(max_abs, off));
+          }
+          const float d = max_abs / 127.0F;
+          const float id = d != 0.0F ? 1.0F / d : 0.0F;
+          const auto q0 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.x * id))));
+          const auto q1 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.y * id))));
+          const auto q2 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.z * id))));
+          const auto q3 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.w * id))));
+          const unsigned pos = h % 32;
+          auto* tile = Q8ActTile(mixed_q8, hidden / 32,
+                                 token / kQ8ActTileTokens, h / 32);
+          const std::size_t tl = token % kQ8ActTileTokens;
+          *reinterpret_cast<unsigned*>(tile + (pos >> 4) * 256 + tl * 16 +
+                                       (pos & 15)) =
+              q0 | q1 << 8 | q2 << 16 | q3 << 24;
+          if (pos == 0) {
+            *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
+                                      tl * sizeof(float)) = d;
+          }
+        }
+      }
+      __syncthreads();
     }
     return;
   }
@@ -7617,12 +7628,17 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
       (up_type != WeightType::kQ8_0 && up_type != WeightType::kBF16)) {
     return false;
   }
-  const dim3 grid((n_tokens + 127) / 128, 4 * hidden / 256);
+  // The BF16 up tile halves the row count: 128 rows keep the two K16
+  // accumulator chains and the 128-token width at 128 F32 values per thread.
+  const dim3 grid((n_tokens + 127) / 128, up_type == WeightType::kBF16
+                                              ? 4 * hidden / 128
+                                              : 4 * hidden / 256);
   if (up_type == WeightType::kBF16) {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true, false,
-                                           false, true, false, false, true>),
-                       grid, dim3(kThreads), 0, stream, up, low_rank, mixed,
-                       n_tokens, 4 * hidden, rank, xn, mixed_half, mixed_q8);
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<128, 128, 1, 4, 2, 8, true, false, false, true,
+                            false, false, false, true>),
+        grid, dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
+        4 * hidden, rank, xn, mixed_half, mixed_q8);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true>), grid,
                        dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
