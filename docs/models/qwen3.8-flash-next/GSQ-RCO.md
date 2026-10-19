@@ -17,12 +17,12 @@ unsloth UD-Q4_K_XL target: AR and MTP generation (shared-Q8_0 MTP sidecar),
 image input (BF16 mmproj sidecar), chat template, graph capture, batched
 sessions, serving modes. All in-repo quality gates are green on both mixes, and
 the UD-Q4_K_XL control is regression-free vs `main`. Speed (see
-"Performance"): AR token generation is at parity or within about 6% on both
+"Performance"): AR token generation is at parity or within about 7% on both
 mixes; MTP token generation at depth 32768 times the multi-row verification
 forward, because upstream's prompt-lookup draft copies bypass the neural draft
 head for greedy runs (identical 17 cycles / 111 accepted across all three
-models): the residual (about -2% xxs, -6..-6.5% s) is the low-bit formats'
-per-element decode at eight verification rows with the shared-expert
+models): the residual (about -3..-3.5% xxs, -6.5..-6.9% s) is the low-bit
+formats' per-element decode at eight verification rows with the shared-expert
 weight-fragment reuse in place, not a draft, attention or dispatch deficit.
 MTP tg at depth 0 rides the
 draft-trajectory measurement class — accept-rate driven, not kernel speed.
@@ -316,10 +316,11 @@ session/audit replay.
   `CheckBf16Inject` against CPU-expanded F16/F32 references; double CPU mix
   reference within 5e-5/1e-4.
 - MoE: the fused epilogue residual is byte-exact against
-  `MoeEpilogueVec4 + HcCombine`, and the combine's square-sum uses one pinned
-  `__fmaf_rn` chain for the deferred (`kPrior`) and separate paths alike (a
-  split spelling diverged at Q8 rounding boundaries in this compilation
-  context); the routed SwiGLU-in-down-quantize codes are bit-identical to
+  `MoeEpilogueVec4 + HcCombine`, and the combine's square-sum and gamma-scale
+  multiplies use one pinned `__fmaf_rn`/`__fmul_rn` spelling for the deferred
+  (`kPrior`) and separate paths alike (a split spelling diverged at Q8
+  rounding boundaries in this compilation context); the routed
+  SwiGLU-in-down-quantize codes are bit-identical to
   SwigluKernel + the plain entry for all thirteen routed formats
   (`CheckSiluDownMmq`). The grouped gated vector's IQ2/IQ3 fragment reuse
   keeps each format's integer scale formula, dp4a order and float scale
@@ -397,21 +398,21 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
 
 | cell | xxs | s |
 | --- | ---: | ---: |
-| AR tg128 | -6.1/-1.5% | -5.9/-6.0% |
-| AR tg128 @ d32768 | -1.5/-1.9% | -6.3/-6.4% |
-| MTP tg128 | -9.4/-22.8% | -19.0/-19.1% |
-| MTP tg128 @ d32768 | -2.0/-2.4% | -6.5/-6.2% |
+| AR tg128 | -2.5/-2.2% | -6.9/-6.9% |
+| AR tg128 @ d32768 | -2.2/-2.2% | -6.7/-6.7% |
+| MTP tg128 | -11.3/-10.4% | -19.8/-20.0% |
+| MTP tg128 @ d32768 | -3.0/-3.5% | -6.9/-6.5% |
 | pp (all cells, both modes/depths) | ≈ -25..-29% | ≈ -25..-29% |
 
-- Decode reading: AR tg is at parity to about -6%; the s cells read
-  -5.9/-6.0% at depth 0 and -6.3/-6.4% at depth 32768. MTP tg depth-0 cells
+- Decode reading: AR tg is at parity to about -7%; the s cells read
+  -6.9/-6.9% at depth 0 and -6.7/-6.7% at depth 32768. MTP tg depth-0 cells
   sit in the draft-trajectory class: speed tracks draft accept-rate, not
   kernel speed (the control itself reads 37-43 t/s across rounds with
   identical cycles and accepted counts; each model's counters are
   deterministic per binary). At depth 32768 upstream's prompt-lookup draft
   copies bypass the neural draft head for greedy runs (identical 17 cycles /
   111 accepted across all three models), so that cell times the multi-row
-  verification forward: the -2..-2.4% (xxs) / -6.2..-6.5% (s) residual is the
+  verification forward: the -3..-3.5% (xxs) / -6.5..-6.9% (s) residual is the
   low-bit formats' per-element decode at 8 verification rows with the
   shared-expert weight-fragment reuse in place (the routed gate/up stage is
   434 ms per 17 copied-32K verification cycles on xxs, at that stage's
@@ -442,7 +443,10 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
   launch-bound); +21% dispatches vs the control is the mixed-type-stack
   class. The unquantized narrow plan stays 64x128; upstream's <128,128>
   wide plan is not used (the 64x128 plan serves the same shapes, and the
-  control pp showed no regression).
+  control pp showed no regression). Cell-to-cell pp ratios span about
+  -19..-31% across the measured rounds; the control's pp rate varies more
+  than the mixes' between rounds, so that spread is measurement variance,
+  not a path difference.
 - Measured-negative routes (not built, and why): the HC up conversion is
   not conversion-bound (v_cvt 2.8% of the kernel body; an F16-weights
   variant of the same shape runs 3.2x faster on 1.9x bytes — the
