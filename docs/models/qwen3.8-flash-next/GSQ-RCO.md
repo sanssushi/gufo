@@ -399,16 +399,20 @@ control measured in interleaved rounds on that binary (two rounds, r1/r2).
   or dispatch regression; absolute MTP tg improved 37-38% over the previous
   measurement. One r1 AR tg128 d0 s cell read 21.64 t/s in an earlier round — a
   run-noise one-off (its d32768 cell and two clean reruns read ~25).
-- Decode ceilings (measured): the practical DRAM read peak is 216.2 GB/s;
+- Decode ceilings (standalone per-format saturation cells measured with
+  canonical block accounting, real GGUF weight blocks and per-cell CPU-dot
+  validation): the practical DRAM read peak is 216.2 GB/s;
   the Q6_K head MMVQ runs at 98-100% of it — no headroom (the control's
   Q8_0 head moves more bytes per token at the same peak). The low-bit
   expert MMVQs run at 85-95% of their own formats' standalone saturation
-  ceilings (IQ2_S 116, IQ3_XXS 138, IQ3_S 155, IQ4_NL 191, IQ4_XS 207
-  GB/s at 512 used experts); the remaining gap is the per-lane grid-LUT
-  decode of the IQ vec-dot family, and it exceeds what the known
-  techniques (wider loads, wave scheduling) could recover — the LUT
-  decode cost is the formats' ceiling. The one genuinely slow decode
-  shape was the BF16 hc-down 16-bit GEMV (629 MB at 84 GB/s vs the
+  ceilings (512 used experts, pair gate/up: Q2_0 214, IQ4_NL 211, Q4_K
+  211, Q5_K 211, Q6_K 213, IQ4_XS 208, IQ3_S 153, IQ3_XXS 138, IQ2_S 118,
+  IQ2_XS 110, IQ2_XXS 102 GB/s; down: IQ4_NL 212, Q2_0 185). Q2_0 and
+  IQ4_NL reach DRAM class; the remaining gap for the IQ2/IQ3 family is
+  the per-lane grid-LUT decode of the IQ vec-dot family, and it exceeds
+  what the known techniques (wider loads, wave scheduling) could recover
+  — the LUT decode cost is that family's ceiling. The one genuinely slow
+  decode shape was the BF16 hc-down 16-bit GEMV (629 MB at 84 GB/s vs the
   control's Q8_0 320 MB at 182); it is fixed by a two-rows-per-wave
   retune (82 → 116 GB/s cold), and a faster double-tile variant was
   rejected as code that does not pay for itself.
