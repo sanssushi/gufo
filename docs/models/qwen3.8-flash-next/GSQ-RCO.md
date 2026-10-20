@@ -26,8 +26,10 @@ formats' per-element decode at eight verification rows with the shared-expert
 weight-fragment reuse in place, not a draft, attention or dispatch deficit.
 MTP tg at depth 0 rides the
 draft-trajectory measurement class — accept-rate driven, not kernel speed.
-Prefill sits at about -19..-24%, measured compute-bound — the residual is the
+Prefill sits at about -18..-23%, measured compute-bound — the residual is the
 formats' F16-WMMA arithmetic cost, not a byte, launch or dispatch deficit.
+The IQ2/IQ3 prefill sub-block decode builds each signed-byte group directly
+from the grid words with packed sign masks.
 
 ## Targets and artifacts
 
@@ -146,11 +148,15 @@ additions to vendored files are recorded as re-import obligations in
   `kLowBit` sub-block staging dequantizes the eight low-bit expert formats
   into F16 tiles using the shared `DecodeQuantSub16` decoders
   (`src/models/qwen/hip/quant_ops.hpp`), with the paired gate/up SwiGLU fusion
-  riding along. Q5_1 rows stage their 24-byte blocks as stored in LDS (scale,
-  high word and codes read per K block); K-quant/IQ rows stage codes plus
-  their per-block affine. The series' pair design is kept wholesale — cached
-  headers, cndmask code-group selection, the F16 LDS pair epilogue — with its
-  `HeaderByte` header decoder.
+  riding along. The IQ2/IQ3 sub16 decoders build the four signed-byte words
+  from the grid entries by group (two 64-bit IQ2 words or four 32-bit IQ3
+  words per sub16), with in-register sign bytes and byte-wise negation; Q2_0
+  expands a packed code word. Grid magnitudes and signs are decoded by
+  group, not element-wise. Q5_1 rows
+  stage their 24-byte blocks as stored in LDS (scale, high word and codes read
+  per K block); K-quant/IQ rows stage codes plus their per-block affine. The
+  series' pair design is kept wholesale — cached headers, cndmask code-group
+  selection, the F16 LDS pair epilogue — with its `HeaderByte` header decoder.
 - Wide batches take the 64-token down map and the 128-token paired gate/up
   map (`routed_64_tiles_` / `routed_pair_*`); `WmmaExperts` (upstream's helper
   shape, its condition carrying our `RoutedF16Type` gate) selects the tier.
@@ -409,9 +415,9 @@ steady):
 | AR tg128 @ d32768 | -2.0/-2.0% | -6.5/-6.6% |
 | MTP tg128 (draft-trajectory) | -11.8/-10.3% | -19.1/-18.8% |
 | MTP tg128 @ d32768 | -2.9/-3.3% | -6.2/-5.7% |
-| pp2048 @ d32768 (off) | -20.8/-19.7% | -21.1/-19.5% |
-| pp2048 @ d32768 (mtp) | -19.2/-19.0% | -19.0/-18.7% |
-| pp2048 d0 (steady) | ≈ -23% | ≈ -22..-23% |
+| pp2048 @ d32768 (off) | -18.4/-18.1% | -19.0/-18.5% |
+| pp2048 @ d32768 (mtp) | -17.9/-17.7% | -18.4/-17.6% |
+| pp2048 d0 (steady) | ≈ -21..-23% | ≈ -22..-23% |
 
 - Decode reading: AR tg is at parity to about -7%; steady depth-0 cells
   measure about -1% (xxs) and -6% (s), and the depth-32768 cells read
@@ -447,23 +453,23 @@ steady):
   control's Q8_0 320 MB at 182); its two-rows-per-wave form runs at
   116 GB/s cold, and the faster double-tile variant does not pay for its
   code.
-- Prefill: the residual about -19..-24% is measured compute-bound, not byte-
-  or launch-bound. The dequant-to-F16 route runs at 13-14 TFLOPS ≈ the
-  F16-WMMA ceiling at these shapes (the wide HC down moves ~25% fewer bytes
-  for ~3% less time); the pp window idles 5-8% on both mixes (not
-  launch-bound); +21% dispatches vs the control is the mixed-type-stack
-  class. The unquantized narrow plan stays 64x128; upstream's <128,128>
-  wide plan is not used for that route (the 64x128 plan serves the same
-  shapes, and the control pp showed no regression). The warmed xxs pp2048
-  forward carries HC-up at 71.6 ms (control 51.4; the BF16 128-row tile
-  keeps both K16 chains spill-free), the half-weights HC-down family at
-  +161 ms (the BF16 down projection alone is about 158 ms, against the
-  control's 48 ms int8 WMMA specialization), the mixed-type dense stacks at
-  +178 ms and routed gate/up at +62 ms. Depth-32768 pp cells are tightly
-  -19..-21%; depth-0 cells read about -22..-23.5% in steady alternating
-  cells and read wider when the control's d0 rate runs low (the control's
-  pp rate varies more between rounds than the mixes'), so that spread is
-  measurement variance, not a path difference.
+- Prefill: the residual about -18..-23% is measured compute-bound, not byte-
+  or launch-bound. The dequant-to-F16 route runs at the F16-WMMA ceiling at
+  these shapes (the wide HC down moves ~25% fewer bytes for ~3% less time);
+  the pp window idles 5-8% on both mixes (not launch-bound); +21% dispatches
+  vs the control is the mixed-type-stack class. The unquantized narrow plan
+  stays 64x128; upstream's <128,128> wide plan is not used for that route
+  (the 64x128 plan serves the same shapes, and the control pp showed no
+  regression). The warmed xxs pp2048 forward carries HC-up at 70.5 ms
+  (control 51.6; the BF16 128-row tile keeps both K16 chains spill-free),
+  the half-weights HC-down family at +157 ms (the BF16 down projection alone
+  is about 158 ms, against the control's 48 ms int8 WMMA specialization),
+  the mixed-type dense stacks at +166 ms and routed gate/up at +20 ms.
+  Depth-32768 pp cells are tightly -18..-19%; depth-0 cells read about
+  -21..-23% in steady alternating cells and read wider when the control's
+  d0 rate runs low (the control's pp rate varies more between rounds than
+  the mixes'), so that spread is measurement variance, not a path
+  difference.
 - Measured-negative routes (not built, and why): the HC up conversion is
   not conversion-bound (v_cvt 2.8% of the kernel body; an F16-weights
   variant of the same shape runs 3.2x faster on 1.9x bytes — the
@@ -533,7 +539,7 @@ re-imports must re-apply the recorded blocks.
 | Loader | `src/models/qwen38_flash_next/weights.cpp` (`FormatOf`, role whitelists), `device_model.cpp` (upload gates, `Stack`, `kTailMargin`) |
 | Adapter (gufo-owned) | `kernels/rocm/mmq/qfn_mmq.h`, `qfn_mmq.hip.cpp`, `mmvq.hip.cpp`, `quantize.hip.cpp` |
 | Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
-| Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`) |
+| Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`, packed grid-group decode) |
 | Executor / dispatch | `src/models/qwen38_flash_next/executor.cpp` |
 | Other kernels touched | `kernels.hip.cpp` (`SmallGemmWideKernel`), `moe_wave64.hip.cpp` (untouched), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
 | Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |

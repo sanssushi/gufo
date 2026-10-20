@@ -12,8 +12,8 @@ alternating rounds; negative = slower):
 | --- | ---: | ---: |
 | AR tg128 @ d32768 | -2.0% | -6.6% |
 | MTP tg128 @ d32768 | -3.1% | -6.0% |
-| pp2048 @ d32768 (AR) | -20.3% | -20.3% |
-| pp2048 @ d32768 (MTP) | -19.1% | -18.9% |
+| pp2048 @ d32768 (AR) | -18.3% | -18.7% |
+| pp2048 @ d32768 (MTP) | -17.8% | -18.0% |
 
 # Gufo: The ***Open Source*** Strix Halo AI engine
 
