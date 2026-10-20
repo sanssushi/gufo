@@ -21,7 +21,7 @@ the UD-Q4_K_XL control is regression-free vs `main`. Speed (see
 mixes; MTP token generation at depth 32768 times the multi-row verification
 forward, because upstream's prompt-lookup draft copies bypass the neural draft
 head for greedy runs (identical 17 cycles / 111 accepted across all three
-models): the residual (about -3..-3.5% xxs, -6..-6.5% s) is the low-bit
+models): the residual (about -2.6..-2.8% xxs, -6.7..-6.8% s) is the low-bit
 formats' per-element decode at eight verification rows with the shared-expert
 weight-fragment reuse in place, not a draft, attention or dispatch deficit.
 MTP tg at depth 0 rides the
@@ -407,35 +407,37 @@ all three models; every cell is the delta against the unsloth UD-Q4_K_XL
 control measured in interleaved rounds on that binary (two rounds, r1/r2).
 
 Δ vs UD-Q4_K_XL control (canonical alternating rounds, r1/r2 unless marked
-steady):
+steady or focused d0):
 
 | cell | xxs | s |
 | --- | ---: | ---: |
-| AR tg128 (steady) | ≈ -1% | ≈ -6% |
-| AR tg128 @ d32768 | -2.0/-2.0% | -6.5/-6.6% |
-| MTP tg128 (draft-trajectory) | -11.8/-10.3% | -19.1/-18.8% |
-| MTP tg128 @ d32768 | -2.9/-3.3% | -6.2/-5.7% |
-| pp2048 @ d32768 (off) | -18.4/-18.1% | -19.0/-18.5% |
-| pp2048 @ d32768 (mtp) | -17.9/-17.7% | -18.4/-17.6% |
-| pp2048 d0 (steady) | ≈ -21..-23% | ≈ -22..-23% |
+| AR tg128 (steady) | ≈ -1% | ≈ -6..-7% |
+| AR tg128 @ d32768 | -1.4/-1.5% | -6.6/-6.5% |
+| MTP tg128 (draft-trajectory, focused d0) | -11.4/-10.9% | -20.1/-19.5% |
+| MTP tg128 @ d32768 | -2.8/-2.6% | -6.8/-6.7% |
+| pp2048 @ d32768 (off) | -18.2/-18.2% | -19.0/-18.7% |
+| pp2048 @ d32768 (mtp) | -17.4/-17.7% | -17.8/-17.7% |
+| pp2048 d0 (steady) | ≈ -20..-23% | ≈ -18..-23% |
 
 - Decode reading: AR tg is at parity to about -7%; steady depth-0 cells
-  measure about -1% (xxs) and -6% (s), and the depth-32768 cells read
-  -2.0/-2.0% (xxs) and -6.5/-6.6% (s). Depth-0 AR cells carry launch
+  measure about -1% (xxs) and -6..-7% (s), and the depth-32768 cells read
+  -1.4/-1.5% (xxs) and -6.6/-6.5% (s). Depth-0 AR cells carry launch
   run-noise: individual multi-depth-round cells read as low as 22.7 t/s
-  (xxs) and 21.8 t/s (s) while focused alternating reruns read 26.7-26.9
-  and 25.4-25.5 t/s against the control's ~27. MTP tg depth-0 cells
-  sit in the draft-trajectory class: speed tracks draft accept-rate, not
-  kernel speed (the control itself reads 37-43 t/s across rounds with
-  identical cycles and accepted counts; each model's counters are
-  deterministic per binary). At depth 32768 upstream's prompt-lookup draft
-  copies bypass the neural draft head for greedy runs (identical 17 cycles /
-  111 accepted across all three models), so that cell times the multi-row
-  verification forward: the -3..-3.5% (xxs) / -6..-6.5% (s) residual is the
-  low-bit formats' per-element decode at 8 verification rows with the
-  shared-expert weight-fragment reuse in place (the routed gate/up stage is
-  434 ms per 17 copied-32K verification cycles on xxs, at that stage's
-  decode-bound ceiling), not a draft, attention or dispatch deficit.
+  (xxs) and 21.8 t/s (s), focused alternating reruns read about 26.7 t/s
+  (xxs) and 25.2-25.5 t/s (s), and the control itself reads 23.5-27 t/s
+  across focused cells. MTP tg depth-0 cells sit in the draft-trajectory
+  class: speed tracks draft accept-rate, not kernel speed (the control
+  itself reads 37-44 t/s across rounds; a depth-0 run can take an
+  off-nominal draft trajectory at the same cycle count, which moves the
+  cell with the accept rate). At depth 32768 upstream's prompt-lookup
+  draft copies bypass the neural draft head for greedy runs (identical 17
+  cycles / 111 accepted across all three models), so that cell times the
+  multi-row verification forward: the -2.6..-2.8% (xxs) / -6.7..-6.8% (s)
+  residual is the low-bit formats' per-element decode at 8 verification
+  rows with the shared-expert weight-fragment reuse in place (the routed
+  gate/up stage is 434 ms per 17 copied-32K verification cycles on xxs, at
+  that stage's decode-bound ceiling), not a draft, attention or dispatch
+  deficit.
 - Decode ceilings (standalone per-format saturation cells measured with
   canonical block accounting, real GGUF weight blocks and per-cell CPU-dot
   validation): the practical DRAM read peak is 216.2 GB/s;
@@ -465,11 +467,11 @@ steady):
   the half-weights HC-down family at +157 ms (the BF16 down projection alone
   is about 158 ms, against the control's 48 ms int8 WMMA specialization),
   the mixed-type dense stacks at +166 ms and routed gate/up at +20 ms.
-  Depth-32768 pp cells are tightly -18..-19%; depth-0 cells read about
-  -21..-23% in steady alternating cells and read wider when the control's
-  d0 rate runs low (the control's pp rate varies more between rounds than
-  the mixes'), so that spread is measurement variance, not a path
-  difference.
+  Depth-32768 pp cells are tightly -18..-19%; depth-0 cells read within
+  about -18..-23%, their spread tracking the control's d0 rate (a lower
+  control rate widens the gap, a higher one narrows it; the control's pp
+  rate varies more between rounds than the mixes'), so that spread is
+  measurement variance, not a path difference.
 - Measured-negative routes (not built, and why): the HC up conversion is
   not conversion-bound (v_cvt 2.8% of the kernel body; an F16-weights
   variant of the same shape runs 3.2x faster on 1.9x bytes — the
