@@ -1,8 +1,19 @@
-This fork carries [GSQ-RCO quantization](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-support for Qwen3.8-Flash-Next (IQ3_XXS and IQ3_S weights) as a long-lived rebased patch series on
-`feat/gsq-rco` — do not base work on this fork: every upstream sync rewrites the branch.
-The state of the solution and the verification gates are documented in
+This fork adds [GSQ-RCO weights](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+support for Qwen3.8-Flash-Next (IQ3_XXS and IQ3_S). The solution is documented in
 [docs/models/qwen3.8-flash-next/GSQ-RCO.md](docs/models/qwen3.8-flash-next/GSQ-RCO.md).
+
+`feat/gsq-rco` is kept rebased onto upstream `main` — every sync rewrites the branch's history.
+Building on it is fine, but your branch will need rebasing whenever that happens.
+
+Speed vs unsloth UD-Q4_K_XL so far (single-user `gufo bench`, 2048-token prompt,
+alternating rounds; negative = slower):
+
+| Workload | IQ3_XXS | IQ3_S |
+| --- | ---: | ---: |
+| AR tg128 @ d32768 | -2.0% | -6.6% |
+| MTP tg128 @ d32768 | -3.1% | -6.0% |
+| pp2048 @ d32768 (AR) | -20.3% | -20.3% |
+| pp2048 @ d32768 (MTP) | -19.1% | -18.9% |
 
 # Gufo: The ***Open Source*** Strix Halo AI engine
 
