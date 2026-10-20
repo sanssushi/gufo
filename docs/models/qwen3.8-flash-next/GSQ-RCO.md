@@ -197,7 +197,10 @@ additions to vendored files are recorded as re-import obligations in
   instantiations for the K-quant/IQ ssm_in types) behind the widened
   executor gate (`KQuantWmmaType(ssm_in.type) && cols <= max_half_cols`,
   alongside `DenseF16Route`); the epilogue reads only the accumulated tile,
-  conv_w and history, so the weight format is transparent to it.
+  conv_w and history, so the weight format is transparent to it. The Q8_0
+  route retains each wave's decoded weight rows in registers; the GSQ
+  stacks stage their decoded fragments through LDS (the register variant is
+  slower for them; see "Performance").
 - `UnquantizedF16Gemm` (F16 or BF16-as-F16 weights, F16 activation rows) runs
   64-row x 128-token tiles (the W8A8Gemm narrow geometry; the K order per
   output is fixed, so results stay bit-exact across every prefill chunk
@@ -477,6 +480,12 @@ steady):
   against 158 ms in the warmed pp2048 forward; the smaller token tile
   multiplies BF16-to-F16 weight staging per token, and at 128 tokens the
   halved barrier count does not pay for the larger stage.
+  The SSM register-owned weight path is Q8_0-only: the register variant
+  measures 53.9-54.3 ms (xxs) and 70.2 ms (s) on the warmed pp2048 forward
+  against 48.7-49.2 and 66.2 ms with LDS staging. The half-wave exchange
+  costs sixteen lane permutes per K32 block where the staged path costs
+  twelve LDS instructions, and the low-bit decode already covers the LDS
+  round trip.
 - Control health: UD-Q4_K_XL is regression-free vs `main`.
 
 ## Vendored-code obligations
