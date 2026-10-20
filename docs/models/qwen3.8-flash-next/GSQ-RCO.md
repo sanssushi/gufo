@@ -454,12 +454,13 @@ steady):
   shapes, and the control pp showed no regression). The warmed xxs pp2048
   forward carries HC-up at 71.6 ms (control 51.4; the BF16 128-row tile
   keeps both K16 chains spill-free), the half-weights HC-down family at
-  +161 ms, the mixed-type dense stacks at +178 ms and routed gate/up at
-  +62 ms. Depth-32768 pp cells are tightly -19..-21%; depth-0 cells read
-  about -22..-23.5% in steady alternating cells and read wider when the
-  control's d0 rate runs low (the control's pp rate varies more between
-  rounds than the mixes'), so that spread is measurement variance, not a
-  path difference.
+  +161 ms (the BF16 down projection alone is about 158 ms, against the
+  control's 48 ms int8 WMMA specialization), the mixed-type dense stacks at
+  +178 ms and routed gate/up at +62 ms. Depth-32768 pp cells are tightly
+  -19..-21%; depth-0 cells read about -22..-23.5% in steady alternating
+  cells and read wider when the control's d0 rate runs low (the control's
+  pp rate varies more between rounds than the mixes'), so that spread is
+  measurement variance, not a path difference.
 - Measured-negative routes (not built, and why): the HC up conversion is
   not conversion-bound (v_cvt 2.8% of the kernel body; an F16-weights
   variant of the same shape runs 3.2x faster on 1.9x bytes — the
@@ -470,6 +471,12 @@ steady):
   20.1 vs 28.3, Q4_K 21.4 vs 28.3; an earlier BM=128 route measured 856
   vs 1108 t/s) — the per-accumulator-element fixups eat the 2x int8
   WMMA rate; the routed compact-Q8 tier was gated on it and not built.
+  The BF16 hyper-connection down projection [320, 10240] keeps the
+  64 x 128 tile with 64-element K stages: the 32-token/256-element-stage
+  and 128-token/128-element-stage plans measure about 180 ms and 160 ms
+  against 158 ms in the warmed pp2048 forward; the smaller token tile
+  multiplies BF16-to-F16 weight staging per token, and at 128 tokens the
+  halved barrier count does not pay for the larger stage.
 - Control health: UD-Q4_K_XL is regression-free vs `main`.
 
 ## Vendored-code obligations
