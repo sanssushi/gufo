@@ -28,14 +28,14 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -2.1% for xxs and -5.9..-6.2% for s) is the per-element
+  gap (about -2.3% for xxs and -6.5% for s) is the per-element
   decode cost of the low-bit weight formats at those eight verification
   rows; the shared expert's decoded weight fragments are reused across the
   tokens in a group. It is not a draft, attention or dispatch problem.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill is about 18-24% slower and is compute-bound. The gap is the
+- Prefill is about 16-23% slower and is compute-bound. The gap is the
   arithmetic cost of the F16 WMMA path used for these formats, not a byte,
   launch or dispatch problem.
 
@@ -309,12 +309,21 @@ Three fused paths accept BF16 weights, where UD-Q4_K_XL stores Q8_0:
   256-row specialization). The SiLU'd rank rows reach the gate buffer as
   F16 through SiluScale + NarrowActivations. F32 down projections
   re-normalize into the F32 scratch buffer on the wide route.
-- Two pinned caveats: the mixed row's tiled-Q8 copy is taken only when
-  `hidden <= max_q8_cols`. A GSQ upload without the Q8_0 MTP sidecar has
-  `max_q8_cols == 0`, which is how the probe runs; chat attaches the
-  sidecar automatically. The epilogue's mix and inject FMAs are pinned with
-  `__fmaf_rn`, because the build uses `-ffast-math` and reassociation would
-  break the byte-exactness contracts.
+- Two pinned caveats: the mixed row's tiled-Q8 copy is taken only when a
+  following Q8_0 dense projection consumes it and `hidden <= max_q8_cols`.
+  A GSQ upload without the Q8_0 MTP sidecar has `max_q8_cols == 0`, which
+  is how the probe runs; chat attaches the sidecar automatically. The
+  epilogue's mix and inject FMAs are pinned with `__fmaf_rn`, because the
+  build uses `-ffast-math` and reassociation would break the
+  byte-exactness contracts.
+- The wide combine writes the next mixer's F16 norm for every consumer and
+  its tiled Q8 copy only when that mixer's down projection is Q8_0; the GSQ
+  BF16 down projections read the F16 norm. The mix epilogue likewise writes
+  the mixed row's tiled Q8 copy only when a following dense projection is
+  Q8_0 (an attention or SSM stack, the router, or the shared expert). The
+  fused MoE combine accepts an omitted Q8 norm and skips only its
+  quantization and store, so its residual, normalization, deferred-update
+  and inject paths run unchanged.
 - The BF16 hyper-connection weights are within |w| ≤ 8.56, so F16 staging
   cannot overflow. 823 of 640 million values are below 6.1e-8 and flush to
   zero in F16 staging, contributing less than 5e-5; this is accepted.
@@ -384,6 +393,12 @@ Breaking any of them silently breaks session or audit replay.
 - HC BF16 byte-exactness: `CheckBf16Down`, `CheckFusedProjectionBf16` and
   `CheckBf16Inject` compare against CPU-expanded F16/F32 references; the
   double-precision CPU mix reference stays within 5e-5/1e-4.
+- Optional HC side outputs: the norm's tiled Q8 copy and the mixed row's
+  tiled Q8 copy are written only for consumers that read them. A requested
+  copy keeps its exact bytes; an omitted copy is left untouched while the
+  residual, F16 norm and inject partials stay bit-identical. The fused MoE
+  combine covers the gamma-null case and the deferred and separate paths at
+  one-row, 96-row and 2,049-row batches.
 - MoE: the fused epilogue residual is byte-exact against
   `MoeEpilogueVec4 + HcCombine`. The combine's square-sum and gamma-scale
   multiplies use the same pinned `__fmaf_rn`/`__fmul_rn` form in the
@@ -476,18 +491,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6..-7% |
-| AR tg128 at d32768 | -1.9/-1.7% | -6.7/-6.4% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -11.7/-11.6% | -20.1/-20.2% |
-| MTP tg128 at d32768 | -2.1/-2.1% | -5.9/-6.2% |
-| pp2048 at d32768, AR (speculation off) | -19.3/-18.0% | -19.4/-18.7% |
-| pp2048 at d32768, MTP | -17.9/-17.7% | -18.3/-18.1% |
-| pp2048 at d0, steady state | ≈ -20..-23% | ≈ -22..-24% |
+| AR tg128 at d32768 | -1.5/-1.8% | -6.3/-6.6% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -10.7/-10.8% | -20.0/-19.9% |
+| MTP tg128 at d32768 | -2.3/-2.8% | -6.5/-6.8% |
+| pp2048 at d32768, AR (speculation off) | -17.9/-17.2% | -18.8/-17.3% |
+| pp2048 at d32768, MTP | -16.5/-16.1% | -17.2/-16.7% |
+| pp2048 at d0, steady state | ≈ -15..-21% | ≈ -16..-23% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6..-7% (s); depth-32768
-  measurements are -1.9/-1.7% (xxs) and -6.7/-6.4% (s). Depth-0 AR
+  measurements are -1.5/-1.8% (xxs) and -6.3/-6.6% (s). Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
   focused reruns that alternate models read about 26.7 t/s (xxs) and
@@ -500,7 +515,7 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  -2.1% (xxs) and -5.9..-6.2% (s) gap is the low-bit formats'
+  -2.3% (xxs) and -6.5% (s) gap is the low-bit formats'
   per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -525,7 +540,7 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill: the about -18..-24% gap is compute-bound, not byte- or
+- Prefill: the about -16..-23% gap is compute-bound, not byte- or
   launch-bound. The dequant-to-F16 route runs at the F16-WMMA limit at these
   shapes (the wide HC down projection moves about 25% fewer bytes for about
   3% less time). Prefill execution has 5-8% idle time on both mixes, so it
@@ -539,8 +554,8 @@ focused depth 0):
   control (the BF16 down projection alone is about 158 ms, against the
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
   166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
-  measurements are consistently -18..-19%. Depth-0 measurements fall in
-  about -20..-24%, and their spread follows the control's own depth-0 rate
+  measurements are consistently -16..-17%. Depth-0 measurements fall in
+  about -15..-23%, and their spread follows the control's own depth-0 rate
   (a lower control rate widens the gap and a higher one narrows it; the
   control's prefill rate varies more between rounds than the mixes'). That
   spread is measurement variance, not a difference in the execution path.

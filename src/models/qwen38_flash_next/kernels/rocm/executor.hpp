@@ -504,10 +504,12 @@ private:
   /// `normed` says the previous Combine already produced m's grouped norm
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
   /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
-  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads.
+  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads. `q8t`
+  /// says a following dense projection reads the tiled Q8 copy of `mixed`.
   bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
              float* inject, std::uint32_t n_tokens, std::string* error_msg,
-             bool half_only = false, bool no_f32 = false) const;
+             bool half_only = false, bool no_f32 = false,
+             bool q8t = true) const;
   /// Share mixer projections across decode requests without selecting the
   /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -515,11 +517,12 @@ private:
                   std::string* error) const;
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
-  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
-  /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
-  /// partials in s_.inject (inject_fused_).
+  /// mixer (`gamma`); wide batches write it as F16 and, when that mixer's
+  /// down projection is Q8_0 (`norm_q8`), as tiled Q8. With that mixer's F32
+  /// `inject_w`, the fused MoE combine also leaves its inject partials in
+  /// s_.inject (inject_fused_).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr) const;
+               const float* inject_w = nullptr, bool norm_q8 = true) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,

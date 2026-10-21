@@ -215,6 +215,47 @@ int main() {
     if (Download(&d_res_norm, kResidual) != Download(&d_res_only, kResidual)) {
       throw std::runtime_error("skipping unused norm changed the residual");
     }
+    // The tiled Q8 norm is optional when the next mixer's down projection
+    // does not read it. A null output must leave the buffer untouched and
+    // produce the same residual and F16 norm; a requested one keeps its
+    // exact bytes.
+    {
+      HipBuffer<float> d_res_noq8(kResidual);
+      HipBuffer<__half> d_norm_noq8(kResidual);
+      Upload(&d_res_norm, residual);
+      CheckHip(hipMemset(d_q8.get(), 0, d_q8.bytes()), "clear requested Q8");
+      if (!q::HcCombineMoeF16(d_res_norm.get(), d_half.get(), d_weights.get(),
+                              d_shared.get(), d_gate.get(), kGateStride, kSlots,
+                              d_inject.get(), parts, d_gamma.get(),
+                              d_norm.get(), d_q8.get(), kTokens, kHidden, 4,
+                              1e-6F, nullptr)) {
+        throw std::runtime_error("fused MoE norm rejected with Q8");
+      }
+      const auto requested_res = Download(&d_res_norm, kResidual);
+      const auto requested_norm = Download(&d_norm, kResidual);
+      Upload(&d_res_noq8, residual);
+      CheckHip(hipMemset(d_q8.get(), 0xA5, d_q8.bytes()),
+               "poison unused Q8 norm");
+      if (!q::HcCombineMoeF16(d_res_noq8.get(), d_half.get(), d_weights.get(),
+                              d_shared.get(), d_gate.get(), kGateStride, kSlots,
+                              d_inject.get(), parts, d_gamma.get(),
+                              d_norm_noq8.get(), nullptr, kTokens, kHidden, 4,
+                              1e-6F, nullptr)) {
+        throw std::runtime_error("fused MoE norm rejected without Q8");
+      }
+      if (Download(&d_res_noq8, kResidual) != requested_res) {
+        throw std::runtime_error("skipping the Q8 norm changed the residual");
+      }
+      const auto noq8_norm = Download(&d_norm_noq8, kResidual);
+      if (std::memcmp(noq8_norm.data(), requested_norm.data(),
+                      d_norm.bytes()) != 0) {
+        throw std::runtime_error("skipping the Q8 norm changed the F16 norm");
+      }
+      const std::vector<std::uint8_t> poison(d_q8.bytes(), 0xA5);
+      if (Download(&d_q8, d_q8.bytes()) != poison) {
+        throw std::runtime_error("unused Q8 norm output was written");
+      }
+    }
     q::MoeEpilogueVec4F16(d_half.get(), d_weights.get(), d_shared.get(),
                           d_gate.get(), kGateStride, d_vec.get(), kTokens,
                           kSlots, kHidden, nullptr);
@@ -337,6 +378,99 @@ int main() {
     if (Download(&d_res_separate, kResidual) !=
         Download(&d_res_f32, kResidual)) {
       throw std::runtime_error("fusing the F32 combine changed it");
+    }
+    // Row boundaries: single-row, the wide-mixer threshold and a large
+    // prefill batch. The optional Q8 norm must not alter the residual or
+    // F16 norm, must stay unwritten when null, and the residual-only
+    // combine must stay fused.
+    for (const std::uint32_t rows : {1U, 96U, 2049U}) {
+      const std::size_t out = static_cast<std::size_t>(rows) * kHidden;
+      const std::size_t residual_count = out * 4;
+      const std::size_t expert_count =
+          static_cast<std::size_t>(rows) * kSlots * kHidden;
+      HipBuffer<float> d_expert_rows(expert_count);
+      HipBuffer<__half> d_half_rows(expert_count);
+      HipBuffer<float> d_weights_rows(static_cast<std::size_t>(rows) * kSlots);
+      HipBuffer<float> d_shared_rows(out);
+      HipBuffer<float> d_gate_rows(static_cast<std::size_t>(rows) *
+                                   kGateStride);
+      HipBuffer<float> d_inject_rows(static_cast<std::size_t>(rows) * 4 *
+                                     parts);
+      HipBuffer<float> d_gamma_rows(4 * kHidden);
+      HipBuffer<float> d_res_q8(residual_count);
+      HipBuffer<float> d_res_noq8(residual_count);
+      HipBuffer<float> d_res_only(residual_count);
+      HipBuffer<float> d_res_plain(residual_count);
+      HipBuffer<__half> d_norm_q8(residual_count);
+      HipBuffer<__half> d_norm_noq8(residual_count);
+      HipBuffer<std::uint8_t> d_q8_rows(q::Q8TiledBytes(rows, 4 * kHidden));
+      HipBuffer<float> d_block_rows(out);
+      Upload(&d_expert_rows, MakeValues(expert_count, 0x51A2U + rows, 1.0F));
+      Upload(&d_weights_rows,
+             MakeValues(static_cast<std::size_t>(rows) * kSlots, 0x9E37U, 0.5F,
+                        0.5F));
+      Upload(&d_shared_rows, MakeValues(out, 0x7C15U, 1.0F));
+      Upload(&d_gate_rows,
+             MakeValues(static_cast<std::size_t>(rows) * kGateStride, 0x3D2BU,
+                        3.0F));
+      Upload(&d_inject_rows,
+             MakeValues(static_cast<std::size_t>(rows) * 4 * parts, 0x6A09U,
+                        0.5F));
+      Upload(&d_gamma_rows, MakeValues(4 * kHidden, 0xBB67U, 0.5F, 1.0F));
+      const auto row_residual =
+          MakeValues(residual_count, 0x85EBU + rows, 1.0F);
+      Upload(&d_res_q8, row_residual);
+      Upload(&d_res_noq8, row_residual);
+      Upload(&d_res_only, row_residual);
+      q::NarrowActivations(d_expert_rows.get(), d_half_rows.get(), false,
+                           expert_count, nullptr);
+      if (!q::HcCombineMoeF16(
+              d_res_q8.get(), d_half_rows.get(), d_weights_rows.get(),
+              d_shared_rows.get(), d_gate_rows.get(), kGateStride, kSlots,
+              d_inject_rows.get(), parts, d_gamma_rows.get(), d_norm_q8.get(),
+              d_q8_rows.get(), rows, kHidden, 4, 1e-6F, nullptr)) {
+        throw std::runtime_error("row-size fused combine rejected");
+      }
+      CheckHip(hipMemset(d_q8_rows.get(), 0xA5, d_q8_rows.bytes()),
+               "poison row Q8 norm");
+      if (!q::HcCombineMoeF16(
+              d_res_noq8.get(), d_half_rows.get(), d_weights_rows.get(),
+              d_shared_rows.get(), d_gate_rows.get(), kGateStride, kSlots,
+              d_inject_rows.get(), parts, d_gamma_rows.get(), d_norm_noq8.get(),
+              nullptr, rows, kHidden, 4, 1e-6F, nullptr)) {
+        throw std::runtime_error("row-size fused combine rejected without Q8");
+      }
+      if (Download(&d_res_noq8, residual_count) !=
+          Download(&d_res_q8, residual_count)) {
+        throw std::runtime_error("row-size Q8 output changed the residual");
+      }
+      const auto norm_q8 = Download(&d_norm_q8, residual_count);
+      const auto norm_noq8 = Download(&d_norm_noq8, residual_count);
+      if (std::memcmp(norm_q8.data(), norm_noq8.data(), d_norm_q8.bytes()) !=
+          0) {
+        throw std::runtime_error("row-size Q8 output changed the F16 norm");
+      }
+      const std::vector<std::uint8_t> poison(d_q8_rows.bytes(), 0xA5);
+      if (Download(&d_q8_rows, d_q8_rows.bytes()) != poison) {
+        throw std::runtime_error("row-size unused Q8 output was written");
+      }
+      if (!q::HcCombineMoeF16(d_res_only.get(), d_half_rows.get(),
+                              d_weights_rows.get(), d_shared_rows.get(),
+                              d_gate_rows.get(), kGateStride, kSlots,
+                              d_inject_rows.get(), parts, nullptr, nullptr,
+                              nullptr, rows, kHidden, 4, 1e-6F, nullptr)) {
+        throw std::runtime_error("row-size residual-only combine rejected");
+      }
+      Upload(&d_res_plain, row_residual);
+      q::MoeEpilogueVec4F16(d_half_rows.get(), d_weights_rows.get(),
+                            d_shared_rows.get(), d_gate_rows.get(), kGateStride,
+                            d_block_rows.get(), rows, kSlots, kHidden, nullptr);
+      q::HcCombine(d_res_plain.get(), d_block_rows.get(), d_inject_rows.get(),
+                   parts, nullptr, nullptr, rows, kHidden, 4, 1e-6F, nullptr);
+      if (Download(&d_res_only, residual_count) !=
+          Download(&d_res_plain, residual_count)) {
+        throw std::runtime_error("row-size residual-only combine changed");
+      }
     }
     return worst == 0.0 ? 0 : 1;
   } catch (const std::exception& error) {

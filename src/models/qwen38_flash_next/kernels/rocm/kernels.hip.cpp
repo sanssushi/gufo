@@ -1177,6 +1177,9 @@ __global__ void HcCombineMoeKernel(
                             __high2float(hi)};
         }
       }
+      if (xn_q8 == nullptr) {
+        continue;
+      }
       // Eight lanes hold one 32-wide block: absmax over them, then each
       // lane stores its four codes as one word.
       float max_abs =
@@ -6163,7 +6166,6 @@ static bool HcCombineMoeLaunch(
     const float* prior_out = nullptr, const float* prior_w = nullptr,
     float* inject_out = nullptr, const float* inject_w = nullptr) {
   if (streams != 4 || hidden % 128 != 0 || hidden > 3 * 4 * kThreads ||
-      (gamma != nullptr && xn_q8 == nullptr) ||
       (inject_w != nullptr && (gamma == nullptr || prior_out == nullptr))) {
     return false;
   }

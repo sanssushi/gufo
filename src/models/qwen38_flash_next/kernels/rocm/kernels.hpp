@@ -147,7 +147,8 @@ void HcApplyDeferred(float* res, const float* block_out, const float* w,
 /// F16 rows), `weights`, the gated shared expert; it is formed in
 /// registers and never written. Returns false (launching nothing) for a
 /// geometry the fused kernel does not cover (four 2,560-wide streams).
-/// A null gamma updates only the residual; otherwise xn_q8 is required.
+/// A null gamma updates only the residual; otherwise the F16 norm is
+/// written and a non-null xn_q8 also receives its tiled Q8 copy.
 /// A non-null `prior_out` first applies a deferred HcCombineF16 update
 /// (its block output and `prior_w` stream weights). A non-null `inject_w`
 /// (with gamma and `prior_out`) also writes the next mixer's inject partials
