@@ -1624,6 +1624,22 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   return true;
 }
 
+bool Executor::QuantizeFor(std::initializer_list<const DeviceTensor*> consumers,
+                           const float* x, std::uint32_t n_tokens,
+                           std::uint32_t k, Q8Input* q,
+                           std::string* error_msg) const {
+  for (const DeviceTensor* w : consumers) {
+    if (w->type == GgmlType::kQ8_0) {
+      return Quantize(x, n_tokens, k, q, error_msg);
+    }
+  }
+  q->x = x;
+  q->data = nullptr;
+  q->n = n_tokens;
+  q->k = k;
+  return true;
+}
+
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
@@ -2477,7 +2493,8 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   }
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
-  if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
+  if (!QuantizeFor({&l.ple_key, &l.ple_value}, s_.ple_emb, n,
+                   c.PleEmbeddingDim(), &emb, error_msg) ||
       !Dense(l.ple_key, emb, s_.ple_key, error_msg) ||
       !Dense(l.ple_value, emb, s_.ple_value, error_msg)) {
     return false;
@@ -2551,7 +2568,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     qkv_stride = z_stride = l.ssm_in.rows;
   } else if (!projections_ready) {
     Q8Input xq;
-    if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+    if (!QuantizeFor({&l.ssm_qkv, &l.ssm_gate}, x, n_tokens, c.hidden_size, &xq,
+                     error_msg) ||
         !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
         !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
       return false;
@@ -2669,7 +2687,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   } else {
     Q8Input xq;
     if (!projections_ready &&
-        (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+        (!QuantizeFor({&l.attn_q, &l.attn_k, &l.attn_v}, x, n_tokens,
+                      c.hidden_size, &xq, error_msg) ||
          !Dense(l.attn_q, xq, s_.qg, error_msg) ||
          !Dense(l.attn_k, xq, s_.k, error_msg) ||
          !Dense(l.attn_v, xq, s_.v, error_msg))) {
