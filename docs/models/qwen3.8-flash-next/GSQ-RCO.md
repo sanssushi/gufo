@@ -28,14 +28,14 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -2.6..-2.8% for xxs and -6.7..-6.8% for s) is the per-element
+  gap (about -2.1% for xxs and -5.9..-6.2% for s) is the per-element
   decode cost of the low-bit weight formats at those eight verification
   rows; the shared expert's decoded weight fragments are reused across the
   tokens in a group. It is not a draft, attention or dispatch problem.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill is about 18-23% slower and is compute-bound. The gap is the
+- Prefill is about 18-24% slower and is compute-bound. The gap is the
   arithmetic cost of the F16 WMMA path used for these formats, not a byte,
   launch or dispatch problem.
 
@@ -227,6 +227,11 @@ vendored code is re-imported (see "Vendored-code obligations").
   error path distinguishes an unsupported format (probed through
   `qfn_mmq_moe_gated_type`) from a launch failure. `DenseBatch` sends
   quantized rows through one `qfn_mmq_dense` call.
+- Decode projections build the shared Q8_1 activation rows only when a
+  consumer is Q8_0. The attention Q/K/V, SSM QKV/gate and PLE key/value
+  groups quantize once for their Q8_0 consumers; every other format
+  quantizes the F32 rows in its own entry, so the GSQ dense groups run no
+  unused shared pass.
 - Q6_K is fully supported by the adapter (`WeightType::kQ6_K = 14`; the
   MMVQ, MMQ and gated cases exist).
 - Wide dense GEMMs (prefill): `DenseF16GEMMKernel` decodes the k-quant/IQ
@@ -471,18 +476,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6..-7% |
-| AR tg128 at d32768 | -1.4/-1.5% | -6.6/-6.5% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -11.4/-10.9% | -20.1/-19.5% |
-| MTP tg128 at d32768 | -2.8/-2.6% | -6.8/-6.7% |
-| pp2048 at d32768, AR (speculation off) | -18.2/-18.2% | -19.0/-18.7% |
-| pp2048 at d32768, MTP | -17.4/-17.7% | -17.8/-17.7% |
-| pp2048 at d0, steady state | ≈ -20..-23% | ≈ -18..-23% |
+| AR tg128 at d32768 | -1.9/-1.7% | -6.7/-6.4% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -11.7/-11.6% | -20.1/-20.2% |
+| MTP tg128 at d32768 | -2.1/-2.1% | -5.9/-6.2% |
+| pp2048 at d32768, AR (speculation off) | -19.3/-18.0% | -19.4/-18.7% |
+| pp2048 at d32768, MTP | -17.9/-17.7% | -18.3/-18.1% |
+| pp2048 at d0, steady state | ≈ -20..-23% | ≈ -22..-24% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6..-7% (s); depth-32768
-  measurements are -1.4/-1.5% (xxs) and -6.6/-6.5% (s). Depth-0 AR
+  measurements are -1.9/-1.7% (xxs) and -6.7/-6.4% (s). Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
   focused reruns that alternate models read about 26.7 t/s (xxs) and
@@ -495,7 +500,7 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  -2.6..-2.8% (xxs) and -6.7..-6.8% (s) gap is the low-bit formats'
+  -2.1% (xxs) and -5.9..-6.2% (s) gap is the low-bit formats'
   per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -520,7 +525,7 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill: the about -18..-23% gap is compute-bound, not byte- or
+- Prefill: the about -18..-24% gap is compute-bound, not byte- or
   launch-bound. The dequant-to-F16 route runs at the F16-WMMA limit at these
   shapes (the wide HC down projection moves about 25% fewer bytes for about
   3% less time). Prefill execution has 5-8% idle time on both mixes, so it
@@ -535,7 +540,7 @@ focused depth 0):
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
   166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
   measurements are consistently -18..-19%. Depth-0 measurements fall in
-  about -18..-23%, and their spread follows the control's own depth-0 rate
+  about -20..-24%, and their spread follows the control's own depth-0 rate
   (a lower control rate widens the gap and a higher one narrows it; the
   control's prefill rate varies more between rounds than the mixes'). That
   spread is measurement variance, not a difference in the execution path.
