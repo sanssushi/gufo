@@ -130,13 +130,15 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
 /// the stream weights land in defer_w, and true is returned. The update is
 /// then owed by HcCombineMoeF16 (prior_out, prior_w) or HcApplyDeferred.
 /// A deferring combine given `inject_w` also writes the next mixer's
-/// inject partials to `inject_out` (see HcCombineMoeF16).
+/// inject partials to `inject_out` (see HcCombineMoeF16). `inject_w` holds
+/// F32 or BF16 weights, selected by `inject_type`.
 bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
                   float* defer_w = nullptr, float* inject_out = nullptr,
-                  const float* inject_w = nullptr);
+                  const void* inject_w = nullptr,
+                  WeightType inject_type = WeightType::kF32);
 /// Applies the residual update a deferring HcCombineF16 left out (four
 /// streams), with the same arithmetic.
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
@@ -153,7 +155,8 @@ void HcApplyDeferred(float* res, const float* block_out, const float* w,
 /// (its block output and `prior_w` stream weights). A non-null `inject_w`
 /// (with gamma and `prior_out`) also writes the next mixer's inject partials
 /// to `inject_out`, as HcMixF16Gemm would from the F16 norm; they may
-/// replace this combine's own `inject` logits.
+/// replace this combine's own `inject` logits. `inject_w` holds F32 or BF16
+/// weights, selected by `inject_type`.
 bool HcCombineMoeF16(
     float* res, const __half* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
@@ -161,7 +164,8 @@ bool HcCombineMoeF16(
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t n_tokens,
     std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
     const float* prior_out = nullptr, const float* prior_w = nullptr,
-    float* inject_out = nullptr, const float* inject_w = nullptr);
+    float* inject_out = nullptr, const void* inject_w = nullptr,
+    WeightType inject_type = WeightType::kF32);
 /// HcCombineMoeF16 over F32 expert rows (the quantized mixes' MMQ down
 /// projection): the block output is MoeEpilogueVec4's result, formed in
 /// registers and never written.

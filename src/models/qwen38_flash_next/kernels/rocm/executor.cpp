@@ -2054,10 +2054,20 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
 
 namespace {
 
-/// A mixer's F32 inject weights, which its combine can apply (see Combine).
-const float* InjectWeights(const DeviceMixer& m) {
-  return !m.inject.empty() && m.inject.type == GgmlType::kF32 ? m.inject.f32()
-                                                              : nullptr;
+/// A mixer's F32 or BF16 inject weights, which its combine can apply (see
+/// Combine).
+const void* InjectWeights(const DeviceMixer& m) {
+  return !m.inject.empty() && (m.inject.type == GgmlType::kF32 ||
+                               m.inject.type == GgmlType::kBF16)
+             ? m.inject.data
+             : nullptr;
+}
+
+/// The encoding of a mixer's inject weights; the F32 form also covers an
+/// absent matrix (the combine is then never given a pointer).
+WeightType InjectType(const DeviceMixer& m) {
+  return m.inject.type == GgmlType::kBF16 ? WeightType::kBF16
+                                          : WeightType::kF32;
 }
 
 /// Whether the next mixer's down projection reads the norm's tiled Q8 copy:
@@ -2089,7 +2099,8 @@ bool MoeUsesMixedQ8(const DeviceLayer& l) {
 }  // namespace
 
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-                       const float* inject_w, bool norm_q8) const {
+                       const void* inject_w, bool norm_q8,
+                       WeightType inject_type) const {
   const Config& c = config();
   inject_fused_ = nullptr;
   // Wide batches hand the next mixer an F16 norm for its epilogue and, when
@@ -2100,7 +2111,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   void* xn_q8t = xn_half_ && norm_q8 ? s_.xn_q8t : nullptr;
   xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
   // The next mixer's inject pass reads only the F16 norm written here.
-  const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
+  const void* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
   const bool defer = defer_residual_;
   defer_residual_ = false;
   bool deferred = res_deferred_;
@@ -2132,14 +2143,15 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                       stream_);
     } else {
       const auto* down = reinterpret_cast<const __half*>(s_.down_e);
-      const float* fused_w = deferred ? fused_inject : nullptr;
+      const void* fused_w = deferred ? fused_inject : nullptr;
       if (wide_mixer_ && MatrixRows(n_tokens) &&
           HcCombineMoeF16(
               res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
               c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
               gamma, s_.xn_half, xn_q8t, n_tokens, c.hidden_size, c.hc_count,
               c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
-              deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
+              deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w,
+              inject_type)) {
         inject_fused_ = fused_w;
         return;
       }
@@ -2164,11 +2176,11 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     // 4,096 tokens) instead of this combine writing the residual and the
     // next reading it back (168 MB each).
     const bool defer_now = defer && c.hc_count == 4;
-    res_deferred_ =
-        HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
-                     s_.xn_half, xn_q8t, n_tokens, c.hidden_size, c.hc_count,
-                     c.rms_eps, stream_, defer_now ? s_.hc_defer_w : nullptr,
-                     s_.inject, defer_now ? fused_inject : nullptr);
+    res_deferred_ = HcCombineF16(
+        res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half, xn_q8t,
+        n_tokens, c.hidden_size, c.hc_count, c.rms_eps, stream_,
+        defer_now ? s_.hc_defer_w : nullptr, s_.inject,
+        defer_now ? fused_inject : nullptr, inject_type);
     if (res_deferred_)
       inject_fused_ = fused_inject;
     return;
@@ -2293,7 +2305,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // The previous combine already wrote these partials from the same norm.
   const bool inject_done = fused_inject && inject == s_.inject &&
                            inject_fused_ != nullptr &&
-                           inject_fused_ == m.inject.f32();
+                           inject_fused_ == m.inject.data;
   inject_fused_ = nullptr;
   const WeightType inject_type =
       m.inject.type == GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kF32;
@@ -3468,8 +3480,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : nullptr;
-    const float* next_inject =
+    const void* next_inject =
         next_norm != nullptr ? InjectWeights(layers[il + 1].hc_attn) : nullptr;
+    const WeightType next_inject_type = next_norm != nullptr
+                                            ? InjectType(layers[il + 1].hc_attn)
+                                            : WeightType::kF32;
     // Cache updates precede the FFN. Without MTP, only requested head rows
     // and the checkpoint frontier consume the final layer's residual.
     // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
@@ -3489,13 +3504,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           l.shexp_gate.type == GgmlType::kQ8_0 &&
                           l.shexp_up.type == GgmlType::kQ8_0;
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
-              MixerNormUsesQ8(l.hc_ffn));
+              MixerNormUsesQ8(l.hc_ffn), InjectType(l.hc_ffn));
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
                  false, no_f32, MoeUsesMixedQ8(l)) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
       Combine(s_.res, next_norm, rows, next_inject,
-              next_norm != nullptr && MixerNormUsesQ8(layers[il + 1].hc_attn));
+              next_norm != nullptr && MixerNormUsesQ8(layers[il + 1].hc_attn),
+              next_inject_type);
       return true;
     };
     if (skipped != 0) {

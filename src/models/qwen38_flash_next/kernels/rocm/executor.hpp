@@ -518,11 +518,12 @@ private:
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and, when that mixer's
-  /// down projection is Q8_0 (`norm_q8`), as tiled Q8. With that mixer's F32
-  /// `inject_w`, the fused MoE combine also leaves its inject partials in
-  /// s_.inject (inject_fused_).
+  /// down projection is Q8_0 (`norm_q8`), as tiled Q8. With that mixer's
+  /// F32 or BF16 `inject_w` (`inject_type`), the fused MoE combine also
+  /// leaves its inject partials in s_.inject (inject_fused_).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr, bool norm_q8 = true) const;
+               const void* inject_w = nullptr, bool norm_q8 = true,
+               WeightType inject_type = WeightType::kF32) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -816,9 +817,9 @@ private:
   mutable bool xn_half_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
-  /// Inject weights whose partials the last combine already wrote to
-  /// s_.inject, so the following HcMix skips its inject pass.
-  mutable const float* inject_fused_{nullptr};
+  /// Inject weights (F32 or BF16) whose partials the last combine already
+  /// wrote to s_.inject, so the following HcMix skips its inject pass.
+  mutable const void* inject_fused_{nullptr};
   mutable unsigned q8_slot_{0};
   /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
   struct ReadyRows {

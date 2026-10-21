@@ -79,6 +79,20 @@ std::vector<float> MakeValues(std::size_t count, std::uint32_t seed,
   return values;
 }
 
+std::uint16_t FloatToBf16(float v) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  bits += 0x7FFFu + ((bits >> 16) & 1u);
+  return static_cast<std::uint16_t>(bits >> 16);
+}
+
+float Bf16ToFloat(std::uint16_t h) {
+  const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+  float v = 0.0F;
+  std::memcpy(&v, &bits, sizeof(v));
+  return v;
+}
+
 void Upload(HipBuffer<float>* destination, const std::vector<float>& source) {
   CheckHip(hipMemcpy(destination->get(), source.data(), destination->bytes(),
                      hipMemcpyHostToDevice),
@@ -278,71 +292,91 @@ int main() {
     const auto next_inject_weights =
         MakeValues(kHidden * 4 * 4, 0xDED123U, 0.1F);
     Upload(&d_next_inject_w, next_inject_weights);
-    for (unsigned mode = 0; mode < 3; ++mode) {
-      const bool normalize = mode != 0;
-      const bool inject_next = mode == 2;
-      Upload(&d_res_norm, residual);
-      Upload(&d_res_separate, residual);
-      CheckHip(hipMemset(d_q8.get(), 0, d_q8.bytes()), "clear fused Q8");
-      CheckHip(hipMemset(d_q8_separate.get(), 0, d_q8_separate.bytes()),
-               "clear reference Q8");
-      q::HcApplyDeferred(d_res_separate.get(), d_prior.get(), d_prior_w.get(),
-                         kTokens, kHidden, nullptr);
-      for (bool deferred : {false, true}) {
-        if (!q::HcCombineMoeF16(
-                deferred ? d_res_norm.get() : d_res_separate.get(),
-                d_half.get(), d_weights.get(), d_shared.get(), d_gate.get(),
-                kGateStride, kSlots, d_inject.get(), parts,
-                normalize ? d_gamma.get() : nullptr,
-                normalize ? (deferred ? d_norm.get() : d_norm_separate.get())
-                          : nullptr,
-                normalize ? (deferred ? d_q8.get() : d_q8_separate.get())
-                          : nullptr,
-                kTokens, kHidden, 4, 1e-6F, nullptr,
-                deferred ? d_prior.get() : nullptr,
-                deferred ? d_prior_w.get() : nullptr,
-                deferred && inject_next ? d_next_inject.get() : nullptr,
-                deferred && inject_next ? d_next_inject_w.get() : nullptr)) {
-          throw std::runtime_error("deferred fused combine rejected");
-        }
-      }
-      const auto fused = Download(&d_res_norm, kResidual);
-      const auto separate = Download(&d_res_separate, kResidual);
-      if (std::memcmp(fused.data(), separate.data(), d_res_norm.bytes()) != 0) {
-        throw std::runtime_error("deferred combine changed residual bytes");
-      }
-      if (normalize) {
-        const auto norm = Download(&d_norm, kResidual);
-        const auto reference_norm = Download(&d_norm_separate, kResidual);
-        if (std::memcmp(norm.data(), reference_norm.data(), d_norm.bytes()) !=
-            0) {
-          std::size_t changed = 0;
-          for (std::size_t i = 0; i < norm.size(); ++i) {
-            if (std::memcmp(&norm[i], &reference_norm[i], sizeof(__half)) !=
-                0) {
-              if (changed < 8)
-                std::cerr << "norm mismatch " << i << ": "
-                          << __half2float(norm[i]) << " vs "
-                          << __half2float(reference_norm[i]) << '\n';
-              ++changed;
-            }
+    std::vector<std::uint16_t> next_inject_bf16(next_inject_weights.size());
+    std::vector<float> next_inject_f32(next_inject_weights.size());
+    for (std::size_t i = 0; i < next_inject_weights.size(); ++i) {
+      next_inject_bf16[i] = FloatToBf16(next_inject_weights[i]);
+      next_inject_f32[i] = Bf16ToFloat(next_inject_bf16[i]);
+    }
+    HipBuffer<std::uint16_t> d_next_inject_bf16(next_inject_bf16.size());
+    CheckHip(hipMemcpy(d_next_inject_bf16.get(), next_inject_bf16.data(),
+                       d_next_inject_bf16.bytes(), hipMemcpyHostToDevice),
+             "upload BF16 inject weights");
+    for (bool bf16 : {false, true}) {
+      const void* next_w =
+          bf16 ? static_cast<const void*>(d_next_inject_bf16.get())
+               : static_cast<const void*>(d_next_inject_w.get());
+      const q::WeightType next_type =
+          bf16 ? q::WeightType::kBF16 : q::WeightType::kF32;
+      const auto& next_reference = bf16 ? next_inject_f32 : next_inject_weights;
+      for (unsigned mode = 0; mode < 3; ++mode) {
+        const bool normalize = mode != 0;
+        const bool inject_next = mode == 2;
+        Upload(&d_res_norm, residual);
+        Upload(&d_res_separate, residual);
+        CheckHip(hipMemset(d_q8.get(), 0, d_q8.bytes()), "clear fused Q8");
+        CheckHip(hipMemset(d_q8_separate.get(), 0, d_q8_separate.bytes()),
+                 "clear reference Q8");
+        q::HcApplyDeferred(d_res_separate.get(), d_prior.get(), d_prior_w.get(),
+                           kTokens, kHidden, nullptr);
+        for (bool deferred : {false, true}) {
+          if (!q::HcCombineMoeF16(
+                  deferred ? d_res_norm.get() : d_res_separate.get(),
+                  d_half.get(), d_weights.get(), d_shared.get(), d_gate.get(),
+                  kGateStride, kSlots, d_inject.get(), parts,
+                  normalize ? d_gamma.get() : nullptr,
+                  normalize ? (deferred ? d_norm.get() : d_norm_separate.get())
+                            : nullptr,
+                  normalize ? (deferred ? d_q8.get() : d_q8_separate.get())
+                            : nullptr,
+                  kTokens, kHidden, 4, 1e-6F, nullptr,
+                  deferred ? d_prior.get() : nullptr,
+                  deferred ? d_prior_w.get() : nullptr,
+                  deferred && inject_next ? d_next_inject.get() : nullptr,
+                  deferred && inject_next ? next_w : nullptr,
+                  deferred && inject_next ? next_type : q::WeightType::kF32)) {
+            throw std::runtime_error("deferred fused combine rejected");
           }
-          throw std::runtime_error("deferred combine changed " +
-                                   std::to_string(changed) +
-                                   " F16 norm values");
         }
-        if (Download(&d_q8, d_q8.bytes()) !=
-            Download(&d_q8_separate, d_q8_separate.bytes())) {
-          throw std::runtime_error("deferred combine changed Q8 norm bytes");
+        const auto fused = Download(&d_res_norm, kResidual);
+        const auto separate = Download(&d_res_separate, kResidual);
+        if (std::memcmp(fused.data(), separate.data(), d_res_norm.bytes()) !=
+            0) {
+          throw std::runtime_error("deferred combine changed residual bytes");
         }
-        if (inject_next) {
-          const auto actual_inject =
-              Download(&d_next_inject, kTokens * 4 * parts);
-          const auto reference_inject =
-              InjectReference(reference_norm, next_inject_weights, parts);
-          if (std::memcmp(actual_inject.data(), reference_inject.data(),
-                          d_next_inject.bytes()) != 0) {
-            throw std::runtime_error("deferred combine changed inject bytes");
+        if (normalize) {
+          const auto norm = Download(&d_norm, kResidual);
+          const auto reference_norm = Download(&d_norm_separate, kResidual);
+          if (std::memcmp(norm.data(), reference_norm.data(), d_norm.bytes()) !=
+              0) {
+            std::size_t changed = 0;
+            for (std::size_t i = 0; i < norm.size(); ++i) {
+              if (std::memcmp(&norm[i], &reference_norm[i], sizeof(__half)) !=
+                  0) {
+                if (changed < 8)
+                  std::cerr << "norm mismatch " << i << ": "
+                            << __half2float(norm[i]) << " vs "
+                            << __half2float(reference_norm[i]) << '\n';
+                ++changed;
+              }
+            }
+            throw std::runtime_error("deferred combine changed " +
+                                     std::to_string(changed) +
+                                     " F16 norm values");
+          }
+          if (Download(&d_q8, d_q8.bytes()) !=
+              Download(&d_q8_separate, d_q8_separate.bytes())) {
+            throw std::runtime_error("deferred combine changed Q8 norm bytes");
+          }
+          if (inject_next) {
+            const auto actual_inject =
+                Download(&d_next_inject, kTokens * 4 * parts);
+            const auto reference_inject =
+                InjectReference(reference_norm, next_reference, parts);
+            if (std::memcmp(actual_inject.data(), reference_inject.data(),
+                            d_next_inject.bytes()) != 0) {
+              throw std::runtime_error("deferred combine changed inject bytes");
+            }
           }
         }
       }

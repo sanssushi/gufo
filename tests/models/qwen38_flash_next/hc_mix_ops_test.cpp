@@ -479,6 +479,109 @@ void CheckBf16Inject() {
   std::cerr << "HC BF16 inject weights exact on every epilogue\n";
 }
 
+// A deferred wide combine given BF16 inject weights writes the next mixer's
+// inject partials from its own F16-rounded norm. The fused partials must
+// match the separate BF16 epilogue over that norm byte for byte, and the
+// fusion must leave the deferred update, residual and norm unchanged.
+void CheckCombineBf16Inject(std::uint32_t tokens) {
+  constexpr std::size_t kDim = kStreams * kHidden;
+  constexpr float kEps = 1e-6F;
+  const std::size_t rows = static_cast<std::size_t>(tokens) * kDim;
+  const std::size_t mixed = static_cast<std::size_t>(tokens) * kHidden;
+  const std::uint32_t parts = q::HcInjectPartsVec4(kHidden);
+  const std::size_t inject_in_count =
+      static_cast<std::size_t>(tokens) * kStreams * parts;
+  const auto res = MakeValues(rows, 0x0F0F0F0FU, 1.0F);
+  const auto block_out = MakeValues(mixed, 0xF0F0F0F0U, 1.0F);
+  const auto gamma = MakeValues(kDim, 0x600DCAFEU, 0.5F);
+  const auto gate = MakeValues(rows, 0xBADC0FFEU, 2.0F);
+  const auto inject_in = MakeValues(inject_in_count, 0x24680U, 0.5F);
+  HipBuffer<float> d_res_plain(rows), d_res_fused(rows);
+  HipBuffer<float> d_block(block_out.size()), d_gamma(gamma.size());
+  HipBuffer<float> d_gate(gate.size()), d_inject_in(inject_in.size());
+  HipBuffer<__half> d_norm_plain(rows), d_norm_fused(rows);
+  HipBuffer<float> d_defer_plain(tokens * kStreams),
+      d_defer_fused(tokens * kStreams);
+  HipBuffer<float> d_mixed(mixed);
+  HipBuffer<float> d_inject_ref(inject_in_count),
+      d_inject_fused(inject_in_count);
+  Upload(&d_block, block_out);
+  Upload(&d_gamma, gamma);
+  Upload(&d_gate, gate);
+  Upload(&d_inject_in, inject_in);
+  // Two replacement weight buffers: the combine seam must use whichever
+  // matrix the caller passes, with no residue of the previous one.
+  for (std::uint32_t pattern = 0; pattern < 2; ++pattern) {
+    const auto inject_w =
+        MakeValues(kStreams * kDim, 0xDEADBEEFU + pattern, 0.1F);
+    std::vector<std::uint16_t> inj_bf16(inject_w.size());
+    std::vector<float> inj_f32(inject_w.size());
+    for (std::size_t i = 0; i < inject_w.size(); ++i) {
+      inj_bf16[i] = FloatToBf16(inject_w[i]);
+      inj_f32[i] = Bf16ToFloat(inj_bf16[i]);
+    }
+    HipBuffer<std::uint16_t> d_inj_bf16(inj_bf16.size());
+    HipBuffer<float> d_inj_f32(inj_f32.size());
+    Upload(&d_inj_bf16, inj_bf16);
+    Upload(&d_inj_f32, inj_f32);
+    Upload(&d_res_plain, res);
+    Upload(&d_res_fused, res);
+    if (!q::HcCombineF16(d_res_plain.get(), d_block.get(), d_inject_in.get(),
+                         parts, d_gamma.get(), d_norm_plain.get(), nullptr,
+                         tokens, kHidden, kStreams, kEps, nullptr,
+                         d_defer_plain.get(), nullptr, nullptr)) {
+      throw std::runtime_error("plain deferred HC combine rejected");
+    }
+    if (!q::HcCombineF16(d_res_fused.get(), d_block.get(), d_inject_in.get(),
+                         parts, d_gamma.get(), d_norm_fused.get(), nullptr,
+                         tokens, kHidden, kStreams, kEps, nullptr,
+                         d_defer_fused.get(), d_inject_fused.get(),
+                         d_inj_bf16.get(), q::WeightType::kBF16)) {
+      throw std::runtime_error("BF16 fused HC combine rejected");
+    }
+    Exact(d_norm_plain, d_norm_fused, "F16 norm");
+    q::HcMixEpilogueVec4F16(d_norm_plain.get(), d_gate.get(), d_inj_f32.get(),
+                            d_mixed.get(), nullptr, nullptr, d_inject_ref.get(),
+                            tokens, kHidden, nullptr);
+    Exact(d_inject_fused, d_inject_ref, "BF16 inject partials");
+    q::HcApplyDeferred(d_res_plain.get(), d_block.get(), d_defer_plain.get(),
+                       tokens, kHidden, nullptr);
+    q::HcApplyDeferred(d_res_fused.get(), d_block.get(), d_defer_fused.get(),
+                       tokens, kHidden, nullptr);
+    Exact(d_res_plain, d_res_fused, "residual");
+    std::vector<__half> norm(rows);
+    CheckHip(hipMemcpy(norm.data(), d_norm_fused.get(), d_norm_fused.bytes(),
+                       hipMemcpyDeviceToHost),
+             "download norm");
+    const auto actual = Download(&d_inject_fused, inject_in_count);
+    double worst = 0.0;
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      for (std::uint32_t s = 0; s < kStreams; ++s) {
+        double expected = 0.0;
+        for (std::uint32_t i = 0; i < kDim; ++i) {
+          expected +=
+              static_cast<double>(
+                  inj_f32[static_cast<std::size_t>(s) * kDim + i]) *
+              __half2float(norm[static_cast<std::size_t>(t) * kDim + i]);
+        }
+        double candidate = 0.0;
+        const std::size_t base =
+            (static_cast<std::size_t>(t) * kStreams + s) * parts;
+        for (std::uint32_t p = 0; p < parts; ++p) {
+          candidate += actual[base + p];
+        }
+        worst = std::max(worst, std::abs(expected - candidate) /
+                                    std::max(1.0, std::abs(expected)));
+      }
+    }
+    if (worst > 1e-4) {
+      throw std::runtime_error("BF16 fused inject differs from the CPU dot");
+    }
+  }
+  std::cerr << "HC BF16 fused combine inject exact at " << tokens
+            << " tokens\n";
+}
+
 // The decode 16-bit GEMV tier (vectorized row waves over F32 activations):
 // every encoding follows the F64 oracle, and an output row must not depend
 // on the token count, which is the batched-decode contract.
@@ -567,6 +670,8 @@ int main() {
     CheckFusedProjectionBf16(96);
     CheckFusedProjectionBf16(2049);
     CheckBf16Inject();
+    CheckCombineBf16Inject(96);
+    CheckCombineBf16Inject(2049);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;
