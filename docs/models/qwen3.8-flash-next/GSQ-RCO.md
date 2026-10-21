@@ -28,7 +28,7 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -2.3% for xxs and -6.5% for s) is the per-element
+  gap (about -2% for xxs and -6.5% for s) is the per-element
   decode cost of the low-bit weight formats at those eight verification
   rows; the shared expert's decoded weight fragments are reused across the
   tokens in a group. It is not a draft, attention or dispatch problem.
@@ -491,18 +491,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6..-7% |
-| AR tg128 at d32768 | -1.5/-1.8% | -6.3/-6.6% |
+| AR tg128 at d32768 | -1.4/-1.8% | -6.1/-6.3% |
 | MTP tg128 at d0 (acceptance-rate dependent, focused run) | -10.7/-10.8% | -20.0/-19.9% |
-| MTP tg128 at d32768 | -2.3/-2.8% | -6.5/-6.8% |
-| pp2048 at d32768, AR (speculation off) | -17.9/-17.2% | -18.8/-17.3% |
-| pp2048 at d32768, MTP | -16.5/-16.1% | -17.2/-16.7% |
+| MTP tg128 at d32768 | -1.7/-4.2% | -6.6/-6.5% |
+| pp2048 at d32768, AR (speculation off) | -17.7/-16.8% | -18.5/-17.0% |
+| pp2048 at d32768, MTP | -16.4/-16.6% | -17.0/-17.0% |
 | pp2048 at d0, steady state | ≈ -15..-21% | ≈ -16..-23% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6..-7% (s); depth-32768
-  measurements are -1.5/-1.8% (xxs) and -6.3/-6.6% (s). Depth-0 AR
+  measurements are -1.4/-1.8% (xxs) and -6.1/-6.3% (s). Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
   focused reruns that alternate models read about 26.7 t/s (xxs) and
@@ -515,7 +515,7 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  -2.3% (xxs) and -6.5% (s) gap is the low-bit formats'
+  roughly -2% (xxs) and -6.5% (s) gap is the low-bit formats'
   per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -554,7 +554,7 @@ focused depth 0):
   control (the BF16 down projection alone is about 158 ms, against the
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
   166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
-  measurements are consistently -16..-17%. Depth-0 measurements fall in
+  measurements are consistently -16..-19%. Depth-0 measurements fall in
   about -15..-23%, and their spread follows the control's own depth-0 rate
   (a lower control rate widens the gap and a higher one narrows it; the
   control's prefill rate varies more between rounds than the mixes'). That
@@ -585,6 +585,14 @@ focused depth 0):
   exchange costs sixteen lane permutes per K32 block, where the staged path
   costs twelve LDS instructions, and the low-bit decode itself requires the
   LDS round trip.
+- The 64-row narrow tile and the BK=2/WM=8/WN=1 plan are slower for the
+  K-quant/IQ dense route. At 2048 tokens the narrow tile reads 4.6-4.7 ms
+  against 3.8 ms for the 512-row K/V and indexer projections and is flat at
+  640 rows (24.5 against 24.7 ms). The BK=2 plan is flat at the 13312-row
+  attention stacks (18.3 against 18.1 ms) and 2-13.6% slower on the separate
+  6144-, 10240- and 12288-row projections, worst for IQ4_XS at 12288 rows
+  (16.9 against 14.9 ms). The 256×128 tile with one K block per stage and
+  four-by-two wave groups keeps every quantized dense shape.
 
 ### Control
 
