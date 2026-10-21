@@ -2,11 +2,11 @@ This fork adds [GSQ-RCO weights](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flas
 support for Qwen3.8-Flash-Next (IQ3_XXS and IQ3_S). The solution is documented in
 [docs/models/qwen3.8-flash-next/GSQ-RCO.md](docs/models/qwen3.8-flash-next/GSQ-RCO.md).
 
-`feat/gsq-rco` is kept rebased onto upstream `main` — every sync rewrites the branch's history.
+Branch `feat/gsq-rco` is kept rebased onto upstream `main` — every sync rewrites the branch's history.
 Building on it is fine, but your branch will need rebasing whenever that happens.
 
 Speed vs unsloth UD-Q4_K_XL (single-user `gufo bench`, 2048-token prompt,
-two alternating rounds r1/r2; negative = slower):
+two alternating rounds, negative = slower):
 
 | Workload | IQ3_XXS | IQ3_S |
 | --- | ---: | ---: |
