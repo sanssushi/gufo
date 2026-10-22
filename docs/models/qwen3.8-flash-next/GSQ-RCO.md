@@ -259,10 +259,11 @@ vendored code is re-imported (see "Vendored-code obligations").
   instantiations for the K-quant/IQ `ssm_in` types) behind the executor
   check `KQuantWmmaType(ssm_in.type) && cols <= max_half_cols`, alongside
   `DenseF16Route`. Mixed-type layers keep QKV and gate separate; their
-  standalone [10240][2560] QKV projection takes the same fused epilogue
-  behind the check on `ssm_qkv.type`, and the independently typed gate
-  keeps its own projection. The epilogue reads only the accumulated tile,
-  `conv_w` and the history, so it does not depend on the weight format. The
+  standalone [10240][2560] QKV projection takes the same fused epilogue in
+  wide prefill behind the check on `ssm_qkv.type`, and the independently
+  typed gate keeps its own projection. The epilogue reads only the
+  accumulated tile, `conv_w` and the history, so it does not depend on the
+  weight format. The
   Q8_0 route keeps each wave's decoded weight rows in registers; the GSQ
   stacks stage their decoded fragments in shared memory (`LDS`), because
   the register variant is slower for them (see "Performance state").
@@ -403,11 +404,11 @@ Breaking any of them silently breaks session or audit replay.
   `DenseQuantF16Gemm` projection for each stacked K-quant/IQ format (same
   decode, same K order per output), through its GatedDeltaNet consumer, at
   a full and a partial final token tile. The standalone QKV case uses an
-  independently typed gate and covers 1,024-, 1,025- and 2,049-token
-  batches, a nonzero rolling history and mid-tile checkpoint prefixes;
-  projection, convolution, recurrent state, history and checkpoint bytes
-  match the separate chain. Fixtures verify rejection of unsupported
-  shapes.
+  independently typed gate and covers 9-, 33-, 470-, 1,024-, 1,025- and
+  2,049-token batches, a nonzero rolling history and mid-tile checkpoint
+  prefixes; projection, convolution, recurrent state, history and
+  checkpoint bytes match the separate chain. Fixtures verify rejection of
+  unsupported shapes.
 - F16 producer handoffs: `gdn_ops` pins the GDN epilogue's direct F16 rows
   against the F32 epilogue rounded to F16 (`__float2half_rn`), including
   padded output strides and guard bytes, without changing the recurrent
@@ -522,18 +523,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6% |
-| AR tg128 at d32768 | -1.8/-1.7% | -6.6/-6.6% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -6.3/-9.1% | -1.3/-1.5% |
-| MTP tg128 at d32768 | -2.5/-3.2% | -6.2/-6.7% |
-| pp2048 at d32768, AR (speculation off) | -14.9/-14.0% | -15.6/-14.1% |
-| pp2048 at d32768, MTP | -14.0/-14.2% | -14.3/-14.5% |
+| AR tg128 at d32768 | -1.8/-1.8% | -6.6/-6.5% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | +6.6/+6.7% | -1.1/+0.5% |
+| MTP tg128 at d32768 | -2.2/-3.2% | -6.0/-6.7% |
+| pp2048 at d32768, AR (speculation off) | -15.0/-14.3% | -15.5/-14.5% |
+| pp2048 at d32768, MTP | -14.1/-14.4% | -14.6/-14.5% |
 | pp2048 at d0, steady state | ≈ -10..-20% | ≈ -10..-20% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6% (s);
-  depth-32768 measurements are -1.8/-1.7% (xxs) and -6.6/-6.6% (s).
+  depth-32768 measurements are -1.8/-1.8% (xxs) and -6.6/-6.5% (s).
   Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
