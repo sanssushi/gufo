@@ -28,7 +28,7 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -3% for xxs and about -7% for s) is the per-element decode cost
+  gap (about -2.5% for xxs and about -6.5% for s) is the per-element decode cost
   of the low-bit weight formats at those eight verification rows; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
   It is not a draft, attention or dispatch problem.
@@ -378,12 +378,13 @@ Breaking any of them silently breaks session or audit replay.
 
 - Operator tests compare each type and role (dense, routed, paired, gated,
   head, embedding) exactly against F64 references computed by CPU
-  dequantization. The 19 `qwen38_flash_next.*` ctest suites are 12 HIP
+  dequantization. The 22 `qwen38_flash_next.*` ctest suites are 13 HIP
   operator suites (`mtp_ops`, `blaslt_ops`, `hc_mix_ops`, `gdn_ops`,
   `attention_ops`, `moe_epilogue_ops`, `moe_ids_ops`, `ple_ops`,
-  `projection_ops`, `routed_wmma_ops`, `select_ops`, `snapshot_copy`) plus
-  the CPU suites (`config`, `continuation_layout`, `draft_vocab`, `ngram`,
-  `mtp_sampling`, `prompt_lookup`, `weights`).
+  `projection_ops`, `routed_wmma_ops`, `select_ops`, `snapshot_copy`,
+  `verification_sampling`) plus the CPU suites (`config`,
+  `continuation_layout`, `draft_vocab`, `ngram`, `mtp_sampling`,
+  `prompt_lookup`, `rope_scaling`, `rope_scaling_oracle`, `weights`).
 - FMA and accumulation: every shared MMQ vector-dot accumulation is pinned
   with `__fadd_rn`/`__fmaf_rn` (`mmq.hpp` typed cases and `vecdotq.hpp`).
   Tests pin chunk-width exactness and the dense MMQ tile width. The reason
@@ -483,7 +484,7 @@ unsloth UD-Q4_K_XL GGUFs):
 ```sh
 # Tests (RelWithDebInfo + assertions)
 cmake --preset gpu-test && cmake --build --preset gpu-test
-ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 19 suites
+ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 22 suites
 ctest --preset gpu-full -R 'ggml_dequant_test|ggml_gemm_parity_test|qwen_gemm_route_test'
 
 # Measurement binary
@@ -521,18 +522,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6% |
-| AR tg128 at d32768 | -1.7/-2.0% | -6.6/-6.3% |
+| AR tg128 at d32768 | -1.8/-1.7% | -6.6/-6.6% |
 | MTP tg128 at d0 (acceptance-rate dependent, focused run) | -6.3/-9.1% | -1.3/-1.5% |
-| MTP tg128 at d32768 | -2.8/-6.0% | -7.0/-6.8% |
-| pp2048 at d32768, AR (speculation off) | -15.3/-14.6% | -16.2/-14.7% |
-| pp2048 at d32768, MTP | -14.1/-14.0% | -14.3/-14.2% |
-| pp2048 at d0, steady state | ≈ -13..-19% | ≈ -13..-19% |
+| MTP tg128 at d32768 | -2.5/-3.2% | -6.2/-6.7% |
+| pp2048 at d32768, AR (speculation off) | -14.9/-14.0% | -15.6/-14.1% |
+| pp2048 at d32768, MTP | -14.0/-14.2% | -14.3/-14.5% |
+| pp2048 at d0, steady state | ≈ -10..-20% | ≈ -10..-20% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6% (s);
-  depth-32768 measurements are -1.7/-2.0% (xxs) and -6.6/-6.3% (s).
+  depth-32768 measurements are -1.8/-1.7% (xxs) and -6.6/-6.6% (s).
   Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
@@ -546,7 +547,7 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  roughly -3% (xxs, one round read -6%) and -7% (s) gap is the low-bit
+  roughly -2.5% (xxs) and -6.5% (s) gap is the low-bit
   formats' per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -586,7 +587,7 @@ focused depth 0):
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
   166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
   measurements are about -14..-16%. Depth-0 measurements fall in
-  about -13..-19%, and their spread follows the control's own depth-0 rate
+  about -10..-20%, and their spread follows the control's own depth-0 rate
   (the control's prefill rate varies more between rounds than the mixes').
   That spread is measurement variance, not a difference in the execution
   path.
@@ -624,6 +625,13 @@ focused depth 0):
   6144-, 10240- and 12288-row projections, worst for IQ4_XS at 12288 rows
   (16.9 against 14.9 ms). The 256×128 tile with one K block per stage and
   four-by-two wave groups keeps every quantized dense shape.
+- Transient F16 staging for the BF16 hyper-connection down projection is
+  slower: converting each [320, 10240] matrix into one reusable F16 scratch
+  per call adds a 6.25 MiB read and write per mixer, and the full 96-mixer
+  chain at pp2048 measures 6.5% slower than the direct BF16 route (16 token
+  tiles amortize one conversion); at 2,049 tokens it measures 9.7% slower.
+  The direct route rounds BF16 rows to F16 as each tile is staged and keeps
+  the matrix read once per tile.
 
 ### Control
 
@@ -663,7 +671,7 @@ re-imports must re-apply the recorded blocks.
   scaffolding that the fork's minimal-diff policy rules out.
 - MTP depth-0 greedy traces are deterministic per binary but not stable
   across binaries (the borderline-argmax case; accepted).
-- The s-mix full test suites have a known seeded-sampling borderline case: a
+- The full test suites have a known seeded-sampling borderline case: the
   session-replay cache check and one `--mtp-audit` candidate check can flip
   between process runs. Both pass on rerun. Logits are pinned bit-identical
   across the affected paths, so this is sampling-boundary noise, not a

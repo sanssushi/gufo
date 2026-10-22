@@ -10,10 +10,10 @@ two alternating rounds, negative = slower):
 
 | Workload | IQ3_XXS | IQ3_S |
 | --- | ---: | ---: |
-| tg128 @ d32768 (AR) | -1.7% | -6.3% |
-| tg128 @ d32768 (MTP) | -2.8% | -6.8% |
-| pp2048 @ d32768 (AR) | -14.6% | -14.7% |
-| pp2048 @ d32768 (MTP) | -14.0% | -14.2% |
+| tg128 @ d32768 (AR) | -1.7% | -6.6% |
+| tg128 @ d32768 (MTP) | -2.5% | -6.2% |
+| pp2048 @ d32768 (AR) | -14.0% | -14.1% |
+| pp2048 @ d32768 (MTP) | -14.0% | -14.3% |
 
 # Gufo: The ***Open Source*** Strix Halo AI engine
 
