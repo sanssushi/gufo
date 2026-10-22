@@ -2611,8 +2611,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // into the standalone QKV projection; the independently typed gate
     // stays a separate projection. Speculative rows need every raw QKV row
     // and keep the separate convolution path.
-    if (!speculative && n_tokens >= 1024 && n_tokens <= options_.max_batch &&
-        KQuantWmmaType(l.ssm_qkv.type) &&
+    if (!speculative && WidePrefill(n_tokens) &&
+        n_tokens <= options_.max_batch && KQuantWmmaType(l.ssm_qkv.type) &&
         l.ssm_qkv.cols <= model_->max_half_cols()) {
       PrepareHalfInput(x, n_tokens, l.ssm_qkv.cols);
       convolved = DenseQuantF16SsmGemm(

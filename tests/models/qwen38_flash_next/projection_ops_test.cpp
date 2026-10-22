@@ -1376,8 +1376,7 @@ void CheckSsmSeparateProjectionQuant(gufo::core::GgmlType type,
          "checkpoint history");
   }
   if (q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
-                              nullptr, 1023, channels, k, channels, 4,
-                              nullptr) ||
+                              nullptr, 0, channels, k, channels, 4, nullptr) ||
       q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
                               nullptr, batch, gate_m, k, channels, 4,
                               nullptr)) {
@@ -1439,7 +1438,7 @@ void CheckDenseRejectsNonDense() {
           "DenseQuantF16SsmGemm accepted a non-K-quant format");
   }
   if (q::DenseQuantF16SsmGemm(gufo::core::GgmlType::kQ4_K, nullptr, nullptr,
-                              nullptr, nullptr, nullptr, nullptr, 1023, 16384,
+                              nullptr, nullptr, nullptr, nullptr, 0, 16384,
                               2560, 10240, 4, nullptr))
     throw std::runtime_error("DenseQuantF16SsmGemm accepted a short batch");
 }
@@ -2081,7 +2080,14 @@ int main() {
     CheckSsmProjectionQuant(gufo::core::GgmlType::kIQ4_XS, 1025);
     // Mixed-type SSM layers: the standalone QKV matrix fuses the same
     // convolution while the gate keeps its own type, with the checkpoint
-    // prefix and rolling history reading the retained raw rows.
+    // prefix and rolling history reading the retained raw rows. Every
+    // prefill pass wider than a vector batch takes the fused route.
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ6_K,
+                                    gufo::core::GgmlType::kIQ3_S, 9, 6);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kIQ4_XS,
+                                    gufo::core::GgmlType::kQ4_K, 33, 30);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ5_K,
+                                    gufo::core::GgmlType::kQ6_K, 470, 468);
     CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ6_K,
                                     gufo::core::GgmlType::kIQ3_S, 1024, 1000);
     CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kIQ4_XS,
