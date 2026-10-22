@@ -454,6 +454,77 @@ void CheckW8A8Tail(std::size_t m, std::size_t k, std::uint32_t seed) {
   (void)hipFree(d_short);
 }
 
+/// The shared-expert producer hands its down projection F16 rows directly.
+/// Those bytes must equal the F32 SwiGLU followed by the activation narrow.
+void CheckSwigluHalf() {
+  constexpr std::size_t kCount = 4099;  // odd count with a partial float4 tail
+  std::vector<float> gate(kCount), up(kCount);
+  std::uint32_t seed = 0x5A17C0DEU;
+  for (std::size_t i = 0; i < kCount; ++i) {
+    gate[i] = Uniform(&seed, 4.0F);
+    up[i] = Uniform(&seed, 4.0F);
+  }
+  // F16 ties: the exact midpoints between adjacent half values must round
+  // nearest-even. Cover normals, subnormals and both signs; the large
+  // products stay below F16 saturation.
+  const float mid = (1.0F + (1.0F + std::ldexp(1.0F, -10))) * 0.5F;
+  const float subnormal_mid = std::ldexp(1.5F, -24);
+  const float ties[][2] = {{1.0F, mid},
+                           {mid, 1.0F},
+                           {-1.0F, -mid},
+                           {-mid, -1.0F},
+                           {1.0F, subnormal_mid},
+                           {subnormal_mid, 1.0F},
+                           {-1.0F, -subnormal_mid},
+                           {300.0F, 200.0F}};
+  for (std::size_t i = 0; i < sizeof(ties) / sizeof(ties[0]); ++i) {
+    gate[i * 7] = ties[i][0];
+    up[i * 7] = ties[i][1];
+  }
+  void* d_gate = nullptr;
+  void* d_up = nullptr;
+  void* d_ref_gate = nullptr;
+  void* d_ref = nullptr;
+  void* d_actual = nullptr;
+  CheckHip(hipMalloc(&d_gate, kCount * sizeof(float)), "SwiGLU gate");
+  CheckHip(hipMalloc(&d_up, kCount * sizeof(float)), "SwiGLU up");
+  CheckHip(hipMalloc(&d_ref_gate, kCount * sizeof(float)), "SwiGLU reference");
+  CheckHip(hipMalloc(&d_ref, kCount * sizeof(__half)), "SwiGLU half reference");
+  CheckHip(hipMalloc(&d_actual, kCount * sizeof(__half)), "SwiGLU half output");
+  CheckHip(hipMemcpy(d_gate, gate.data(), kCount * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "SwiGLU gate upload");
+  CheckHip(
+      hipMemcpy(d_up, up.data(), kCount * sizeof(float), hipMemcpyHostToDevice),
+      "SwiGLU up upload");
+  CheckHip(hipMemcpy(d_ref_gate, d_gate, kCount * sizeof(float),
+                     hipMemcpyDeviceToDevice),
+           "SwiGLU reference copy");
+  q::Swiglu(static_cast<float*>(d_ref_gate), static_cast<const float*>(d_up),
+            kCount, nullptr);
+  q::NarrowActivations(static_cast<const float*>(d_ref_gate), d_ref, false,
+                       kCount, nullptr);
+  q::SwigluHalf(static_cast<const float*>(d_gate),
+                static_cast<const float*>(d_up), static_cast<__half*>(d_actual),
+                kCount, nullptr);
+  std::vector<__half> reference(kCount), actual(kCount);
+  CheckHip(hipMemcpy(reference.data(), d_ref, kCount * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "SwiGLU half reference download");
+  CheckHip(hipMemcpy(actual.data(), d_actual, kCount * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "SwiGLU half output download");
+  if (std::memcmp(reference.data(), actual.data(), kCount * sizeof(__half)) !=
+      0)
+    throw std::runtime_error("SwiGLU F16 producer changed rounding");
+  std::cout << "SwiGLU F16 producer: exact\n";
+  (void)hipFree(d_gate);
+  (void)hipFree(d_up);
+  (void)hipFree(d_ref_gate);
+  (void)hipFree(d_ref);
+  (void)hipFree(d_actual);
+}
+
 void CheckRoutedQ8Placement() {
   constexpr int rows = 64, cols = 512, tokens = 65, experts = 2;
   const auto weights = MakeWeights(rows * experts, cols, 31415, false);
@@ -1879,6 +1950,7 @@ int main() {
     CheckMtpOutputHead(0.0001F);
     CheckW8A8Tail(320, 10240, 0x7A1320U);
     CheckW8A8Tail(640, 2560, 0x7A1640U);
+    CheckSwigluHalf();
     CheckDenseRejectsNonDense();
     // Per-type dense projections against the CPU-dequantized oracle: the
     // decode-width vector path, the tiled MMQ path, and a wide batch.

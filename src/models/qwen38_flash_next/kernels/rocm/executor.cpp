@@ -1686,11 +1686,11 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     return false;
   }
   // A wide batch writes the down projection's staged input directly (the
-  // F32 rows are read by nothing else): F16 rows for the F16 route, else
+  // F32 rows are read by nothing else): F16 rows for the F16 routes, else
   // the tiled Q8 layout; the cache lets Dense skip its activation pass.
   if (down != nullptr && down->cols == up.rows && MatrixRows(n_tokens) &&
       n_tokens <= options_.max_batch) {
-    if (DenseF16Route(*down, n_tokens)) {
+    if (DenseF16Route(*down, n_tokens) || KQuantWmmaType(down->type)) {
       // A private F16 buffer: s_.x_half keeps the narrowed token rows the
       // router left there, which the routed experts read next.
       SwigluHalf(out, s_.shexp_gate, s_.shexp_half,
@@ -2641,8 +2641,15 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      n_tokens <= options_.max_batch;
   const bool half_output =
       tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
-  auto* out_half =
-      half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
+  // The GSQ K-quant/IQ outputs run the quantized F16-tile GEMM at wide batch:
+  // the epilogue writes its contiguous F16 rows directly, so the projection
+  // does not read an F32 copy and narrow it again.
+  const bool quant_half = MatrixRows(n_tokens) &&
+                          n_tokens <= options_.max_batch &&
+                          KQuantWmmaType(l.ssm_out.type);
+  auto* out_half = half_output || quant_half
+                       ? reinterpret_cast<__half*>(s_.gdn_out)
+                       : nullptr;
   // Shift successive rows off the 12 KiB pitch while retaining every half.
   // The existing F32 scratch has room for these slightly padded F16 rows.
   const std::uint32_t half_stride =
@@ -2666,9 +2673,15 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!project_output) {
     return true;
   }
-  if (half_output) {
-    if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
-                      l.ssm_out.cols, stream_, half_stride)) {
+  if (half_output || quant_half) {
+    const bool projected =
+        half_output
+            ? DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens,
+                           l.ssm_out.rows, l.ssm_out.cols, stream_, half_stride)
+            : DenseQuantF16Gemm(l.ssm_out.type, l.ssm_out.data, out_half, out,
+                                n_tokens, l.ssm_out.rows, l.ssm_out.cols,
+                                stream_);
+    if (!projected) {
       AssignError(error_msg, "SSM output F16 GEMM failed");
       return false;
     }
@@ -2930,8 +2943,15 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   if (shexp_half_ready_) {
     shexp_half_ready_ = false;
-    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
-                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
+    const bool projected =
+        KQuantWmmaType(l.shexp_down.type)
+            ? DenseQuantF16Gemm(l.shexp_down.type, l.shexp_down.data,
+                                s_.shexp_half, s_.shexp_out, n_tokens,
+                                l.shexp_down.rows, l.shexp_down.cols, stream_)
+            : DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
+                           n_tokens, l.shexp_down.rows, l.shexp_down.cols,
+                           stream_);
+    if (!projected) {
       AssignError(error_msg, "shared expert F16 GEMM failed");
       return false;
     }
