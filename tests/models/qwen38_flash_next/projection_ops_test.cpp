@@ -1088,6 +1088,239 @@ void CheckSsmProjectionQuant(gufo::core::GgmlType type, std::uint32_t batch) {
   CheckHip(hipFree(d_ref), "SSM quant free");
 }
 
+/// Mixed-type SSM layers keep QKV and gate as separate projections. The
+/// standalone QKV matrix can still fuse the four-tap convolution while the
+/// independently typed gate runs unchanged. The fused pass must stay
+/// bit-identical to the separate QKV projection through GatedDeltaNet,
+/// including the boundary raw rows the rolling history and the checkpoint
+/// prefix read.
+void CheckSsmSeparateProjectionQuant(gufo::core::GgmlType type,
+                                     gufo::core::GgmlType gate_type,
+                                     std::uint32_t batch,
+                                     std::uint32_t checkpoint_tokens) {
+  constexpr std::uint32_t channels = 10240, gate_m = 6144, k = 2560;
+  constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
+  constexpr std::size_t tail = 4096;
+  const auto wtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  const auto gtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(gate_type));
+  const DenseWeights qkv = MakeQuant(wtype, channels, k, 0x6B1D1024U);
+  const DenseWeights gate = MakeQuant(gtype, gate_m, k, 0x9A7E6144U);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t seed = 0xC0FFEEU;
+  for (float& v : x)
+    v = Uniform(&seed, 2.0F);
+
+  struct Buffers {
+    std::vector<float*> pointers;
+    ~Buffers() {
+      for (float* p : pointers) {
+        (void)hipFree(p);
+      }
+    }
+    float* Make(std::size_t count) {
+      float* p = nullptr;
+      CheckHip(hipMalloc(&p, count * sizeof(float)), "separate SSM allocation");
+      pointers.push_back(p);
+      return p;
+    }
+  } buffers;
+  auto values = [&](std::size_t count, float scale, float offset = 0.0F) {
+    std::vector<float> v(count);
+    for (float& value : v) {
+      value = offset + Uniform(&seed, scale);
+    }
+    return v;
+  };
+  auto upload = [](float* p, const std::vector<float>& v) {
+    CheckHip(
+        hipMemcpy(p, v.data(), v.size() * sizeof(float), hipMemcpyHostToDevice),
+        "separate SSM upload");
+  };
+  auto constant = [&](float* p, std::size_t count, float value) {
+    std::vector<float> v(count, value);
+    upload(p, v);
+  };
+
+  std::uint8_t* d_qkv_w = nullptr;
+  std::uint8_t* d_gate_w = nullptr;
+  float* d_x = nullptr;
+  __half* d_x_half = nullptr;
+  CheckHip(hipMalloc(&d_qkv_w, qkv.packed.size() + tail),
+           "separate SSM QKV weights");
+  CheckHip(hipMalloc(&d_gate_w, gate.packed.size() + tail),
+           "separate SSM gate weights");
+  CheckHip(hipMalloc(&d_x, x.size() * sizeof(float)), "separate SSM input");
+  CheckHip(hipMalloc(&d_x_half, x.size() * sizeof(__half)),
+           "separate SSM halves");
+  CheckHip(hipMemcpy(d_qkv_w, qkv.packed.data(), qkv.packed.size(),
+                     hipMemcpyHostToDevice),
+           "separate SSM QKV weights upload");
+  CheckHip(hipMemcpy(d_gate_w, gate.packed.data(), gate.packed.size(),
+                     hipMemcpyHostToDevice),
+           "separate SSM gate weights upload");
+  CheckHip(hipMemset(d_qkv_w + qkv.packed.size(), 0, tail),
+           "separate SSM QKV weights tail");
+  CheckHip(hipMemset(d_gate_w + gate.packed.size(), 0, tail),
+           "separate SSM gate weights tail");
+  CheckHip(
+      hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "separate SSM input upload");
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+
+  const std::size_t conv_count = std::size_t(batch) * channels;
+  const std::size_t state_count = std::size_t(vh) * d * d;
+  const std::size_t out_count = std::size_t(batch) * value_dim;
+  const std::size_t hist_count = std::size_t(3) * channels;
+  const float poison = 1.0e30F;
+  const auto history = values(hist_count, 0.5F);
+  const auto initial_state = values(state_count, 0.05F);
+  float* qkv_ref = buffers.Make(conv_count);
+  float* z_ref = buffers.Make(out_count);
+  float* scratch_ref = buffers.Make(conv_count + 4 * channels);
+  float* qkv_fused = buffers.Make(conv_count + 8);
+  float* z_fused = buffers.Make(out_count);
+  float* scratch_fused = buffers.Make(conv_count + 4 * channels + 8);
+  float* conv_state = buffers.Make(hist_count);
+  float* state = buffers.Make(state_count);
+  float* qn = buffers.Make(std::size_t(batch) * kh * d);
+  float* kn = buffers.Make(std::size_t(batch) * kh * d);
+  float* raw = buffers.Make(out_count);
+  float* out = buffers.Make(out_count);
+  float* chk_state = buffers.Make(state_count);
+  float* chk_history = buffers.Make(hist_count);
+  float* conv_w = buffers.Make(std::size_t(channels) * 4);
+  float* ab = buffers.Make(std::size_t(batch) * 2 * vh);
+  float* a = buffers.Make(vh);
+  float* dt = buffers.Make(vh);
+  float* norm = buffers.Make(d);
+
+  const auto conv = values(channels * 4, 0.05F);
+  const auto alpha_beta = values(std::size_t(batch) * 2 * vh, 1.0F);
+  const auto decay = values(vh, 0.5F, -1.5F);
+  const auto delta = values(vh, 1.0F);
+  const auto norm_weight = values(d, 0.5F, 1.0F);
+  upload(conv_state, history);
+  upload(state, initial_state);
+  upload(conv_w, conv);
+  upload(ab, alpha_beta);
+  upload(a, decay);
+  upload(dt, delta);
+  upload(norm, norm_weight);
+  const auto consume = [&](const float* qkv_rows, const float* gate_rows,
+                           bool convolved, float* conv_state_rows,
+                           float* scratch, float* state_rows, float* out_rows,
+                           float* checkpoint_state, float* checkpoint_history) {
+    q::GatedDeltaNet(qkv_rows, channels, gate_rows, gate_m, ab, conv_w, a, dt,
+                     norm, conv_state_rows, scratch, qn, kn, raw, state_rows,
+                     out_rows, nullptr, {}, {}, batch, kh, vh, d, 4, true,
+                     convolved, 1e-6F, nullptr, nullptr,
+                     q::GdnCheckpoint{checkpoint_state, checkpoint_history,
+                                      checkpoint_tokens});
+  };
+  auto download = [](const float* p, std::size_t count) {
+    return Download(p, count);
+  };
+  auto same = [](const std::vector<float>& expected,
+                 const std::vector<float>& actual, const char* name) {
+    if (expected.size() != actual.size() ||
+        std::memcmp(expected.data(), actual.data(),
+                    expected.size() * sizeof(float)) != 0) {
+      throw std::runtime_error(std::string("separate SSM changed ") + name);
+    }
+    for (float value : actual) {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("nonfinite separate SSM ") + name);
+      }
+    }
+  };
+
+  if (!q::DenseQuantF16Gemm(type, d_qkv_w, d_x_half, qkv_ref, batch, channels,
+                            k, nullptr) ||
+      !q::DenseQuantF16Gemm(gate_type, d_gate_w, d_x_half, z_ref, batch, gate_m,
+                            k, nullptr)) {
+    throw std::runtime_error("separate SSM projection rejected the shape");
+  }
+  const auto qkv_reference = download(qkv_ref, conv_count);
+  const auto gate_reference = download(z_ref, out_count);
+  constant(chk_state, state_count, poison);
+  constant(chk_history, hist_count, poison);
+  consume(qkv_ref, z_ref, false, conv_state, scratch_ref, state, out, chk_state,
+          chk_history);
+  const auto expected_conv = download(scratch_ref, conv_count);
+  const auto expected_state = download(state, state_count);
+  const auto expected_history = download(conv_state, hist_count);
+  const auto expected_out = download(out, out_count);
+  const auto expected_checkpoint_state = download(chk_state, state_count);
+  const auto expected_checkpoint_history = download(chk_history, hist_count);
+
+  for (int replay = 0; replay < 2; ++replay) {
+    upload(conv_state, history);
+    upload(state, initial_state);
+    constant(chk_state, state_count, poison);
+    constant(chk_history, hist_count, poison);
+    CheckHip(hipMemset(qkv_fused, 0xFF, (conv_count + 8) * sizeof(float)),
+             "poison fused QKV");
+    CheckHip(hipMemset(scratch_fused, 0xFF,
+                       (conv_count + 4 * channels + 8) * sizeof(float)),
+             "poison fused convolution");
+    if (!q::DenseQuantF16SsmGemm(type, d_qkv_w, d_x_half, conv_w,
+                                 history.data(), qkv_fused, scratch_fused,
+                                 batch, channels, k, channels, 4, nullptr,
+                                 checkpoint_tokens)) {
+      throw std::runtime_error("standalone SSM projection rejected the shape");
+    }
+    if (!q::DenseQuantF16Gemm(gate_type, d_gate_w, d_x_half, z_fused, batch,
+                              gate_m, k, nullptr)) {
+      throw std::runtime_error("separate SSM gate rejected the shape");
+    }
+    same(expected_conv, download(scratch_fused, conv_count), "convolution");
+    same(gate_reference, download(z_fused, out_count), "gate projection");
+    const auto projected = download(qkv_fused, conv_count + 8);
+    for (std::uint32_t t = 0; t < batch; ++t) {
+      const std::uint32_t tile = t % 32;
+      const bool raw = tile < 3 || tile >= 29 || t + 3 >= batch ||
+                       (checkpoint_tokens != 0 && t < checkpoint_tokens &&
+                        t + 3 >= checkpoint_tokens);
+      if (raw && std::memcmp(projected.data() + std::size_t(t) * channels,
+                             qkv_reference.data() + std::size_t(t) * channels,
+                             std::size_t(channels) * sizeof(float)) != 0) {
+        throw std::runtime_error("standalone SSM changed a retained QKV row");
+      }
+    }
+    for (std::size_t i = conv_count; i < projected.size(); ++i) {
+      if (std::bit_cast<std::uint32_t>(projected[i]) != 0xFFFFFFFFU) {
+        throw std::runtime_error("standalone SSM overwrote its QKV guard");
+      }
+    }
+    consume(qkv_fused, z_fused, true, conv_state, scratch_fused, state, out,
+            chk_state, chk_history);
+    same(expected_history, download(conv_state, hist_count), "history");
+    same(expected_state, download(state, state_count), "recurrent state");
+    same(expected_out, download(out, out_count), "output");
+    same(expected_checkpoint_state, download(chk_state, state_count),
+         "checkpoint state");
+    same(expected_checkpoint_history, download(chk_history, hist_count),
+         "checkpoint history");
+  }
+  if (q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, 1023, channels, k, channels, 4,
+                              nullptr) ||
+      q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, batch, gate_m, k, channels, 4,
+                              nullptr)) {
+    throw std::runtime_error(
+        "standalone SSM projection accepted an unsupported shape");
+  }
+  CheckHip(hipFree(d_qkv_w), "separate SSM free");
+  CheckHip(hipFree(d_gate_w), "separate SSM free");
+  CheckHip(hipFree(d_x), "separate SSM free");
+  CheckHip(hipFree(d_x_half), "separate SSM free");
+  std::cout << "standalone fused SSM convolution, gate, state, history and "
+               "checkpoint are exact\n";
+}
+
 /// Formats outside the adapter set (Q5_1 is routed down-projection only,
 /// Q4_0 has no GPU kernels) must fail the executor's format probe and both
 /// dense entry points, so a widened whitelist cannot make decode and prefill
@@ -1774,6 +2007,15 @@ int main() {
       CheckSsmProjectionQuant(type, 1024);
     }
     CheckSsmProjectionQuant(gufo::core::GgmlType::kIQ4_XS, 1025);
+    // Mixed-type SSM layers: the standalone QKV matrix fuses the same
+    // convolution while the gate keeps its own type, with the checkpoint
+    // prefix and rolling history reading the retained raw rows.
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ6_K,
+                                    gufo::core::GgmlType::kIQ3_S, 1024, 1000);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kIQ4_XS,
+                                    gufo::core::GgmlType::kQ4_K, 1025, 1025);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ5_K,
+                                    gufo::core::GgmlType::kQ6_K, 2049, 2046);
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.

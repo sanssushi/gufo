@@ -28,20 +28,21 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -2 to -4% for xxs and -6 to -7% for s) is the per-element
+  gap (about -2 to -3% for xxs and about -6% for s) is the per-element
   decode cost of the low-bit weight formats at those eight verification
   rows; the shared expert's decoded weight fragments are reused across the
   tokens in a group. It is not a draft, attention or dispatch problem.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill is about 16-23% slower and is compute-bound. The gap is the
+- Prefill is about 15-21% slower and is compute-bound. The gap is the
   arithmetic cost of the F16 WMMA path used for these formats, not a byte,
   launch or dispatch problem.
 
 On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
 signed bytes directly from the quantization grid words, using packed sign
-masks.
+masks. Mixed-type SSM layers fuse the four-tap convolution into their
+standalone QKV projection; the gate keeps its own projection type.
 
 ## Targets and artifacts
 
@@ -70,10 +71,10 @@ Facts that shape the implementation:
 | `ple_conv1d` | F16 |
 | router and GDN alpha/beta | BF16 |
 
-- Only 4 of 12 attention layers in xxs and 5 of 12 in s, plus 8 of 24 SSM
-  layers in each mix, have all their projections in one quantization type.
-  Attention and SSM stacking therefore merges only those groups (see
-  "Stacked attention and SSM projections").
+- Only 4 of 12 attention layers in xxs and 5 of 12 in s, plus 9 of 36 SSM
+  layers in xxs and 12 of 36 in s, have all their projections in one
+  quantization type. Attention and SSM stacking therefore merges only those
+  groups (see "Stacked attention and SSM projections").
 
 ## Type layer (`src/core`)
 
@@ -246,11 +247,14 @@ vendored code is re-imported (see "Vendored-code obligations").
   quantized projection (`DenseQuantF16SsmGemm`, with `kSsmConv` epilogue
   instantiations for the K-quant/IQ `ssm_in` types) behind the executor
   check `KQuantWmmaType(ssm_in.type) && cols <= max_half_cols`, alongside
-  `DenseF16Route`. The epilogue reads only the accumulated tile, `conv_w`
-  and the history, so it does not depend on the weight format. The Q8_0
-  route keeps each wave's decoded weight rows in registers; the GSQ stacks
-  stage their decoded fragments in shared memory (`LDS`), because the
-  register variant is slower for them (see "Performance state").
+  `DenseF16Route`. Mixed-type layers keep QKV and gate separate; their
+  standalone [10240][2560] QKV projection takes the same fused epilogue
+  behind the check on `ssm_qkv.type`, and the independently typed gate
+  keeps its own projection. The epilogue reads only the accumulated tile,
+  `conv_w` and the history, so it does not depend on the weight format. The
+  Q8_0 route keeps each wave's decoded weight rows in registers; the GSQ
+  stacks stage their decoded fragments in shared memory (`LDS`), because
+  the register variant is slower for them (see "Performance state").
 - `UnquantizedF16Gemm` handles F16 weights or BF16 weights treated as F16,
   with F16 activation rows, in 64-row × 128-token tiles (the narrow shape
   also used by W8A8Gemm). The accumulation order along K is fixed per
@@ -386,8 +390,12 @@ Breaking any of them silently breaks session or audit replay.
   `DenseQuantF16SsmGemm` pass bit-exact against the separate
   `DenseQuantF16Gemm` projection for each stacked K-quant/IQ format (same
   decode, same K order per output), through its GatedDeltaNet consumer, at
-  a full and a partial final token tile, plus fixtures that verify
-  rejection.
+  a full and a partial final token tile. The standalone QKV case uses an
+  independently typed gate and covers 1,024-, 1,025- and 2,049-token
+  batches, a nonzero rolling history and mid-tile checkpoint prefixes;
+  projection, convolution, recurrent state, history and checkpoint bytes
+  match the separate chain. Fixtures verify rejection of unsupported
+  shapes.
 - The `UnquantizedF16Gemm` route keeps one K order per output:
   `CheckBf16Gemm` pins the BF16 route bit-exact against the F16-staged route
   across a prefill chunk split, and `blaslt_ops_test` pins the F16 route
@@ -496,18 +504,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6% |
-| AR tg128 at d32768 | -1.6/-2.3% | -6.5/-6.6% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -11.2/-11.3% | -20.0/-20.5% |
-| MTP tg128 at d32768 | -2.1/-4.4% | -6.2/-6.6% |
-| pp2048 at d32768, AR (speculation off) | -17.5/-16.7% | -18.3/-17.1% |
-| pp2048 at d32768, MTP | -16.8/-16.9% | -17.4/-17.1% |
-| pp2048 at d0, steady state | ≈ -21..-23% | ≈ -21..-23% |
+| AR tg128 at d32768 | -1.6/-2.1% | -6.5/-6.7% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -10.2/-11.5% | -19.9/-20.3% |
+| MTP tg128 at d32768 | -2.6/-2.8% | -6.5/-5.8% |
+| pp2048 at d32768, AR (speculation off) | -16.7/-15.8% | -17.3/-16.3% |
+| pp2048 at d32768, MTP | -15.4/-15.4% | -16.2/-15.8% |
+| pp2048 at d0, steady state | ≈ -19..-21% | ≈ -19..-21% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6% (s);
-  depth-32768 measurements are -1.6/-2.3% (xxs) and -6.5/-6.6% (s).
+  depth-32768 measurements are -1.6/-2.1% (xxs) and -6.5/-6.7% (s).
   Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
@@ -521,7 +529,7 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  roughly -2 to -4% (xxs) and -6 to -7% (s) gap is the low-bit formats'
+  roughly -2 to -3% (xxs) and -6% (s) gap is the low-bit formats'
   per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -560,8 +568,8 @@ focused depth 0):
   control (the BF16 down projection alone is about 158 ms, against the
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
   166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
-  measurements are about -16..-18%. Depth-0 measurements fall in
-  about -21..-23%, and their spread follows the control's own depth-0 rate
+  measurements are about -15..-17%. Depth-0 measurements fall in
+  about -19..-21%, and their spread follows the control's own depth-0 rate
   (a lower control rate widens the gap and a higher one narrows it; the
   control's prefill rate varies more between rounds than the mixes'). That
   spread is measurement variance, not a difference in the execution path.
@@ -654,7 +662,7 @@ re-imports must re-apply the recorded blocks.
 | Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
 | Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`, packed grid-group decode) |
 | Executor / dispatch | `src/models/qwen38_flash_next/executor.cpp` |
-| Other kernels | `kernels.hip.cpp` (`SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
+| Other kernels | `kernels.hip.cpp` (`DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
 | Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |
 | Core quant tests | `tests/core/ggml_dequant_test.cpp` |
 | Benchmark and profiling tools | `tools/bench/`, `tools/prof/prof.py`, `tools/prof/isa_mix.py` |

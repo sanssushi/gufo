@@ -312,8 +312,9 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 /// IQ3_S — the dense F16-tile set) take the same fused projection and
 /// boundary pass: their weight tiles decode through DecodeQuantSub16 into
 /// F16 as they are staged, so the convolution sees the same accumulated
-/// values as the separate projection. Same geometry contract as
-/// DenseF16SsmGemm; other types launch nothing.
+/// values as the separate projection. m is the stacked [QKV; gate] width
+/// (16384) or the standalone QKV width (10240, channels); other types
+/// launch nothing.
 bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
                           const float* conv_w, const float* history,
                           float* qkvz, float* convolved, std::uint32_t n_tokens,

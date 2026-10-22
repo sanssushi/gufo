@@ -2607,10 +2607,24 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     z = s_.qkvz + channels;
     qkv_stride = z_stride = l.ssm_in.rows;
   } else if (!projections_ready) {
+    // The convolution consumes QKV only, so a mixed-type layer can fuse it
+    // into the standalone QKV projection; the independently typed gate
+    // stays a separate projection. Speculative rows need every raw QKV row
+    // and keep the separate convolution path.
+    if (!speculative && n_tokens >= 1024 && n_tokens <= options_.max_batch &&
+        KQuantWmmaType(l.ssm_qkv.type) &&
+        l.ssm_qkv.cols <= model_->max_half_cols()) {
+      PrepareHalfInput(x, n_tokens, l.ssm_qkv.cols);
+      convolved = DenseQuantF16SsmGemm(
+          l.ssm_qkv.type, l.ssm_qkv.data, static_cast<const __half*>(s_.x_half),
+          l.ssm_conv1d.f32(), s.conv_state, s_.qkv, s_.conv_scratch, n_tokens,
+          l.ssm_qkv.rows, l.ssm_qkv.cols, channels, c.ssm_conv_kernel, stream_,
+          checkpoint.tokens);
+    }
     Q8Input xq;
     if (!QuantizeFor({&l.ssm_qkv, &l.ssm_gate}, x, n_tokens, c.hidden_size, &xq,
                      error_msg) ||
-        !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
+        (!convolved && !Dense(l.ssm_qkv, xq, s_.qkv, error_msg)) ||
         !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
       return false;
     }
