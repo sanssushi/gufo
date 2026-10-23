@@ -254,23 +254,40 @@ void CheckBf16Gemm(std::uint32_t tokens, std::size_t rows, std::size_t cols,
     down_bf16[i] = FloatToBf16(down[i]);
     down_half[i] = __float2half_rn(Bf16ToFloat(down_bf16[i]));
   }
+  constexpr std::size_t kGuard = 32;
+  constexpr float kPoison = 1234.5F;
   HipBuffer<__half> d_norm(norm_half.size()), d_down_half(down_half.size());
   HipBuffer<std::uint16_t> d_down_bf16(down_bf16.size());
-  HipBuffer<float> d_ref(out_count), d_out(out_count);
+  HipBuffer<float> d_ref(out_count), d_out(out_count + 2 * kGuard);
+  std::vector<float> poison(d_out.bytes() / sizeof(float), kPoison);
+  CheckHip(hipMemcpy(d_out.get(), poison.data(), d_out.bytes(),
+                     hipMemcpyHostToDevice),
+           "poison BF16 projection output");
   Upload(&d_norm, norm_half);
   Upload(&d_down_half, down_half);
   Upload(&d_down_bf16, down_bf16);
   if (!q::UnquantizedF16Gemm(d_down_half.get(), d_norm.get(), d_ref.get(),
                              tokens, rows, cols, nullptr))
     throw std::runtime_error("HC BF16 reference projection rejected");
-  if (!q::UnquantizedF16Gemm(d_down_bf16.get(), d_norm.get(), d_out.get(),
-                             tokens, rows, cols, nullptr, q::WeightType::kBF16))
+  if (!q::UnquantizedF16Gemm(d_down_bf16.get(), d_norm.get(),
+                             d_out.get() + kGuard, tokens, rows, cols, nullptr,
+                             q::WeightType::kBF16))
     throw std::runtime_error("HC BF16 projection rejected");
-  Exact(d_ref, d_out, label);
   const auto reference = Download(&d_ref, out_count);
+  const auto actual = Download(&d_out, poison.size());
+  if (std::memcmp(reference.data(), actual.data() + kGuard,
+                  out_count * sizeof(float)) != 0) {
+    throw std::runtime_error(std::string(label) + " projection changed");
+  }
+  for (std::size_t i = 0; i < kGuard; ++i) {
+    if (actual[i] != kPoison || actual[kGuard + out_count + i] != kPoison) {
+      throw std::runtime_error(std::string(label) +
+                               " projection wrote outside the live rows");
+    }
+  }
   SpotOracle(down_half, norm_half, reference, rows, cols, tokens, label);
-  // The 64 x 128 plan keeps one K order per output, so a token's row must
-  // stay bit-identical across any prefill chunk split.
+  // Every plan keeps one K order per output, so a token's row must stay
+  // bit-identical across any prefill chunk split.
   if (tokens >= 129) {
     const std::uint32_t head = tokens - 33;
     HipBuffer<float> d_split(out_count);
@@ -719,10 +736,9 @@ int main() {
     CheckFusedProjection(2049);
     constexpr std::size_t kRank = 320;
     constexpr std::size_t kDim = kStreams * kHidden;
-    CheckBf16Gemm(1, kRank, kDim, "HC BF16 down");
-    CheckBf16Gemm(8, kRank, kDim, "HC BF16 down");
-    CheckBf16Gemm(96, kRank, kDim, "HC BF16 down");
-    CheckBf16Gemm(2049, kRank, kDim, "HC BF16 down");
+    for (const std::uint32_t tokens : {1U, 8U, 96U, 127U, 128U, 129U, 1023U,
+                                       1024U, 1025U, 2047U, 2048U, 2049U})
+      CheckBf16Gemm(tokens, kRank, kDim, "HC BF16 down");
     for (std::uint32_t tokens = 1; tokens <= 8; ++tokens)
       CheckBf16Gemm(tokens, kDim, kRank, "HC BF16 up");
     CheckBf16Gemm(96, kDim, kRank, "HC BF16 up");
