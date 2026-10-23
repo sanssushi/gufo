@@ -1364,10 +1364,7 @@ __global__ void NarrowKernel(const S* x, T* out, std::size_t count) {
 
 /// One wave per weight row, kSmallGemmRows rows per block: the row is read
 /// once (four consecutive elements per lane per step) while up to eight
-/// tokens accumulate in registers, then a wave reduction per token. The
-/// 16-bit encodings read eight weights and activations per lane step: the
-/// decode tier's GEMVs are bandwidth-bound row waves, and the per-element
-/// fetch held them to half of it.
+/// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
 template<WeightType type, unsigned tokens, bool grouped = false,
          bool kWhole = false>
@@ -1391,112 +1388,88 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   constexpr unsigned kSteps = kWhole || tokens <= 2 ? 4 : 2;
   const std::uint32_t stride = warpSize * 4;
   float acc[tokens] = {};
-  if constexpr (type == WeightType::kBF16 || type == WeightType::kF16) {
-    for (std::uint32_t i0 = lane * 8; i0 < k; i0 += warpSize * 8) {
-      float wv[8];
-      if (i0 + 8 <= k) {
-        std::uint16_t packed[8];
-        __builtin_memcpy(packed, wrow + static_cast<std::size_t>(i0) * 2,
-                         sizeof(packed));
+  for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
+    float wv[kSteps][4];
+    float xv[kSteps][tokens][4];
 #pragma unroll
-        for (unsigned r = 0; r < 8; ++r) {
-          wv[r] = type == WeightType::kBF16
-                      ? Bf16ToF32(packed[r])
-                      : __half2float(__builtin_bit_cast(__half, packed[r]));
-        }
-      } else {
-#pragma unroll
-        for (unsigned r = 0; r < 8; ++r) {
-          wv[r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
-        }
-      }
-#pragma unroll
-      for (unsigned j = 0; j < tokens; ++j) {
-        const float* xr = x + static_cast<std::size_t>(j) * k + i0;
-        float dot = 0.0f;
-        if (i0 + 8 <= k) {
-          float xv[8];
-          __builtin_memcpy(xv, xr, sizeof(xv));
-#pragma unroll
-          for (unsigned r = 0; r < 8; ++r) {
-            dot += wv[r] * xv[r];
-          }
-        } else {
-#pragma unroll
-          for (unsigned r = 0; r < 8; ++r) {
-            dot += wv[r] * (i0 + r < k ? xr[r] : 0.0f);
-          }
-        }
-        acc[j] += dot;
-      }
-    }
-  } else {
-    for (std::uint32_t i_base = lane * 4; i_base < k;
-         i_base += stride * kSteps) {
-      float wv[kSteps][4];
-      float xv[kSteps][tokens][4];
-#pragma unroll
-      for (unsigned st = 0; st < kSteps; ++st) {
-        const std::uint32_t i0 = i_base + st * stride;
-        if constexpr (kWhole) {
-          // F32 rows of whole passes (k a multiple of stride * kSteps): every
-          // step is in range, so the four elements arrive as one 16-byte load.
+    for (unsigned st = 0; st < kSteps; ++st) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if constexpr (kWhole) {
+        // Rows of whole passes (k a multiple of stride * kSteps): every step
+        // is in range, so the four elements arrive as one load: 16 bytes for
+        // F32, 8 bytes for F16/BF16 (widened exactly, as RowElement does).
+        if constexpr (type == WeightType::kF32) {
           const float4 w4 = reinterpret_cast<const float4*>(
               static_cast<const void*>(wrow))[i0 / 4];
           wv[st][0] = w4.x;
           wv[st][1] = w4.y;
           wv[st][2] = w4.z;
           wv[st][3] = w4.w;
-#pragma unroll
-          for (unsigned j = 0; j < tokens; ++j) {
-            const float4 x4 = reinterpret_cast<const float4*>(
-                x + static_cast<std::size_t>(j) * k)[i0 / 4];
-            xv[st][j][0] = x4.x;
-            xv[st][j][1] = x4.y;
-            xv[st][j][2] = x4.z;
-            xv[st][j][3] = x4.w;
+        } else {
+          static_assert(type == WeightType::kF16 || type == WeightType::kBF16);
+          const ushort4 h4 = reinterpret_cast<const ushort4*>(
+              static_cast<const void*>(wrow))[i0 / 4];
+          if constexpr (type == WeightType::kBF16) {
+            wv[st][0] = Bf16ToF32(h4.x);
+            wv[st][1] = Bf16ToF32(h4.y);
+            wv[st][2] = Bf16ToF32(h4.z);
+            wv[st][3] = Bf16ToF32(h4.w);
+          } else {
+            wv[st][0] = __half2float(__ushort_as_half(h4.x));
+            wv[st][1] = __half2float(__ushort_as_half(h4.y));
+            wv[st][2] = __half2float(__ushort_as_half(h4.z));
+            wv[st][3] = __half2float(__ushort_as_half(h4.w));
           }
-          continue;
-        }
-#pragma unroll
-        for (unsigned r = 0; r < 4; ++r) {
-          wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
         }
 #pragma unroll
         for (unsigned j = 0; j < tokens; ++j) {
-          const float* xr = x + static_cast<std::size_t>(j) * k + i0;
-#pragma unroll
-          for (unsigned r = 0; r < 4; ++r) {
-            xv[st][j][r] = i0 + r < k ? xr[r] : 0.0f;
-          }
+          const float4 x4 = reinterpret_cast<const float4*>(
+              x + static_cast<std::size_t>(j) * k)[i0 / 4];
+          xv[st][j][0] = x4.x;
+          xv[st][j][1] = x4.y;
+          xv[st][j][2] = x4.z;
+          xv[st][j][3] = x4.w;
         }
+        continue;
       }
 #pragma unroll
-      for (unsigned st = 0; st < kSteps; ++st) {
-        const std::uint32_t i0 = i_base + st * stride;
-        if (!kWhole && i0 >= k) {
-          break;
+      for (unsigned r = 0; r < 4; ++r) {
+        wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
+      }
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+        const float* xr = x + static_cast<std::size_t>(j) * k + i0;
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          xv[st][j][r] = i0 + r < k ? xr[r] : 0.0f;
         }
+      }
+    }
 #pragma unroll
-        for (unsigned j = 0; j < tokens; ++j) {
-          if constexpr (kWhole) {
-            // The bounds-checked path compiles acc + dot to one FMA chain
-            // from acc in element order; spelled out so it cannot reassociate.
-            float a = acc[j];
+    for (unsigned st = 0; st < kSteps; ++st) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if (!kWhole && i0 >= k) {
+        break;
+      }
 #pragma unroll
-            for (unsigned r = 0; r < 4; ++r) {
-              a = __builtin_fmaf(wv[st][r], xv[st][j][r], a);
-            }
-            acc[j] = Materialize(a);
-            continue;
-          }
-          float dot = 0.0f;
+      for (unsigned j = 0; j < tokens; ++j) {
+        if constexpr (kWhole) {
+          // The bounds-checked path compiles acc + dot to one FMA chain
+          // from acc in element order; spelled out so it cannot reassociate.
+          float a = acc[j];
 #pragma unroll
           for (unsigned r = 0; r < 4; ++r) {
-            dot += wv[st][r] * xv[st][j][r];
+            a = __builtin_fmaf(wv[st][r], xv[st][j][r], a);
           }
-          acc[j] = Materialize(acc[j] + dot);
+          acc[j] = Materialize(a);
+          continue;
         }
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          dot += wv[st][r] * xv[st][j][r];
+        }
+        acc[j] = Materialize(acc[j] + dot);
       }
     }
   }
@@ -1513,9 +1486,9 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
 /// [320, 10240]) starve the device of waves, and every wave re-reads the
 /// complete activation block per token. One wave computes kWideGemmRows
 /// weight rows per step, loading each activation fragment once for all of
-/// them. Per-row and per-token dot products and reductions are those of
-/// SmallGemmKernel, so a row never depends on the token count or the wave's
-/// other rows. Two rows per wave (not four) double the resident waves: the
+/// them. Each row's dot product uses this kernel's eight-element lane
+/// partition, so a row never depends on the token count or the wave's other
+/// rows. Two rows per wave (not four) double the resident waves: the
 /// shape has 320 rows, and 40 blocks hide more of the DRAM latency than the
 /// four-row ILP they trade away (measured 82 -> 116 GB/s cold on gfx1151).
 constexpr unsigned kWideGemmRows = 2;

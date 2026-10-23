@@ -28,23 +28,27 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -2.5% for xxs and about -6.5% for s) is the per-element decode cost
+  gap (about -3% for xxs and about -7% for s) is the per-element decode cost
   of the low-bit weight formats at those eight verification rows; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
   It is not a draft, attention or dispatch problem.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill is about 14-19% slower and is compute-bound. The gap is the
-  arithmetic cost of the F16 WMMA path used for these formats, not a byte,
-  launch or dispatch problem.
+- Prefill at depth 32768 is about 14-16% slower and is compute-bound. The
+  gap is the arithmetic cost of the F16 WMMA path used for these formats,
+  not a byte, launch or dispatch problem. Depth-0 prefill cells span about
+  14-23%; their spread follows the control's own depth-0 rate.
 
 On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
 signed bytes directly from the quantization grid words, using packed sign
 masks. Mixed-type SSM layers fuse the four-tap convolution into their
 standalone QKV projection; the gate keeps its own projection type. The GDN
 output epilogue and the shared-expert SwiGLU write their F16 rows directly
-for the quantized dense projections.
+for the quantized dense projections. Ordinary short-K F16/BF16 small
+projections use a four-element lane partition with a multi-step preload,
+exact 16-bit loads and a pinned FMA chain, while the long-K BF16
+hyper-connection down projection keeps its eight-element wide GEMV.
 
 ## Targets and artifacts
 
@@ -282,12 +286,18 @@ vendored code is re-imported (see "Vendored-code obligations").
   one warp computes all tokens for its two weight rows; the per-row and
   per-token dot products match the one-token waves. Routed calls never use
   this path; it is enabled only when `n_experts == n_expert_used == 1`.
+- Short-K F16/BF16 small projections (router, GDN alpha/beta and indexer;
+  k=2560): `SmallGemmKernel` keeps one wave per weight row, maps four
+  consecutive weights and activations per lane, preloads the weight and
+  activation groups for every step, reads whole-pass F16/BF16 weights with
+  exact `ushort4` loads and activations with `float4` loads, and accumulates
+  through one pinned per-output FMA chain.
 - 16-bit few-row long-K GEMVs (the BF16 `hc` down projection at [320,
   10240]): `SmallGemmWideKernel` computes two weight rows per wave (m ≤ 512,
-  k ≥ 8192, 1-8 tokens). With four rows per wave, the 320-row shape leaves
-  too few resident waves; two rows raise cold-cache throughput from 82 to
-  116 GB/s. The control's Q8_0 `hc` down projection keeps its specialized
-  `qfn_q8_hc_down` path.
+  k ≥ 8192, 1-8 tokens) with its own eight-element lane partition. With four
+  rows per wave, the 320-row shape leaves too few resident waves; two rows
+  raise cold-cache throughput from 82 to 116 GB/s. The control's Q8_0 `hc`
+  down projection keeps its specialized `qfn_q8_hc_down` path.
 
 ### Stacked attention and SSM projections
 
@@ -399,6 +409,11 @@ Breaking any of them silently breaks session or audit replay.
   consuming path (`CheckDenseStackExact`), paired gate/up bit-exact against
   separate projections per type, and decode 16-bit GEMVs bit-exact against
   the CPU-expanded reference (`CheckDecodeGemv`).
+- Small projections: `CheckSmallProjection` pins F16/BF16/F32 scalar calls
+  against independent FP64 references on the production [513,2560],
+  [96,2560], [128,2560] and [512,2560] shapes plus ragged [7,131]. Widths
+  1-8 and grouped widths 9, 16, 31, 32, 33 and 64 replay the scalar result
+  bit-for-bit, and poison guards bound every write.
 - Quantized fused SSM convolution: `CheckSsmProjectionQuant` pins the fused
   `DenseQuantF16SsmGemm` pass bit-exact against the separate
   `DenseQuantF16Gemm` projection for each stacked K-quant/IQ format (same
@@ -523,18 +538,18 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ -1% | ≈ -6% |
-| AR tg128 at d32768 | -1.8/-1.8% | -6.6/-6.5% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | +6.6/+6.7% | -1.1/+0.5% |
-| MTP tg128 at d32768 | -2.2/-3.2% | -6.0/-6.7% |
-| pp2048 at d32768, AR (speculation off) | -15.0/-14.3% | -15.5/-14.5% |
-| pp2048 at d32768, MTP | -14.1/-14.4% | -14.6/-14.5% |
-| pp2048 at d0, steady state | ≈ -10..-20% | ≈ -10..-20% |
+| AR tg128 at d32768 | -1.7/-2.5% | -6.9/-6.9% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -3.9/-4.5% | -36.6/-36.4% |
+| MTP tg128 at d32768 | -3.0/-3.8% | -6.9/-7.6% |
+| pp2048 at d32768, AR (speculation off) | -15.3/-14.8% | -16.2/-14.8% |
+| pp2048 at d32768, MTP | -14.1/-14.1% | -14.6/-14.6% |
+| pp2048 at d0, steady state | ≈ -14..-23% | ≈ -14..-23% |
 
 ### Decode
 
 - Decode results: AR token generation is within 7% of the control. Steady
   depth-0 measurements are about -1% (xxs) and -6% (s);
-  depth-32768 measurements are -1.8/-1.8% (xxs) and -6.6/-6.5% (s).
+  depth-32768 measurements are -1.7/-2.5% (xxs) and -6.9/-6.9% (s).
   Depth-0 AR
   measurements carry launch and run noise: individual runs from the
   multi-depth benchmark read as low as 22.7 t/s (xxs) and 21.8 t/s (s),
@@ -542,13 +557,15 @@ focused depth 0):
   25.4 t/s (s), and the control itself reads 23.5-27 t/s across
   focused runs. MTP depth-0
   measurements follow the draft acceptance rate rather than kernel speed
-  (the control reads 37-44 t/s across rounds; a depth-0 run can take an
-  unusual draft trajectory at the same cycle count, which moves the result
-  with the acceptance rate). At depth 32768, upstream's prompt-lookup draft
+  (the control reads 42-49 t/s across the retained rounds; a depth-0 run
+  can take an unusual draft trajectory at the same cycle count, which moves
+  the result with the acceptance rate). The focused s run takes 59 cycles with 36 of
+  65 drafts accepted; the focused xxs run takes 49 cycles with 78 of 117
+  accepted. At depth 32768, upstream's prompt-lookup draft
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  roughly -2.5% (xxs) and -6.5% (s) gap is the low-bit
+  roughly -3% (xxs) and -7% (s) gap is the low-bit
   formats' per-element decode at eight verification rows, with shared-expert
   weight-fragment reuse. The routed gate/up stage is 434 ms per 17
   verification cycles of the copied 32K prompt on xxs, at that stage's
@@ -573,25 +590,24 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill: the about -14..-19% gap is compute-bound, not byte- or
-  launch-bound. The dequant-to-F16 route runs at the F16-WMMA limit at these
-  shapes (the wide HC down projection moves about 25% fewer bytes for about
-  3% less time). Prefill execution has 5-8% idle time on both mixes, so it
-  is not launch-bound. The mixes issue 21% more dispatches than the
-  control, which follows from the mixed-type stacks. The unquantized route
-  keeps its 64×128 tile; upstream's <128,128> wide tile is not used for it
-  (64×128 covers the same shapes, and the control's prefill shows no
+- Prefill: the about -14..-16% gap at depth 32768 is compute-bound, not
+  byte- or launch-bound. The dequant-to-F16 route runs at the F16-WMMA limit
+  at these shapes (the wide HC down projection moves about 25% fewer bytes
+  for about 3% less time). Prefill execution has 5-8% idle time on both
+  mixes, so it is not launch-bound. The mixes issue 21% more dispatches than
+  the control, which follows from the mixed-type stacks. The unquantized
+  route keeps its 64×128 tile; upstream's <128,128> wide tile is not used
+  for it (64×128 covers the same shapes, and the control's prefill shows no
   regression). In a warmed-up xxs pp2048 forward pass, HC-up takes 70.5 ms
   (control 51.6 ms; the BF16 128-row tile keeps both K16 chains
   spill-free), the 16-bit-weight HC-down family costs 157 ms more than the
   control (the BF16 down projection alone is about 158 ms, against the
   control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
-  166 ms more, and routed gate/up costs 20 ms more. Depth-32768 prefill
-  measurements are about -14..-16%. Depth-0 measurements fall in
-  about -10..-20%, and their spread follows the control's own depth-0 rate
-  (the control's prefill rate varies more between rounds than the mixes').
-  That spread is measurement variance, not a difference in the execution
-  path.
+  166 ms more, and routed gate/up costs 20 ms more. Depth-0 measurements
+  span about -14..-23%, and their spread follows the control's own depth-0
+  rate (the control's prefill rate varies more between rounds than the
+  mixes'). That spread is measurement variance, not a difference in the
+  execution path.
 
 ### Rejected options
 
@@ -637,6 +653,10 @@ focused depth 0):
 ### Control
 
 - Control health: UD-Q4_K_XL shows no regression relative to `main`.
+  MTP tg128 at depth 32768 reads 91.76/91.49 t/s against main's
+  91.80/91.08 t/s (-0.04%/+0.45%), with the same 17 cycles / 111 accepted /
+  102 lookup trajectory and completion sha `d856f78e…`. AR and prefill
+  control cells stay within round spread.
 
 ## Vendored-code obligations
 
@@ -688,7 +708,7 @@ re-imports must re-apply the recorded blocks.
 | Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
 | Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`, packed grid-group decode) |
 | Executor / dispatch | `src/models/qwen38_flash_next/executor.cpp` |
-| Other kernels | `kernels.hip.cpp` (`DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
+| Other kernels | `kernels.hip.cpp` (`DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmKernel`, `SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
 | Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |
 | Core quant tests | `tests/core/ggml_dequant_test.cpp` |
 | Benchmark and profiling tools | `tools/bench/`, `tools/prof/prof.py`, `tools/prof/isa_mix.py` |
