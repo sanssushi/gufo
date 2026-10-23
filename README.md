@@ -9,10 +9,10 @@ Speed vs unsloth UD-Q4_K_XL (single-user `gufo bench`, context depth 32k, negati
 
 | Workload | IQ3_XXS | IQ3_S |
 | --- | ---: | ---: |
-| tg128 AR | -1.7% | -6.9% |
-| tg128 MTP | -3.0% | -6.9% |
-| pp2048 AR | -14.8% | -14.8% |
-| pp2048 MTP | -14.1% | -14.6% |
+| tg128 AR | -0.5% | -5.3% |
+| tg128 MTP | -2.3% | -6.2% |
+| pp2048 AR | -14.6% | -13.9% |
+| pp2048 MTP | -13.6% | -14.4% |
 
 # Gufo: The ***Open Source*** Strix Halo AI engine
 
