@@ -7660,6 +7660,19 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0 ||
       (wtype != WeightType::kF16 && wtype != WeightType::kBF16))
     return false;
+  // The BF16 mixer up projection at decode: the 64 x 128 plan computes a full
+  // 128-token tile for at most eight rows. A 256 x 16 tile keeps the same
+  // staged BF16 rounding and two K16 accumulator chains at a sixteenth of
+  // the token width.
+  if (wtype == WeightType::kBF16 && m == 10240 && k == 320 && batch <= 8) {
+    const dim3 narrow_grid(static_cast<unsigned int>((batch + 15) / 16),
+                           static_cast<unsigned int>((m + 255) / 256));
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<256, 16, 1, 8, 1, 1, false, false, false, true,
+                            false, false, false, true>),
+        narrow_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    return true;
+  }
   // 64-row x 128-token tiles (the W8A8 narrow geometry): half the weight
   // re-reads per token tile of the 64 x 64 plan. The K order per output is
   // unchanged, so the results stay bit-exact across the plan and every

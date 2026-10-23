@@ -293,6 +293,71 @@ void CheckBf16Gemm(std::uint32_t tokens, std::size_t rows, std::size_t cols,
   std::cerr << label << " projection exact at " << tokens << " tokens\n";
 }
 
+// The decode mixer-up route must keep the wide plan's exact bytes at every
+// token width and leave the bytes beyond the live rows untouched. BF16 lanes
+// across F16's subnormal range and its round-to-nearest ties are included.
+void CheckBf16UpNarrow() {
+  constexpr std::size_t kRows = static_cast<std::size_t>(kHidden) * kStreams;
+  constexpr std::size_t kCols = 320;
+  constexpr std::size_t kGuard = 32;
+  constexpr float kPoison = 1234.5F;
+  const auto x = MakeValues(kCols * 8, 0x24681357U, 0.5F);
+  std::vector<__half> x_half(x.size());
+  std::transform(x.begin(), x.end(), x_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  const auto base = MakeValues(kRows * kCols, 0x13572468U, 0.02F);
+  std::vector<std::uint16_t> weights(base.size());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    weights[i] = FloatToBf16(base[i]);
+  }
+  const std::uint16_t specials[] = {0x0001, 0x007F, 0x0080, 0x3380,
+                                    0x33C0, 0x3C00, 0x4100, 0xC080};
+  constexpr std::size_t kSpecialCount = sizeof(specials) / sizeof(specials[0]);
+  for (std::size_t i = 0; i < weights.size(); i += 977) {
+    weights[i] = specials[(i / 977) % kSpecialCount];
+  }
+  std::vector<__half> weights_half(weights.size());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    weights_half[i] = __float2half_rn(Bf16ToFloat(weights[i]));
+  }
+  HipBuffer<std::uint16_t> d_weights_bf16(weights.size());
+  HipBuffer<__half> d_weights_half(weights.size());
+  HipBuffer<__half> d_x(x_half.size());
+  Upload(&d_weights_bf16, weights);
+  Upload(&d_weights_half, weights_half);
+  Upload(&d_x, x_half);
+  for (std::uint32_t tokens = 1; tokens <= 8; ++tokens) {
+    const std::size_t out_count = static_cast<std::size_t>(tokens) * kRows;
+    HipBuffer<float> d_ref(out_count);
+    HipBuffer<float> d_out(out_count + 2 * kGuard);
+    std::vector<float> poison(d_out.bytes() / sizeof(float), kPoison);
+    CheckHip(hipMemcpy(d_out.get(), poison.data(), d_out.bytes(),
+                       hipMemcpyHostToDevice),
+             "poison narrow up output");
+    if (!q::UnquantizedF16Gemm(d_weights_half.get(), d_x.get(), d_ref.get(),
+                               tokens, kRows, kCols, nullptr))
+      throw std::runtime_error("HC BF16 up reference rejected");
+    if (!q::UnquantizedF16Gemm(d_weights_bf16.get(), d_x.get(),
+                               d_out.get() + kGuard, tokens, kRows, kCols,
+                               nullptr, q::WeightType::kBF16))
+      throw std::runtime_error("HC BF16 up projection rejected");
+    const auto reference = Download(&d_ref, out_count);
+    const auto actual = Download(&d_out, poison.size());
+    if (std::memcmp(reference.data(), actual.data() + kGuard,
+                    out_count * sizeof(float)) != 0) {
+      throw std::runtime_error("HC BF16 up changed at a narrow width");
+    }
+    for (std::size_t i = 0; i < kGuard; ++i) {
+      if (actual[i] != kPoison || actual[kGuard + out_count + i] != kPoison) {
+        throw std::runtime_error("HC BF16 up wrote outside the live rows");
+      }
+    }
+    SpotOracle(weights_half, x_half, reference, kRows, kCols, tokens,
+               "HC BF16 up narrow");
+  }
+  std::cerr << "HC BF16 up exact with guards at widths 1-8\n";
+}
+
 // Fusing the BF16 up and inject of the GSQ mixes must match the CPU
 // expansion of those weights through the separate GEMM and F32-inject
 // epilogue bit for bit.
@@ -658,10 +723,11 @@ int main() {
     CheckBf16Gemm(8, kRank, kDim, "HC BF16 down");
     CheckBf16Gemm(96, kRank, kDim, "HC BF16 down");
     CheckBf16Gemm(2049, kRank, kDim, "HC BF16 down");
-    CheckBf16Gemm(1, kDim, kRank, "HC BF16 up");
-    CheckBf16Gemm(8, kDim, kRank, "HC BF16 up");
+    for (std::uint32_t tokens = 1; tokens <= 8; ++tokens)
+      CheckBf16Gemm(tokens, kDim, kRank, "HC BF16 up");
     CheckBf16Gemm(96, kDim, kRank, "HC BF16 up");
     CheckBf16Gemm(2049, kDim, kRank, "HC BF16 up");
+    CheckBf16UpNarrow();
     CheckDecodeGemv(1, kRank, kDim, "decode HC down");
     CheckDecodeGemv(8, kRank, kDim, "decode HC down");
     CheckDecodeGemv(8, kDim, kRank, "decode HC up");
