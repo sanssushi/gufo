@@ -28,17 +28,19 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap (about -3% for xxs and about -7% for s) is the per-element decode cost
-  of the low-bit weight formats at those eight verification rows; the shared
+  gap is about -3% for xxs and about -7% for s. The forward includes
+  low-bit weight decoding and BF16 hyper-connection projections; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
-  It is not a draft, attention or dispatch problem.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill at depth 32768 is about 14-16% slower and is compute-bound. The
-  gap is the arithmetic cost of the F16 WMMA path used for these formats,
-  not a byte, launch or dispatch problem. Depth-0 prefill cells span about
-  14-23%; their spread follows the control's own depth-0 rate.
+- Prefill throughput at depth 32768 is about 14-16% lower and is dominated
+  by GPU kernel work. BF16 mixers and quantized F16 projections carry
+  substantial execution cost; matrix arithmetic, decoding, staging and
+  memory traffic all contribute. Depth-0 prefill cells span about 14-23%;
+  their spread follows the control's own depth-0 rate. The prefill deficits
+  and s-mix generation deficits exceed the roughly 5%-per-phase
+  comparable-performance target.
 
 On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
 signed bytes directly from the quantization grid words, using packed sign
@@ -565,49 +567,45 @@ focused depth 0):
   copies bypass the neural draft head for greedy runs (the two mixes and the
   control take the same 17 cycles and accept 111 draft tokens), so this
   measurement reflects the multi-row verification forward pass. The
-  roughly -3% (xxs) and -7% (s) gap is the low-bit
-  formats' per-element decode at eight verification rows, with shared-expert
-  weight-fragment reuse. The routed gate/up stage is 434 ms per 17
-  verification cycles of the copied 32K prompt on xxs, at that stage's
-  decode-bound limit. The gap is not a draft, attention or dispatch
-  problem.
+  roughly -3% (xxs) and -7% (s) gap measures the complete verification
+  forward, including the BF16 mixers and quantized dense/routed projections.
+  Shared-expert weight fragments are reused across the group's tokens.
+  A routed gate/up diagnostic measures 434 ms per 17 verification cycles
+  of the copied 32K prompt on xxs; that stage measurement is not a bound
+  on the complete forward or on other exact implementations.
 - Decode limits: standalone saturation measurements per format, using the
   true GGUF block layouts and a CPU dot-product check for each measurement,
   give a practical DRAM read peak of 216.2 GB/s. The Q6_K head MMVQ reaches
-  98-100% of it, so it has no headroom (the control's Q8_0 head moves more
-  bytes per token at the same peak). The low-bit expert MMVQs reach 85-95%
+  98-100% of it, leaving little bandwidth headroom in that measured shape
+  (the control's Q8_0 head moves more bytes per token at the same peak).
+  The low-bit expert MMVQs reach 85-95%
   of the maximum measured bandwidth of that format (512 experts in
   use, paired gate/up: Q2_0 214, IQ4_NL 211, Q4_K 211, Q5_K 211, Q6_K 213,
   IQ4_XS 208, IQ3_S 153, IQ3_XXS 138, IQ2_S 118, IQ2_XS 110, IQ2_XXS
   102 GB/s; down: IQ4_NL 212, Q2_0 185). Q2_0 and IQ4_NL reach the DRAM
   peak. The IQ2/IQ3 family stays below it because its vector dot products
-  decode through a per-lane grid lookup table; the gap is larger than wider
-  loads or better wave scheduling can recover, so the lookup cost is that
-  family's limit. The one clearly slow decode shape is the BF16 `hc`-down
+  decode through a per-lane grid lookup table. Those rates characterize the
+  measured decoders, not a lower bound on every exact implementation or on
+  multi-row verification. Another costly decode shape is the BF16 `hc`-down
   16-bit GEMV (629 MB at 84 GB/s, against the control's Q8_0 320 MB at
   182 GB/s). Its two-rows-per-wave form reaches 116 GB/s with a cold cache;
   the faster double-tile variant is not worth the extra code.
 
 ### Prefill
 
-- Prefill: the about -14..-16% gap at depth 32768 is compute-bound, not
-  byte- or launch-bound. The dequant-to-F16 route runs at the F16-WMMA limit
-  at these shapes (the wide HC down projection moves about 25% fewer bytes
-  for about 3% less time). Prefill execution has 5-8% idle time on both
-  mixes, so it is not launch-bound. The mixes issue 21% more dispatches than
-  the control, which follows from the mixed-type stacks. The unquantized
-  route keeps its 64×128 tile; upstream's <128,128> wide tile is not used
-  for it (64×128 covers the same shapes, and the control's prefill shows no
-  regression). In a warmed-up xxs pp2048 forward pass, HC-up takes 70.5 ms
-  (control 51.6 ms; the BF16 128-row tile keeps both K16 chains
-  spill-free), the 16-bit-weight HC-down family costs 157 ms more than the
-  control (the BF16 down projection alone is about 158 ms, against the
-  control's 48 ms int8 WMMA specialization), mixed-type dense stacks cost
-  166 ms more, and routed gate/up costs 20 ms more. Depth-0 measurements
-  span about -14..-23%, and their spread follows the control's own depth-0
-  rate (the control's prefill rate varies more between rounds than the
-  mixes'). That spread is measurement variance, not a difference in the
-  execution path.
+- Prefill throughput at depth 32768 is about 14-16% below the control.
+  The BF16 hyper-connection down projection uses 64×128 tiles, F16-staged
+  weights and two K16 accumulator chains. The BF16 up projection uses the
+  spill-free 128-row fused mixer tile for wide inputs; few-row calls use
+  the unquantized 64×128 GEMM. Quantized dense projections decode into F16
+  tiles, while the GDN producer supplies contiguous F16 activation rows.
+  These paths include matrix products, decode, LDS staging and memory work;
+  low idle time alone does not establish matrix-core saturation or an
+  unavoidable format ceiling. Kernel-family differences are not additive
+  role penalties: q4 HC-down belongs to its int8 family, and fused SSM
+  projections contain projection work as well as convolution. Depth-0
+  throughput differences span about -14..-23%; their spread follows the
+  control's own depth-0 rate and does not indicate a different dispatch path.
 
 ### Rejected options
 
