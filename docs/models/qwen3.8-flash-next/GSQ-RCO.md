@@ -28,16 +28,16 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap is about -2% for xxs and about -6% for s. The forward includes
+  gap is about -2% for xxs and about -7% for s. The forward includes
   low-bit weight decoding and BF16 hyper-connection projections; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill throughput at depth 32768 is about 14-15% lower and is dominated
+- Prefill throughput at depth 32768 is about 12-14% lower and is dominated
   by GPU kernel work. BF16 mixers and quantized F16 projections carry
   substantial execution cost; matrix arithmetic, decoding, staging and
-  memory traffic all contribute. Depth-0 prefill cells span about 14-20%;
+  memory traffic all contribute. Depth-0 prefill cells span about 13-21%;
   their spread follows the control's own depth-0 rate. The prefill deficits
   and s-mix generation deficits exceed the roughly 5%-per-phase
   comparable-performance target.
@@ -51,8 +51,9 @@ for the quantized dense projections. Ordinary short-K F16/BF16 small
 projections use a four-element lane partition with a multi-step preload,
 exact 16-bit loads and a pinned FMA chain, while the long-K BF16
 hyper-connection down projection keeps its eight-element wide GEMV. The
-BF16 hyper-connection up projection at decode uses a 256-row x 16-token
-tile; the wide fused mixer keeps its 128-row tile.
+BF16 hyper-connection down projection at wide prefill uses a 128-row x
+128-token tile. The BF16 hyper-connection up projection at decode uses a
+256-row x 16-token tile; the wide fused mixer keeps its 128-row tile.
 
 ## Targets and artifacts
 
@@ -277,11 +278,14 @@ vendored code is re-imported (see "Vendored-code obligations").
   the register variant is slower for them (see "Performance state").
 - `UnquantizedF16Gemm` handles F16 weights or BF16 weights treated as F16,
   with F16 activation rows, in 64-row × 128-token tiles (the narrow shape
-  also used by W8A8Gemm). The accumulation order along K is fixed per
-  output, so results stay bit-exact across every prefill chunk width. The
-  BF16 [10240,320] mixer up projection at 1-8 tokens uses a 256-row ×
-  16-token tile with the same staged BF16 rounding and two K16 accumulator
-  chains. It serves the HC down fusion, the BF16 indexer/alpha-beta
+  also used by W8A8Gemm). The BF16 [320,10240] mixer down projection at
+  1,024 or more tokens uses a 128-row × 128-token tile; its third row block
+  masks the 64 rows past m=320. The accumulation order along K is fixed per
+  output, so results stay bit-exact across every prefill chunk width and
+  between the two plans. The BF16 [10240,320] mixer up projection at 1-8
+  tokens uses a 256-row × 16-token tile with the same staged BF16 rounding
+  and two K16 accumulator chains. It serves the HC down fusion, the BF16
+  indexer/alpha-beta
   projections and the tuned F16 blaslt shapes.
 - Embeddings: `EmbeddingType`/`SmallType` and the gather (`RowElement`/
   `RowBytes` via `gufo::hip::QuantBlockElement`) accept the GSQ `token_embd`
@@ -334,9 +338,10 @@ Three fused paths accept BF16 weights, where UD-Q4_K_XL stores Q8_0:
   normalization output is staged as F16 (W8A8 uses the tiled-Q8 norm path).
   `fused_projection` accepts BF16 down and up projections. The down
   projection reads the F16 norm through `UnquantizedF16Gemm` with
-  `kStageBf16` on `DenseF16GEMMKernel`; BF16 rows are rounded to F16 when
-  written to shared memory, which is exact for every BF16 value in F16's
-  range, and the route keeps the same two-chain K order as the F16 path.
+  `kStageBf16` on `DenseF16GEMMKernel`, using the 128-row × 128-token tile
+  at 1,024 or more tokens; BF16 rows are rounded to F16 when written to
+  shared memory, which is exact for every BF16 value in F16's range, and
+  the route keeps the same two-chain K order as the F16 path.
   `HcMixF16Gemm` runs the up projection as `kHalfWeights + kStageBf16` on
   the 128-row `kHcMix` tile (32 hidden channels per tile across the four
   streams, with the same two K16 chains and 128-token width as the Q8_0
@@ -546,22 +551,22 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ 0% | ≈ -4% |
-| AR tg128 at d32768 | -0.5/-0.8% | -5.4/-5.3% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -3.1/-2.7% | -36.7/-36.5% |
-| MTP tg128 at d32768 | -2.3/-6.2% | -6.2/-9.2% |
-| pp2048 at d32768, AR (speculation off) | -14.6/-15.2% | -15.4/-13.9% |
-| pp2048 at d32768, MTP | -13.6/-14.9% | -14.4/-15.5% |
-| pp2048 at d0, steady state | ≈ -14..-20% | ≈ -14..-20% |
+| AR tg128 at d32768 | -0.2/-0.3% | -4.9/-5.0% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -4.4/-2.6% | -41.5/-36.2% |
+| MTP tg128 at d32768 | -2.1/-2.5% | -6.8/-8.0% |
+| pp2048 at d32768, AR (speculation off) | -12.9/-12.9% | -13.8/-13.0% |
+| pp2048 at d32768, MTP | -12.2/-12.1% | -13.1/-13.9% |
+| pp2048 at d0, steady state | ≈ -13..-18% | ≈ -19..-21% |
 
 ### Decode
 
 - Decode results: AR token generation is within 6% of the control.
-  Depth-32768 measurements are -0.5/-0.8% (xxs) and -5.4/-5.3% (s).
-  Focused depth-0 alternations read about 27.1-27.3 t/s (xxs) and
-  25.9-26.0 t/s (s) against a control at 27.1-27.3 t/s; a depth-0 run can
-  also take the low-rate path (both binaries read 22.9 t/s for xxs in one
-  round), so the steady-state row is approximate. MTP depth-0 measurements
-  follow the draft acceptance rate rather than kernel speed (the control
+  Depth-32768 measurements are -0.2/-0.3% (xxs) and -4.9/-5.0% (s).
+  Depth-0 alternations read about 26.9-27.3 t/s (xxs) and 25.7-26.1 t/s
+  (s) against a control at 27.1-27.4 t/s; one round's control takes the
+  low-rate path at 23.4 t/s, so the steady-state row is approximate. MTP
+  depth-0 measurements follow the draft acceptance rate rather than kernel
+  speed (the control
   reads 49.0-49.2 t/s; a depth-0 run can take an unusual draft trajectory
   at the same cycle count, which moves the result with the acceptance
   rate). The focused s run takes 59 cycles with 36 of 65 drafts accepted;
@@ -569,7 +574,7 @@ focused depth 0):
   32768, upstream's prompt-lookup draft copies bypass the neural draft head
   for greedy runs (the two mixes and the control take the same 17 cycles
   and accept 111 draft tokens), so this measurement reflects the multi-row
-  verification forward pass. The -2.3/-6.2% (xxs) and -6.2/-9.2% (s) gaps
+  verification forward pass. The -2.1/-2.5% (xxs) and -6.8/-8.0% (s) gaps
   measure the complete verification forward, including the BF16 mixers and
   quantized dense/routed projections. Shared-expert weight fragments are
   reused across the group's tokens. A routed gate/up diagnostic measures
@@ -596,20 +601,23 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill throughput at depth 32768 is about 14-15% below the control.
-  The BF16 hyper-connection down projection uses 64×128 tiles, F16-staged
-  weights and two K16 accumulator chains. The BF16 up projection uses the
-  spill-free 128-row fused mixer tile for wide inputs and the 256-row ×
-  16-token unquantized tile at 1-8 tokens. Quantized dense projections
-  decode into F16 tiles, while the GDN producer supplies contiguous F16
-  activation rows. These paths include matrix products, decode, LDS
-  staging and memory work; low idle time alone does not establish
-  matrix-core saturation or an unavoidable format ceiling. Kernel-family
-  differences are not additive role penalties: q4 HC-down belongs to its
-  int8 family, and fused SSM projections contain projection work as well as
-  convolution. Depth-0 throughput differences span about -14..-20%; their
-  spread follows the control's own depth-0 rate and does not indicate a
-  different dispatch path.
+- Prefill throughput at depth 32768 is about 12-14% below the control.
+  The BF16 hyper-connection down projection uses 128-row × 128-token tiles
+  at 1,024 or more tokens and 64-row × 128-token tiles below that, with
+  F16-staged weights and two K16 accumulator chains. The wide tile is
+  dispatched only at 1,024 or more tokens; smaller widths keep the 64-row
+  plan. The BF16 up projection uses the spill-free 128-row fused mixer tile
+  for wide inputs and the 256-row × 16-token unquantized tile at 1-8
+  tokens. Quantized dense projections decode into F16 tiles, while the GDN
+  producer supplies contiguous F16 activation rows. These paths include
+  matrix products,
+  decode, LDS staging and memory work; low idle time alone does not
+  establish matrix-core saturation or an unavoidable format ceiling.
+  Kernel-family differences are not additive role penalties: q4 HC-down
+  belongs to its int8 family, and fused SSM projections contain projection
+  work as well as convolution. Depth-0 throughput differences span about
+  -13..-21%; their spread follows the control's own depth-0 rate and does
+  not indicate a different dispatch path.
 
 ### Rejected options
 
@@ -655,11 +663,10 @@ focused depth 0):
 ### Control
 
 - Control health: UD-Q4_K_XL shows no regression relative to `main`.
-  MTP tg128 at depth 32768 reads 91.43-91.57 t/s against main's
-  91.14-91.62 t/s (+0.1% to +0.5% in the focused alternations), with the
-  same 17 cycles / 111 accepted / 102 lookup trajectory and completion sha
-  `d856f78e…`. AR (26.75-26.84 against 26.74-26.75 t/s) and prefill control
-  cells stay within round spread.
+  MTP tg128 at depth 32768 reads 91.22-91.46 t/s against main's 91.30 t/s
+  (within 0.2%), with the same 17 cycles / 111 accepted / 102 lookup
+  trajectory and completion sha `d856f78e…`. AR (26.74 against
+  26.75-26.79 t/s) and prefill control cells stay within 0.9%.
 
 ## Vendored-code obligations
 
@@ -711,7 +718,7 @@ re-imports must re-apply the recorded blocks.
 | Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
 | Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`, packed grid-group decode) |
 | Executor / dispatch | `src/models/qwen38_flash_next/executor.cpp` |
-| Other kernels | `kernels.hip.cpp` (`DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmKernel`, `SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
+| Other kernels | `kernels.hip.cpp` (`DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `UnquantizedF16Gemm`, `SmallGemmKernel`, `SmallGemmWideKernel`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
 | Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |
 | Core quant tests | `tests/core/ggml_dequant_test.cpp` |
 | Benchmark and profiling tools | `tools/bench/`, `tools/prof/prof.py`, `tools/prof/isa_mix.py` |
