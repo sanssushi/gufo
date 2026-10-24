@@ -22,22 +22,23 @@ and the UD-Q4_K_XL control shows no regression relative to `main`.
 
 Speed (details in "Performance state"):
 
-- AR token generation is within about 5% of the control on both mixes.
+- AR token generation is within about 5% of the control on both mixes; xxs
+  is at or slightly above the control at depth 32768.
 - MTP token generation at a 32768-token context measures the multi-row
   verification forward pass. For greedy runs, upstream's prompt-lookup
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap is about -2% for xxs and about -5% for s. The forward includes
+  gap is about -1% for xxs and about -6% for s. The forward includes
   low-bit weight decoding and BF16 hyper-connection projections; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill throughput at depth 32768 is about 10-14% lower and is dominated
+- Prefill throughput at depth 32768 is about 11-12% lower and is dominated
   by GPU kernel work. BF16 mixers and quantized F16 projections carry
   substantial execution cost; matrix arithmetic, decoding, staging and
-  memory traffic all contribute. Depth-0 prefill cells span about 8-19%;
+  memory traffic all contribute. Depth-0 prefill cells span about 12-18%;
   their spread follows the control's own depth-0 rate. The prefill deficits
   and s-mix generation deficits exceed the roughly 5%-per-phase
   comparable-performance target.
@@ -48,9 +49,12 @@ masks. Mixed-type SSM layers fuse the four-tap convolution into their
 standalone QKV projection; the gate keeps its own projection type. The GDN
 output epilogue writes F16 rows with a padded pitch for the wide quantized
 SSM output projection, and the shared-expert SwiGLU writes its F16 rows
-directly for the quantized dense projections. Ordinary short-K F16/BF16
-small projections use a four-element lane partition with a multi-step
-preload, exact 16-bit loads and a pinned FMA chain, while the long-K BF16
+directly for the quantized dense projections. Decode dense projections
+share one Q8_1 activation row set across the quantized formats that read
+it, including the producer-written hyper-connection rows. Ordinary short-K
+F16/BF16 small projections use a four-element lane partition with a
+multi-step preload, exact 16-bit loads and a pinned FMA chain, while the
+long-K BF16
 hyper-connection down projection keeps its eight-element wide GEMV. The
 BF16 hyper-connection down projection at wide prefill uses a 128-row x
 128-token tile. The BF16 hyper-connection up projection at decode uses a
@@ -247,11 +251,19 @@ vendored code is re-imported (see "Vendored-code obligations").
   error path distinguishes an unsupported format (probed through
   `qfn_mmq_moe_gated_type`) from a launch failure. `DenseBatch` sends
   quantized rows through one `qfn_mmq_dense` call.
-- Decode projections build the shared Q8_1 activation rows only when a
-  consumer is Q8_0. The attention Q/K/V, SSM QKV/gate and PLE key/value
-  groups quantize once for their Q8_0 consumers; every other format
-  quantizes the F32 rows in its own entry, so the GSQ dense groups run no
-  unused shared pass.
+- Decode projections share one Q8_1 activation row set across the formats
+  that read it. The attention Q/K/V, SSM QKV/gate and PLE key/value groups
+  quantize once when at least two members are quantized, and the
+  shared-expert gate/up pair does the same; a single quantized projection
+  quantizes in its own entry, and F16/BF16/F32 consumers trigger no pass.
+  Every adapter format consumes the same rows:
+  `qfn_mmq_dense_vec_preq` passes them to the routed vector kernel with a
+  zeroed single-expert id, so a K-quant/IQ projection reads the producer's
+  codes, half `d` and `d*sum(q)` instead of re-quantizing the F32 rows. The
+  MMVQ quantizer ignores the weight type, so rows written by
+  `qfn_mmq_quantize_q8_1`, the hyper-connection combine and the mix
+  epilogue are interchangeable. A projection whose source already has
+  producer-written rows consumes them directly.
 - Q6_K is fully supported by the adapter (`WeightType::kQ6_K = 14`; the
   MMVQ, MMQ and gated cases exist).
 - Wide dense GEMMs (prefill): `DenseF16GEMMKernel` decodes the k-quant/IQ
@@ -453,6 +465,12 @@ Breaking any of them silently breaks session or audit replay.
   state. `projection_ops` pins `SwigluHalf` against `Swiglu` followed by the
   activation narrow, including unsaturated products and F16 ties, so the
   shared expert's handoff keeps the exact bytes the F32 path produced.
+- Shared decode Q8_1 rows: `projection_ops` pins the prequantized dense
+  entry byte-identical to the F32 entry for every adapter format at widths
+  1-8, with output guards and the padded row stride. `routed_wmma_ops` pins
+  the prequantized gated vector path byte-identical to the F32 gated path
+  for every routed format, including duplicate experts, inactive slots and
+  nonfinite scales.
 - Padded quantized projection: `projection_ops` pins the padded and packed
   [2560,6144] projections byte-identical at 1,023, 1,024, 1,025 and 2,049
   tokens, leaves the activation padding and output guards untouched, and
@@ -569,31 +587,32 @@ focused depth 0):
 
 | Measurement | xxs | s |
 | --- | ---: | ---: |
-| AR tg128, steady state | ≈ 0% | ≈ -5% |
-| AR tg128 at d32768 | -0.30/-0.41% | -5.16/-5.06% |
-| MTP tg128 at d0 (acceptance-rate dependent) | -3.45/-3.58% | -36.60/-36.30% |
-| MTP tg128 at d32768 | -1.95/-1.92% | -5.60/-5.35% |
-| pp2048 at d32768, AR (speculation off) | -10.77/-13.67% | -11.49/-11.85% |
-| pp2048 at d32768, MTP | -10.42/-12.04% | -10.70/-10.96% |
-| pp2048 at d0, steady state | ≈ -12..-19% | ≈ -8..-19% |
+| AR tg128, steady state | ≈ 0% | ≈ -4% |
+| AR tg128 at d32768 | +0.78/+0.86% | -4.14/-4.33% |
+| MTP tg128 at d0 (acceptance-rate dependent) | -2.59/-2.61% | -45.42/-36.11% |
+| MTP tg128 at d32768 | -1.38/-1.03% | -5.94/-5.69% |
+| pp2048 at d32768, AR (speculation off) | -11.27/-10.85% | -11.68/-11.47% |
+| pp2048 at d32768, MTP | -10.79/-10.76% | -11.42/-11.38% |
+| pp2048 at d0, steady state | ≈ -13..-18% | ≈ -12..-16% |
 
 ### Decode
 
-- Decode results: AR token generation is within about 5% of the control.
-  Depth-32768 measurements are -0.30/-0.41% (xxs) and -5.16/-5.06% (s).
-  Depth-0 alternations read 25.5/27.2 t/s (xxs) and 26.0 t/s (s) against a
-  control at 27.0-27.3 t/s; the xxs 25.5 round takes the low-rate path, so
-  the steady-state row is approximate. MTP depth-0
-  measurements follow the draft acceptance rate rather than kernel speed
-  (the control reads 48.8-49.0 t/s; a depth-0 run can take an unusual draft
-  trajectory at the same cycle count, which moves the result with the
-  acceptance rate). The s run takes 59 cycles with 36 of 65 drafts
-  accepted; the xxs run takes 49 cycles with 78 of 117 accepted.
+- Decode results: AR token generation is within about 5% of the control;
+  xxs is at or slightly above it at depth 32768. Depth-32768 measurements
+  are +0.78/+0.86% (xxs) and -4.14/-4.33% (s). Depth-0 alternations read
+  27.6/27.3 t/s (xxs) and 26.3 t/s (s) against a control at 27.2 t/s; the
+  s 22.3 t/s first round takes the low-rate path, so the steady-state row
+  is approximate. MTP depth-0 measurements follow the draft acceptance
+  rate rather than kernel speed (the control reads 49.1 t/s; a depth-0 run
+  can take an unusual draft trajectory at the same cycle count, which moves
+  the result with the acceptance rate). The s runs take 59 cycles with 36
+  of 65 drafts accepted (26.8 and 31.3 t/s across the two rounds); the xxs
+  runs take 49 cycles with 78 of 117 accepted (47.8 t/s).
   At depth 32768, upstream's prompt-lookup draft copies bypass the neural
   draft head for greedy runs (the two mixes and the control take the same
   17 cycles and accept 111 draft tokens), so this measurement reflects the
-  multi-row verification forward pass. The -1.95/-1.92% (xxs) and
-  -5.60/-5.35% (s) gaps measure the complete verification forward,
+  multi-row verification forward pass. The -1.38/-1.03% (xxs) and
+  -5.94/-5.69% (s) gaps measure the complete verification forward,
   including the BF16 mixers and quantized dense/routed projections.
   Shared-expert weight fragments are reused across the group's tokens. A
   routed gate/up diagnostic measures 434 ms per 17 verification cycles of
@@ -619,7 +638,7 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill throughput at depth 32768 is about 10-14% below the control.
+- Prefill throughput at depth 32768 is about 11-12% below the control.
   The BF16 hyper-connection down projection uses 128-row × 128-token tiles
   at 1,024 or more tokens and 64-row × 128-token tiles below that, with
   F16-staged weights and two K16 accumulator chains. The wide tile is
@@ -634,7 +653,7 @@ focused depth 0):
   format ceiling. Kernel-family differences are not additive role
   penalties: q4 HC-down belongs to its int8 family, and fused SSM
   projections contain projection work as well as convolution. Depth-0
-  throughput differences span about -8..-19%; their spread follows the
+  throughput differences span about -12..-18%; their spread follows the
   control's own depth-0 rate and does not indicate a different dispatch
   path.
 
@@ -682,11 +701,11 @@ focused depth 0):
 ### Control
 
 - Control health: UD-Q4_K_XL shows no regression relative to `main`.
-  MTP tg128 at depth 32768 reads 90.91-91.01 t/s against main's
-  90.89-91.13 t/s (within 0.3%), with the same 17 cycles / 111 accepted /
+  MTP tg128 at depth 32768 reads 91.28-91.49 t/s against main's
+  91.28-91.39 t/s (within 0.3%), with the same 17 cycles / 111 accepted /
   102 lookup trajectory and completion sha `d856f78e…`. AR
-  (26.62-26.65 against 26.65-26.67 t/s) and prefill control cells stay
-  within 0.7%.
+  (26.68-26.70 against 26.67-26.72 t/s) and prefill control cells stay
+  within 0.5%.
 
 ## Vendored-code obligations
 
