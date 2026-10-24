@@ -22,22 +22,22 @@ and the UD-Q4_K_XL control shows no regression relative to `main`.
 
 Speed (details in "Performance state"):
 
-- AR token generation is within about 6% of the control on both mixes.
+- AR token generation is within about 5% of the control on both mixes.
 - MTP token generation at a 32768-token context measures the multi-row
   verification forward pass. For greedy runs, upstream's prompt-lookup
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap is about -2% for xxs and about -7% for s. The forward includes
+  gap is about -2% for xxs and about -6% for s. The forward includes
   low-bit weight decoding and BF16 hyper-connection projections; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill throughput at depth 32768 is about 12-14% lower and is dominated
+- Prefill throughput at depth 32768 is about 10-12% lower and is dominated
   by GPU kernel work. BF16 mixers and quantized F16 projections carry
   substantial execution cost; matrix arithmetic, decoding, staging and
-  memory traffic all contribute. Depth-0 prefill cells span about 13-21%;
+  memory traffic all contribute. Depth-0 prefill cells span about 9-18%;
   their spread follows the control's own depth-0 rate. The prefill deficits
   and s-mix generation deficits exceed the roughly 5%-per-phase
   comparable-performance target.
@@ -46,10 +46,11 @@ On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
 signed bytes directly from the quantization grid words, using packed sign
 masks. Mixed-type SSM layers fuse the four-tap convolution into their
 standalone QKV projection; the gate keeps its own projection type. The GDN
-output epilogue and the shared-expert SwiGLU write their F16 rows directly
-for the quantized dense projections. Ordinary short-K F16/BF16 small
-projections use a four-element lane partition with a multi-step preload,
-exact 16-bit loads and a pinned FMA chain, while the long-K BF16
+output epilogue writes F16 rows with a padded pitch for the wide quantized
+SSM output projection, and the shared-expert SwiGLU writes its F16 rows
+directly for the quantized dense projections. Ordinary short-K F16/BF16
+small projections use a four-element lane partition with a multi-step
+preload, exact 16-bit loads and a pinned FMA chain, while the long-K BF16
 hyper-connection down projection keeps its eight-element wide GEMV. The
 BF16 hyper-connection down projection at wide prefill uses a 128-row x
 128-token tile. The BF16 hyper-connection up projection at decode uses a
@@ -252,8 +253,12 @@ vendored code is re-imported (see "Vendored-code obligations").
   its F16 rows directly: the GDN output epilogue for a wide K-quant/IQ
   `ssm_out`, and the shared-expert SwiGLU for a wide K-quant/IQ
   `shexp_down`. Their bytes equal the F32 producer output followed by the
-  activation narrow. Other wide inputs are narrowed from F32 through
-  `PrepareHalfInput`. The int8 WMMA route
+  activation narrow. For the wide [2560,6144] `ssm_out`, the GDN epilogue
+  writes `cols + 32` halves per row and `DenseQuantF16Gemm` reads that
+  pitch on its five-row-group launch plan; the padded rows stay inside the
+  F32-sized output scratch. Every other caller keeps the contiguous pitch.
+  Other wide inputs are narrowed from F32 through `PrepareHalfInput`. The
+  int8 WMMA route
   (`KQuantWmmaGemm`/`Q8ActFillSums`) is not used. Rebuilding it over the
   per-lane decoder family at the 256-row stack geometry measures slower:
   the per-accumulator-element fixups cost more than the 2x int8 WMMA rate
@@ -441,6 +446,11 @@ Breaking any of them silently breaks session or audit replay.
   state. `projection_ops` pins `SwigluHalf` against `Swiglu` followed by the
   activation narrow, including unsaturated products and F16 ties, so the
   shared expert's handoff keeps the exact bytes the F32 path produced.
+- Padded quantized projection: `projection_ops` pins the padded and packed
+  [2560,6144] projections byte-identical at 1,023, 1,024, 1,025 and 2,049
+  tokens, leaves the activation padding and output guards untouched, and
+  rejects pitches outside the wide shape. The 1,023-token call stays on the
+  contiguous route.
 - The `UnquantizedF16Gemm` route keeps one K order per output:
   `CheckBf16Gemm` pins the BF16 route bit-exact against the F16-staged route
   across a prefill chunk split and at widths 1-8 on the [10240,320] up
@@ -550,37 +560,36 @@ focused depth 0):
 
 | Measurement | xxs | s |
 | --- | ---: | ---: |
-| AR tg128, steady state | ≈ 0% | ≈ -4% |
-| AR tg128 at d32768 | -0.2/-0.3% | -4.9/-5.0% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -4.4/-2.6% | -41.5/-36.2% |
-| MTP tg128 at d32768 | -2.1/-2.5% | -6.8/-8.0% |
-| pp2048 at d32768, AR (speculation off) | -12.9/-12.9% | -13.8/-13.0% |
-| pp2048 at d32768, MTP | -12.2/-12.1% | -13.1/-13.9% |
-| pp2048 at d0, steady state | ≈ -13..-18% | ≈ -19..-21% |
+| AR tg128, steady state | ≈ 0% | ≈ -5% |
+| AR tg128 at d32768 | -0.19/-0.11% | -5.08/-4.95% |
+| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -2.8/-3.4% | -36.5/-45.0% |
+| MTP tg128 at d32768 | -1.75/-1.98% | -5.77/-6.35% |
+| pp2048 at d32768, AR (speculation off) | -11.27/-10.59% | -11.77/-11.06% |
+| pp2048 at d32768, MTP | -10.50/-10.68% | -11.59/-11.41% |
+| pp2048 at d0, steady state | ≈ -13..-14% | ≈ -9..-18% |
 
 ### Decode
 
-- Decode results: AR token generation is within 6% of the control.
-  Depth-32768 measurements are -0.2/-0.3% (xxs) and -4.9/-5.0% (s).
-  Depth-0 alternations read about 26.9-27.3 t/s (xxs) and 25.7-26.1 t/s
-  (s) against a control at 27.1-27.4 t/s; one round's control takes the
-  low-rate path at 23.4 t/s, so the steady-state row is approximate. MTP
-  depth-0 measurements follow the draft acceptance rate rather than kernel
-  speed (the control
-  reads 49.0-49.2 t/s; a depth-0 run can take an unusual draft trajectory
-  at the same cycle count, which moves the result with the acceptance
-  rate). The focused s run takes 59 cycles with 36 of 65 drafts accepted;
-  the focused xxs run takes 49 cycles with 78 of 117 accepted. At depth
-  32768, upstream's prompt-lookup draft copies bypass the neural draft head
-  for greedy runs (the two mixes and the control take the same 17 cycles
-  and accept 111 draft tokens), so this measurement reflects the multi-row
-  verification forward pass. The -2.1/-2.5% (xxs) and -6.8/-8.0% (s) gaps
-  measure the complete verification forward, including the BF16 mixers and
-  quantized dense/routed projections. Shared-expert weight fragments are
-  reused across the group's tokens. A routed gate/up diagnostic measures
-  434 ms per 17 verification cycles of the copied 32K prompt on xxs; that
-  stage measurement is not a bound on the complete forward or on other
-  exact implementations.
+- Decode results: AR token generation is within about 5% of the control.
+  Depth-32768 measurements are -0.19/-0.11% (xxs) and -5.08/-4.95% (s).
+  Depth-0 alternations read about 27.1 t/s (xxs) and 26.0/22.4 t/s (s)
+  against a control at 27.2 t/s; one s round takes the low-rate path at
+  22.4 t/s, so the steady-state row is approximate. MTP depth-0
+  measurements follow the draft acceptance rate rather than kernel speed
+  (the control reads 49.0 t/s; a depth-0 run can take an unusual draft
+  trajectory at the same cycle count, which moves the result with the
+  acceptance rate). The focused s run takes 59 cycles with 36 of 65 drafts
+  accepted; the focused xxs run takes 49 cycles with 78 of 117 accepted.
+  At depth 32768, upstream's prompt-lookup draft copies bypass the neural
+  draft head for greedy runs (the two mixes and the control take the same
+  17 cycles and accept 111 draft tokens), so this measurement reflects the
+  multi-row verification forward pass. The -1.75/-1.98% (xxs) and
+  -5.77/-6.35% (s) gaps measure the complete verification forward,
+  including the BF16 mixers and quantized dense/routed projections.
+  Shared-expert weight fragments are reused across the group's tokens. A
+  routed gate/up diagnostic measures 434 ms per 17 verification cycles of
+  the copied 32K prompt on xxs; that stage measurement is not a bound on
+  the complete forward or on other exact implementations.
 - Decode limits: standalone saturation measurements per format, using the
   true GGUF block layouts and a CPU dot-product check for each measurement,
   give a practical DRAM read peak of 216.2 GB/s. The Q6_K head MMVQ reaches
@@ -601,7 +610,7 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill throughput at depth 32768 is about 12-14% below the control.
+- Prefill throughput at depth 32768 is about 10-12% below the control.
   The BF16 hyper-connection down projection uses 128-row × 128-token tiles
   at 1,024 or more tokens and 64-row × 128-token tiles below that, with
   F16-staged weights and two K16 accumulator chains. The wide tile is
@@ -609,15 +618,16 @@ focused depth 0):
   plan. The BF16 up projection uses the spill-free 128-row fused mixer tile
   for wide inputs and the 256-row × 16-token unquantized tile at 1-8
   tokens. Quantized dense projections decode into F16 tiles, while the GDN
-  producer supplies contiguous F16 activation rows. These paths include
-  matrix products,
-  decode, LDS staging and memory work; low idle time alone does not
-  establish matrix-core saturation or an unavoidable format ceiling.
-  Kernel-family differences are not additive role penalties: q4 HC-down
-  belongs to its int8 family, and fused SSM projections contain projection
-  work as well as convolution. Depth-0 throughput differences span about
-  -13..-21%; their spread follows the control's own depth-0 rate and does
-  not indicate a different dispatch path.
+  producer supplies contiguous F16 activation rows at widths below 1,024
+  and rows with the padded pitch at 1,024 or more tokens. These paths
+  include matrix products, decode, LDS staging and memory work; low idle
+  time alone does not establish matrix-core saturation or an unavoidable
+  format ceiling. Kernel-family differences are not additive role
+  penalties: q4 HC-down belongs to its int8 family, and fused SSM
+  projections contain projection work as well as convolution. Depth-0
+  throughput differences span about -9..-18%; their spread follows the
+  control's own depth-0 rate and does not indicate a different dispatch
+  path.
 
 ### Rejected options
 
@@ -663,10 +673,11 @@ focused depth 0):
 ### Control
 
 - Control health: UD-Q4_K_XL shows no regression relative to `main`.
-  MTP tg128 at depth 32768 reads 91.22-91.46 t/s against main's 91.30 t/s
-  (within 0.2%), with the same 17 cycles / 111 accepted / 102 lookup
-  trajectory and completion sha `d856f78e…`. AR (26.74 against
-  26.75-26.79 t/s) and prefill control cells stay within 0.9%.
+  MTP tg128 at depth 32768 reads 90.91-91.01 t/s against main's
+  90.89-91.13 t/s (within 0.3%), with the same 17 cycles / 111 accepted /
+  102 lookup trajectory and completion sha `d856f78e…`. AR
+  (26.62-26.65 against 26.65-26.67 t/s) and prefill control cells stay
+  within 0.7%.
 
 ## Vendored-code obligations
 

@@ -5,14 +5,14 @@ support for Qwen3.8-Flash-Next (IQ3_XXS and IQ3_S). The solution is documented i
 Branch `feat/gsq-rco` is kept rebased onto upstream `main` — every sync rewrites the branch's history.
 Building on it is fine, but your branch will need rebasing whenever that happens.
 
-Speed vs unsloth UD-Q4_K_XL (single-user `gufo bench`, context depth 32k, negative = slower):
+Relative speed vs unsloth UD-Q4_K_XL (single-user `gufo bench`, context depth 32k, negative = slower):
 
 | Workload | IQ3_XXS | IQ3_S |
 | --- | ---: | ---: |
-| tg128 AR | -0.2% | -4.9% |
-| tg128 MTP | -2.1% | -6.8% |
-| pp2048 AR | -12.9% | -13.0% |
-| pp2048 MTP | -12.1% | -13.1% |
+| tg128 AR | -0.1% | -5.0% |
+| tg128 MTP | -1.8% | -5.8% |
+| pp2048 AR | -10.6% | -11.1% |
+| pp2048 MTP | -10.5% | -11.4% |
 
 # Gufo: The ***Open Source*** Strix Halo AI engine
 
