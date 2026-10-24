@@ -241,11 +241,14 @@ bool KQuantWmmaType(core::GgmlType type);
 /// Dense GEMM over K-quant/IQ weights whose tiles are dequantized to F16 at
 /// the LDS commit (DecodeQuantSub16 codes with one (scale, -offset) pair per
 /// 16-element sub-block) against F16 activation rows [batch][k]. out is
-/// [batch][m]. Returns false, launching nothing, for other types or a k that
-/// is not a whole weight block.
+/// [batch][m]. A nonzero `input_stride` is the activation row pitch in
+/// halves; only the padded [2560,6144] output shape at 1,024 or more tokens
+/// accepts one. Returns false, launching nothing, for other types, a k that
+/// is not a whole weight block or an unsupported pitch.
 bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
                        float* out, std::size_t batch, std::size_t m,
-                       std::size_t k, hipStream_t stream);
+                       std::size_t k, hipStream_t stream,
+                       std::size_t input_stride = 0);
 
 /// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
 /// Matches the separate operators' rounding. Supports at least 96 tokens.

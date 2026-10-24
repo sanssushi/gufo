@@ -1583,6 +1583,122 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
       CheckHip(hipFree(p), "dense quant free");
 }
 
+/// The wide quantized SSM output projection accepts the GDN epilogue's
+/// padded F16 pitch: padded and packed rows must produce the same bytes,
+/// the padding stays untouched, and a pitch is rejected below the supported
+/// [2560,6144] wide shape.
+void CheckDenseQuantStrided(q::WeightType type, std::uint32_t seed) {
+  constexpr std::size_t m = 2560;
+  constexpr std::size_t k = 6144;
+  constexpr std::size_t pitch = k + 32;
+  const auto ggml =
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type));
+  const DenseWeights w = MakeQuant(type, m, k, seed);
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "stride weights");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "stride weights upload");
+  CheckHip(
+      hipMemset(static_cast<std::uint8_t*>(d_w) + w.packed.size(), 0, tail),
+      "stride weights tail");
+  constexpr float poison = -1234567.0F;
+  constexpr std::size_t guard = 8;
+  for (const std::size_t tokens : {std::size_t{1023}, std::size_t{1024},
+                                   std::size_t{1025}, std::size_t{2049}}) {
+    std::vector<float> x(tokens * k);
+    std::uint32_t state = seed ^ static_cast<std::uint32_t>(tokens);
+    for (float& v : x) {
+      v = Uniform(&state, 2.0F);
+    }
+    const std::vector<float> zeros(tokens * m + guard, poison);
+    float* d_x = nullptr;
+    float* d_out = nullptr;
+    float* d_strided = nullptr;
+    __half* d_half = nullptr;
+    __half* d_padded = nullptr;
+    CheckHip(hipMalloc(&d_x, x.size() * 4), "stride input");
+    CheckHip(hipMalloc(&d_out, zeros.size() * 4), "stride output");
+    CheckHip(hipMalloc(&d_strided, zeros.size() * 4), "stride padded output");
+    CheckHip(hipMalloc(&d_half, tokens * k * sizeof(__half)),
+             "stride F16 input");
+    CheckHip(hipMalloc(&d_padded, tokens * pitch * sizeof(__half)),
+             "stride padded input");
+    CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+             "stride input upload");
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "stride output guards");
+    CheckHip(hipMemcpy(d_strided, zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "stride padded guards");
+    q::NarrowActivations(d_x, d_half, false, tokens * k, nullptr);
+    CheckHip(hipMemset(d_padded, 0x7F, tokens * pitch * sizeof(__half)),
+             "stride padding poison");
+    CheckHip(hipMemcpy2D(d_padded, pitch * sizeof(__half), d_half,
+                         k * sizeof(__half), k * sizeof(__half), tokens,
+                         hipMemcpyDeviceToDevice),
+             "stride padded input");
+    if (!q::DenseQuantF16Gemm(ggml, d_w, d_half, d_out, tokens, m, k, nullptr))
+      throw std::runtime_error("dense strided packed projection failed");
+    if (tokens >= 1024) {
+      if (!q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                                nullptr, pitch))
+        throw std::runtime_error("dense strided padded projection failed");
+    } else {
+      if (q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, pitch))
+        throw std::runtime_error(
+            "dense projection accepted a narrow padded pitch");
+      CheckHip(hipDeviceSynchronize(), "narrow padded rejection");
+      const auto rejected = Download(d_strided, zeros.size());
+      if (std::memcmp(rejected.data(), zeros.data(), zeros.size() * 4) != 0)
+        throw std::runtime_error("rejected padded pitch wrote into its output");
+      for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_out),
+                      static_cast<void*>(d_strided), static_cast<void*>(d_half),
+                      static_cast<void*>(d_padded)})
+        CheckHip(hipFree(p), "stride free");
+      continue;
+    }
+    if (tokens == 1024) {
+      // A pitch below the row width, and one that is not a whole 8 halves,
+      // are both rejected before launch.
+      if (q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, k - 32) ||
+          q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, k + 33))
+        throw std::runtime_error("dense projection accepted an invalid pitch");
+    }
+    CheckHip(hipDeviceSynchronize(), "stride projections");
+    const auto packed = Download(d_out, zeros.size());
+    const auto strided = Download(d_strided, zeros.size());
+    if (std::memcmp(packed.data(), strided.data(), tokens * m * 4) != 0)
+      throw std::runtime_error("padded projection changed the output bytes");
+    for (std::size_t i = tokens * m; i < zeros.size(); ++i)
+      if (packed[i] != poison || strided[i] != poison)
+        throw std::runtime_error(
+            "padded projection overwrote its output guard");
+    const auto padded_host = Download(d_padded, tokens * pitch);
+    for (std::size_t t = 0; t < tokens; ++t) {
+      for (std::size_t i = k; i < pitch; ++i) {
+        std::uint16_t bits;
+        std::memcpy(&bits, &padded_host[t * pitch + i], sizeof(bits));
+        if (bits != 0x7F7F)
+          throw std::runtime_error(
+              "padded projection overwrote the activation padding");
+      }
+    }
+    for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_out),
+                    static_cast<void*>(d_strided), static_cast<void*>(d_half),
+                    static_cast<void*>(d_padded)})
+      CheckHip(hipFree(p), "stride free");
+  }
+  std::cout << "dense strided " << static_cast<unsigned>(type)
+            << " m=2560 k=6144 exact\n";
+  CheckHip(hipFree(d_w), "stride weights free");
+}
+
 /// The dense vector projection computes every token of a decode or
 /// verification batch in one call: its rows must stay bit-identical to the
 /// one-token waves at any batch width (the batched-decode contract).
@@ -2019,6 +2135,12 @@ int main() {
                          true);
     CheckDenseChunkExact(q::WeightType::kIQ4_NL, 2560, 640, 136, 94, seed++,
                          true);
+    // The wide SSM output projection accepts the GDN producer's padded F16
+    // pitch for every K-quant/IQ format.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                               q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS})
+      CheckDenseQuantStrided(type, seed++);
     // Stacked-vs-separate exactness for the formats the GSQ-RCO mixes
     // actually stack (same-type attention triples and SSM pairs), at the
     // production shapes: [12288; 512; 512] attention and [10240; 6144]

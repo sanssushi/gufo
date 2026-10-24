@@ -7793,7 +7793,7 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 template<core::GgmlType QType>
 void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
-                         hipStream_t stream) {
+                         hipStream_t stream, std::size_t input_stride) {
   if (batch >= 96) {
     constexpr int kWideBM = 256;
     constexpr int kBN = 128;
@@ -7803,11 +7803,22 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
       // The output projection's activation is 50 MB at 4,096 tokens. In
       // grid order the resident blocks each walk a different token tile of
       // it; walking five row tiles of a token tile first shares each
-      // activation tile between them. Only the launch order changes.
-      hipLaunchKernelGGL(
-          (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
-                              false, false, false, false, false, QType>),
-          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+      // activation tile between them. Only the launch order changes. The
+      // padded pitch keeps the producer-written rows off the 12 KiB cache
+      // set stride.
+      if (input_stride != 0) {
+        hipLaunchKernelGGL(
+            (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
+                                false, false, true, false, false, QType>),
+            grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
+            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, 0,
+            input_stride);
+      } else {
+        hipLaunchKernelGGL(
+            (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
+                                false, false, false, false, false, QType>),
+            grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+      }
     } else if (batch >= 1024 && m == 2560) {
       // Shared-expert down: pairs of row tiles per token tile (-11 %).
       hipLaunchKernelGGL(
@@ -7832,36 +7843,42 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
 
 bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
                        float* out, std::size_t batch, std::size_t m,
-                       std::size_t k, hipStream_t stream) {
+                       std::size_t k, hipStream_t stream,
+                       std::size_t input_stride) {
   if (w == nullptr || x == nullptr || out == nullptr || batch == 0 || m == 0 ||
       !KQuantWmmaType(type) || k == 0 ||
       k % quant::QuantizedBlockElements(type) != 0) {
     return false;
   }
+  if (input_stride != 0 && input_stride != k &&
+      (batch < 1024 || m != 2560 || k != 6144 || input_stride < k ||
+       input_stride % 8 != 0)) {
+    return false;
+  }
   switch (type) {
     case core::GgmlType::kQ4_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ4_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ4_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kQ5_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ5_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ5_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kQ6_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ6_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ6_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kIQ4_NL:
       LaunchDenseQuantF16<core::GgmlType::kIQ4_NL>(w, x, out, batch, m, k,
-                                                   stream);
+                                                   stream, input_stride);
       return true;
     case core::GgmlType::kIQ4_XS:
       LaunchDenseQuantF16<core::GgmlType::kIQ4_XS>(w, x, out, batch, m, k,
-                                                   stream);
+                                                   stream, input_stride);
       return true;
     case core::GgmlType::kIQ3_S:
       LaunchDenseQuantF16<core::GgmlType::kIQ3_S>(w, x, out, batch, m, k,
-                                                  stream);
+                                                  stream, input_stride);
       return true;
     default:
       return false;

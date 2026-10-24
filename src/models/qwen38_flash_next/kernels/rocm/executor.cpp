@@ -2652,8 +2652,13 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        : nullptr;
   // Shift successive rows off the 12 KiB pitch while retaining every half.
   // The existing F32 scratch has room for these slightly padded F16 rows.
-  const std::uint32_t half_stride =
-      half_output && n_tokens >= 1024 ? l.ssm_out.cols + 32 : 0;
+  // The quantized output projection accepts the same pitch on its wide
+  // [2560,6144] shape.
+  const bool padded_half =
+      (half_output ||
+       (quant_half && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144)) &&
+      n_tokens >= 1024;
+  const std::uint32_t half_stride = padded_half ? l.ssm_out.cols + 32 : 0;
   // A decode batch's output projection reads the epilogue's Q8_1 rows.
   const std::uint32_t value_dim = c.SsmValueDim();
   const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&
@@ -2680,7 +2685,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                            l.ssm_out.rows, l.ssm_out.cols, stream_, half_stride)
             : DenseQuantF16Gemm(l.ssm_out.type, l.ssm_out.data, out_half, out,
                                 n_tokens, l.ssm_out.rows, l.ssm_out.cols,
-                                stream_);
+                                stream_, half_stride);
     if (!projected) {
       AssignError(error_msg, "SSM output F16 GEMM failed");
       return false;
