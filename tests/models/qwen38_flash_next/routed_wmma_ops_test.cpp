@@ -1138,6 +1138,34 @@ void CheckVectorGrouping(bool down = false) {
                 (down ? " down rows" : " gate rows"));
           }
         }
+        if (!down) {
+          // A producer's decode Q8_1 rows reach the same gated kernel and
+          // must keep every bit of the F32 entry's quantized activation.
+          std::uint8_t* dq = nullptr;
+          CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
+                   "prequantized gated rows");
+          if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr))
+            throw std::runtime_error(
+                "prequantized gated input quantization failed");
+          for (int n : gated_widths) {
+            CheckHip(
+                hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                          hipMemcpyHostToDevice),
+                "poison prequantized gated output");
+            if (qfn_mmq_moe_gated_vec_preq(static_cast<int>(formats[f]), w, wb,
+                                           dq, di, batch + guard, rows, cols, n,
+                                           experts, used, nullptr))
+              throw std::runtime_error("prequantized gated launch failed");
+            const auto gated = check_output(batch, n);
+            if (std::memcmp(gated_reference.data() + guard,
+                            gated.data() + guard,
+                            n * used * rows * sizeof(float)) != 0)
+              throw std::runtime_error(
+                  "prequantized gated vector differs for format " +
+                  std::to_string(f) + " width " + std::to_string(n));
+          }
+          CheckHip(hipFree(dq), "prequantized gated rows free");
+        }
       }
       CheckHip(hipFree(wb), "paired weight free");
       CheckHip(hipFree(w), "grouping weight free");

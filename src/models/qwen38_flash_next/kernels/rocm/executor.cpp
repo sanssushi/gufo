@@ -121,6 +121,15 @@ bool UnpaddedQ8(std::uint32_t k) {
          qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
 }
 
+/// Whether a dense projection reads the decode Q8_1 activation rows (the
+/// adapter's MMVQ quantizer ignores the weight type, so one row set serves
+/// every quantized format).
+bool Q8DenseType(GgmlType type) {
+  return type != GgmlType::kF32 && type != GgmlType::kBF16 &&
+         type != GgmlType::kF16 &&
+         qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
+}
+
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
 /// Wide dense Q8_0 projections take the F16 WMMA GEMM (F16 activation
@@ -1628,10 +1637,16 @@ bool Executor::QuantizeFor(std::initializer_list<const DeviceTensor*> consumers,
                            const float* x, std::uint32_t n_tokens,
                            std::uint32_t k, Q8Input* q,
                            std::string* error_msg) const {
+  std::size_t q8_consumers = 0;
   for (const DeviceTensor* w : consumers) {
-    if (w->type == GgmlType::kQ8_0) {
-      return Quantize(x, n_tokens, k, q, error_msg);
+    if (Q8DenseType(w->type)) {
+      ++q8_consumers;
     }
+  }
+  // One shared row set when at least two consumers read it; a single
+  // consumer quantizes in its own entry, so no pass is added or removed.
+  if (q8_consumers > 1) {
+    return Quantize(x, n_tokens, k, q, error_msg);
   }
   q->x = x;
   q->data = nullptr;
@@ -1642,18 +1657,33 @@ bool Executor::QuantizeFor(std::initializer_list<const DeviceTensor*> consumers,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
-  if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
-    if (w.cols != q.k) {
-      AssignError(error_msg, "quantized input width mismatch");
-      return false;
+  if (q.data != nullptr) {
+    if (w.type == GgmlType::kQ8_0) {
+      if (w.cols != q.k) {
+        AssignError(error_msg, "quantized input width mismatch");
+        return false;
+      }
+      if (qfn_mmq_q8_0_dense_vec_preq(
+              w.data, nullptr, q.data, out, static_cast<int>(w.rows),
+              static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
+        AssignError(error_msg, "Q8_0 GEMV failed");
+        return false;
+      }
+      return true;
     }
-    if (qfn_mmq_q8_0_dense_vec_preq(
-            w.data, nullptr, q.data, out, static_cast<int>(w.rows),
-            static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
-      AssignError(error_msg, "Q8_0 GEMV failed");
-      return false;
+    // Every adapter format consumes the same q8_1 rows the Q8_0 GEMV
+    // reads; the entry quantizes those rows itself only without them.
+    if (!MatrixRows(q.n) && w.cols == q.k && Q8DenseType(w.type)) {
+      if (qfn_mmq_dense_vec_preq(static_cast<int>(w.type), w.data, q.data, out,
+                                 static_cast<int>(w.rows),
+                                 static_cast<int>(q.n),
+                                 static_cast<int>(w.cols), stream_) != 0) {
+        AssignError(error_msg, "dense matrix projection failed for " +
+                                   std::string(core::ToString(w.type)));
+        return false;
+      }
+      return true;
     }
-    return true;
   }
   return Dense(w, q.x, out, q.n, error_msg);
 }
@@ -1680,9 +1710,15 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     }
     return true;
   }
+  // The pair reads one shared Q8_1 row set when both are quantized.
+  Q8Input xq{x, nullptr, n_tokens, up.cols};
+  if (up.cols == gate.cols &&
+      !QuantizeFor({&gate, &up}, x, n_tokens, up.cols, &xq, error_msg)) {
+    return false;
+  }
   // Swiglu is in place over its first operand.
-  if (!Dense(gate, x, out, n_tokens, error_msg) ||
-      !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
+  if (!Dense(gate, xq, out, error_msg) ||
+      !Dense(up, xq, s_.shexp_gate, error_msg)) {
     return false;
   }
   // A wide batch writes the down projection's staged input directly (the
@@ -1812,9 +1848,16 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       }
       return true;
     }
-    const int rc = MatrixRows(n_tokens)
-                       ? qfn_mmq_dense(t, w.data, x, out, m, n, k, stream_)
-                       : qfn_mmq_dense_vec(t, w.data, x, out, m, n, k, stream_);
+    int rc = 0;
+    if (MatrixRows(n_tokens)) {
+      rc = qfn_mmq_dense(t, w.data, x, out, m, n, k, stream_);
+    } else if (const void* ready = ReadyQ8(x, n_tokens, w.cols)) {
+      // The producer wrote these rows (byte-identical to Quantize's), so
+      // the projection skips the activation pass.
+      rc = qfn_mmq_dense_vec_preq(t, w.data, ready, out, m, n, k, stream_);
+    } else {
+      rc = qfn_mmq_dense_vec(t, w.data, x, out, m, n, k, stream_);
+    }
     if (rc != 0) {
       AssignError(error_msg, "dense matrix projection failed for " +
                                  std::string(core::ToString(w.type)));

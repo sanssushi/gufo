@@ -29,6 +29,11 @@ int qfn_mmq_dense(
 int qfn_mmq_dense_vec(int weight_type, const void* W, const float* X_f32,
                       float* out, int M, int N, int K, hipStream_t stream);
 
+// qfn_mmq_dense_vec over x already in qfn_mmq_quantize_q8_1's layout.
+int qfn_mmq_dense_vec_preq(int weight_type, const void* W, const void* X_q8,
+                           float* out, int M, int N, int K,
+                           hipStream_t stream);
+
 int qfn_mmq_moe_pair_unique(int weight_type, const void* W_a, const void* W_b,
                             const float* X_f32, const int32_t* ids,
                             float* out_a, float* out_b, int M, int K,

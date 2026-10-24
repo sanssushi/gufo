@@ -1760,11 +1760,44 @@ void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
         throw std::runtime_error("dense vec projection overwrote its guard");
     }
   }
+  // The prequantized entry consumes the rows the decode producers write
+  // (codes, half d and d*sum(q)); every format must reproduce the F32
+  // entry's bytes for the same rows, including the padded row stride.
+  std::uint8_t* d_q = nullptr;
+  CheckHip(hipMalloc(&d_q, qfn_mmq_q8_1_bytes(static_cast<int>(tokens),
+                                              static_cast<int>(k))),
+           "dense vec quantized input");
+  if (qfn_mmq_quantize_q8_1(d_x, d_q, static_cast<int>(tokens),
+                            static_cast<int>(k), nullptr) != 0)
+    throw std::runtime_error("dense vec input quantization failed");
+  for (std::size_t n = 1; n <= tokens; ++n) {
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "dense vec guards");
+    const auto* input =
+        static_cast<const std::uint8_t*>(d_q) +
+        qfn_mmq_q8_1_bytes(static_cast<int>(tokens - n), static_cast<int>(k));
+    if (qfn_mmq_dense_vec_preq(static_cast<int>(type), d_w, input, d_out,
+                               static_cast<int>(m), static_cast<int>(n),
+                               static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error("prequantized dense projection failed");
+    const auto batch = Download(d_out, zeros.size());
+    if (std::memcmp(scalar.data() + (tokens - n) * m, batch.data(),
+                    n * m * sizeof(float)) != 0)
+      throw std::runtime_error(
+          "prequantized dense rows differ: m=" + std::to_string(m) +
+          " k=" + std::to_string(k) + " n=" + std::to_string(n));
+    for (std::size_t i = n * m; i < zeros.size(); ++i) {
+      if (batch[i] != poison)
+        throw std::runtime_error(
+            "prequantized dense projection overwrote its guard");
+    }
+  }
   std::cout << "dense vec " << std::to_string(static_cast<unsigned>(type))
             << " m=" << m << " k=" << k << ": rows exact at 1.." << tokens
-            << " tokens\n";
+            << " tokens, prequantized exact\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
-                  static_cast<void*>(d_out)})
+                  static_cast<void*>(d_out), static_cast<void*>(d_q)})
     CheckHip(hipFree(p), "dense vec free");
 }
 
