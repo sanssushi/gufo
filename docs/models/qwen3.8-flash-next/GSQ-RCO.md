@@ -28,16 +28,16 @@ Speed (details in "Performance state"):
   draft copies bypass the neural draft head (the two mixes and the control
   all take the same 17 cycles and accept 111 draft tokens), so this
   measurement is dominated by verifying eight rows at a time. The remaining
-  gap is about -2% for xxs and about -6% for s. The forward includes
+  gap is about -2% for xxs and about -5% for s. The forward includes
   low-bit weight decoding and BF16 hyper-connection projections; the shared
   expert's decoded weight fragments are reused across the tokens in a group.
 - MTP token generation with no preceding context follows the draft
   acceptance rate rather than kernel speed, so the result varies with the
   draft trajectory.
-- Prefill throughput at depth 32768 is about 10-12% lower and is dominated
+- Prefill throughput at depth 32768 is about 10-14% lower and is dominated
   by GPU kernel work. BF16 mixers and quantized F16 projections carry
   substantial execution cost; matrix arithmetic, decoding, staging and
-  memory traffic all contribute. Depth-0 prefill cells span about 9-18%;
+  memory traffic all contribute. Depth-0 prefill cells span about 8-19%;
   their spread follows the control's own depth-0 rate. The prefill deficits
   and s-mix generation deficits exceed the roughly 5%-per-phase
   comparable-performance target.
@@ -55,6 +55,8 @@ hyper-connection down projection keeps its eight-element wide GEMV. The
 BF16 hyper-connection down projection at wide prefill uses a 128-row x
 128-token tile. The BF16 hyper-connection up projection at decode uses a
 256-row x 16-token tile; the wide fused mixer keeps its 128-row tile.
+Routed Q2_0 down projections use four weight rows per wave for multi-row
+decode and verification batches.
 
 ## Targets and artifacts
 
@@ -182,6 +184,11 @@ vendored code is re-imported (see "Vendored-code obligations").
   is the single definition of the gated-format set (in the adapter, exported
   through `qfn_mmq.h`); the executor's `GatedMoeType` delegates to it, so the
   two sets cannot differ.
+- The routed Q2_0 down projection at the expert shape (K 640) uses four
+  weight rows per wave when a multi-row slot batch routes one expert per
+  row. Each row keeps the two-row wave's dot-product order, warp reduction
+  and inactive-slot zero write; other formats and shapes keep their existing
+  row tiles.
 - Wide batches also use MMQ: `mul_mat_q_case` instantiations plus the
   type-generic `qfn_mmq_moe_raw` and `qfn_mmq_moe_pair_unique` in
   `qfn_mmq.hip.cpp`. The routed tile width comes from
@@ -482,7 +489,9 @@ Breaking any of them silently breaks session or audit replay.
   scalar routed path, enforced by an inline-assembly barrier (`IqMoeScale`),
   so the output is byte-exact against the separate projections plus SwiGLU
   at every width, including duplicate and invalid slots and nonfinite scales
-  (`routed_wmma_ops`).
+  (`routed_wmma_ops`). The four-row Q2_0 down waves produce byte-identical
+  rows to the two-row waves at widths 2-640, including ragged rows, repeated
+  and invalid ids and poisoned output guards (`routed_wmma_ops`).
 - Type-id checks: every `WeightType` value is pinned against both
   `core::GgmlType` and the adapter's `ggml_type` in enum order (the raw-cast
   check in `routed_wmma_ops_test`); GGUF type ids are pinned in
@@ -561,30 +570,30 @@ focused depth 0):
 | Measurement | xxs | s |
 | --- | ---: | ---: |
 | AR tg128, steady state | ≈ 0% | ≈ -5% |
-| AR tg128 at d32768 | -0.19/-0.11% | -5.08/-4.95% |
-| MTP tg128 at d0 (acceptance-rate dependent, focused run) | -2.8/-3.4% | -36.5/-45.0% |
-| MTP tg128 at d32768 | -1.75/-1.98% | -5.77/-6.35% |
-| pp2048 at d32768, AR (speculation off) | -11.27/-10.59% | -11.77/-11.06% |
-| pp2048 at d32768, MTP | -10.50/-10.68% | -11.59/-11.41% |
-| pp2048 at d0, steady state | ≈ -13..-14% | ≈ -9..-18% |
+| AR tg128 at d32768 | -0.30/-0.41% | -5.16/-5.06% |
+| MTP tg128 at d0 (acceptance-rate dependent) | -3.45/-3.58% | -36.60/-36.30% |
+| MTP tg128 at d32768 | -1.95/-1.92% | -5.60/-5.35% |
+| pp2048 at d32768, AR (speculation off) | -10.77/-13.67% | -11.49/-11.85% |
+| pp2048 at d32768, MTP | -10.42/-12.04% | -10.70/-10.96% |
+| pp2048 at d0, steady state | ≈ -12..-19% | ≈ -8..-19% |
 
 ### Decode
 
 - Decode results: AR token generation is within about 5% of the control.
-  Depth-32768 measurements are -0.19/-0.11% (xxs) and -5.08/-4.95% (s).
-  Depth-0 alternations read about 27.1 t/s (xxs) and 26.0/22.4 t/s (s)
-  against a control at 27.2 t/s; one s round takes the low-rate path at
-  22.4 t/s, so the steady-state row is approximate. MTP depth-0
+  Depth-32768 measurements are -0.30/-0.41% (xxs) and -5.16/-5.06% (s).
+  Depth-0 alternations read 25.5/27.2 t/s (xxs) and 26.0 t/s (s) against a
+  control at 27.0-27.3 t/s; the xxs 25.5 round takes the low-rate path, so
+  the steady-state row is approximate. MTP depth-0
   measurements follow the draft acceptance rate rather than kernel speed
-  (the control reads 49.0 t/s; a depth-0 run can take an unusual draft
+  (the control reads 48.8-49.0 t/s; a depth-0 run can take an unusual draft
   trajectory at the same cycle count, which moves the result with the
-  acceptance rate). The focused s run takes 59 cycles with 36 of 65 drafts
-  accepted; the focused xxs run takes 49 cycles with 78 of 117 accepted.
+  acceptance rate). The s run takes 59 cycles with 36 of 65 drafts
+  accepted; the xxs run takes 49 cycles with 78 of 117 accepted.
   At depth 32768, upstream's prompt-lookup draft copies bypass the neural
   draft head for greedy runs (the two mixes and the control take the same
   17 cycles and accept 111 draft tokens), so this measurement reflects the
-  multi-row verification forward pass. The -1.75/-1.98% (xxs) and
-  -5.77/-6.35% (s) gaps measure the complete verification forward,
+  multi-row verification forward pass. The -1.95/-1.92% (xxs) and
+  -5.60/-5.35% (s) gaps measure the complete verification forward,
   including the BF16 mixers and quantized dense/routed projections.
   Shared-expert weight fragments are reused across the group's tokens. A
   routed gate/up diagnostic measures 434 ms per 17 verification cycles of
@@ -610,7 +619,7 @@ focused depth 0):
 
 ### Prefill
 
-- Prefill throughput at depth 32768 is about 10-12% below the control.
+- Prefill throughput at depth 32768 is about 10-14% below the control.
   The BF16 hyper-connection down projection uses 128-row × 128-token tiles
   at 1,024 or more tokens and 64-row × 128-token tiles below that, with
   F16-staged weights and two K16 accumulator chains. The wide tile is
@@ -625,7 +634,7 @@ focused depth 0):
   format ceiling. Kernel-family differences are not additive role
   penalties: q4 HC-down belongs to its int8 family, and fused SSM
   projections contain projection work as well as convolution. Depth-0
-  throughput differences span about -9..-18%; their spread follows the
+  throughput differences span about -8..-19%; their spread follows the
   control's own depth-0 rate and does not indicate a different dispatch
   path.
 
