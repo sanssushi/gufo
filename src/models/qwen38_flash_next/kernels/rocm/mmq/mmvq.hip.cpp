@@ -976,6 +976,14 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q2_0:
+          // Down projection slots have independent inputs. Four rows reuse
+          // each short input across more weights without changing its sum.
+          if (k == 640 && experts_used == 1 && tokens > 1) {
+            launch_moe<GGML_TYPE_Q2_0, 4>(weights, input, ids, output, k, rows,
+                                          tokens, experts_used, input_stride,
+                                          stream, dst_slots);
+            break;
+          }
             launch_moe<GGML_TYPE_Q2_0>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;

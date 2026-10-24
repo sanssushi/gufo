@@ -1063,8 +1063,8 @@ void CheckVectorGrouping(bool down = false) {
         throw std::runtime_error("paired reference projection failed");
       const auto reference_b = check_output(paired_scalar, tokens);
       const auto widths =
-          down ? std::vector{2,  3,  4,  7,  8,   10,  20, 21,
-                             30, 40, 79, 80, 160, 319, 640}
+          down ? std::vector{2,  3,  4,  7,  8,  10,  20,  21,
+                             30, 40, 70, 79, 80, 160, 319, 640}
                : std::vector{2, 3, 4, 7, 8, 9, 16, 31, 32, 33, 64};
       for (int n : widths) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
