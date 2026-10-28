@@ -383,6 +383,75 @@ int main() {
         }
       }
     }
+    // The production wide combine passes the same buffer as the previous
+    // mixer's inject logits and the next mixer's inject partials. Every
+    // thread reads its own row's logits before the first barrier, so the
+    // alias must produce exactly the separate-buffer result for both the
+    // Q8-producing and the no-Q8 specialization.
+    for (bool request_q8 : {false, true}) {
+      const std::size_t inject_count =
+          static_cast<std::size_t>(kTokens) * 4 * parts;
+      const auto logits = MakeValues(inject_count, 0x5A17U, 0.5F);
+      HipBuffer<float> d_inject_alias(inject_count);
+      HipBuffer<float> d_inject_in(inject_count);
+      HipBuffer<float> d_inject_out(inject_count);
+      Upload(&d_inject_alias, logits);
+      Upload(&d_inject_in, logits);
+      Upload(&d_inject_out, MakeValues(inject_count, 0x17A5U, 0.25F));
+      HipBuffer<float> d_res_alias(kResidual);
+      HipBuffer<float> d_res_separate_alias(kResidual);
+      HipBuffer<__half> d_norm_alias(kResidual);
+      HipBuffer<__half> d_norm_separate_alias(kResidual);
+      HipBuffer<std::uint8_t> d_q8_alias(d_q8.bytes());
+      HipBuffer<std::uint8_t> d_q8_separate_alias(d_q8.bytes());
+      Upload(&d_res_alias, residual);
+      Upload(&d_res_separate_alias, residual);
+      CheckHip(hipMemset(d_q8_alias.get(), 0xA5, d_q8_alias.bytes()),
+               "poison aliased Q8");
+      CheckHip(hipMemset(d_q8_separate_alias.get(), 0xA5,
+                         d_q8_separate_alias.bytes()),
+               "poison separate Q8");
+      if (!q::HcCombineMoeF16(d_res_alias.get(), d_half.get(), d_weights.get(),
+                              d_shared.get(), d_gate.get(), kGateStride, kSlots,
+                              d_inject_alias.get(), parts, d_gamma.get(),
+                              d_norm_alias.get(),
+                              request_q8 ? d_q8_alias.get() : nullptr, kTokens,
+                              kHidden, 4, 1e-6F, nullptr, d_prior.get(),
+                              d_prior_w.get(), d_inject_alias.get(),
+                              d_next_inject_bf16.get(), q::WeightType::kBF16)) {
+        throw std::runtime_error("aliased inject combine rejected");
+      }
+      if (!q::HcCombineMoeF16(d_res_separate_alias.get(), d_half.get(),
+                              d_weights.get(), d_shared.get(), d_gate.get(),
+                              kGateStride, kSlots, d_inject_in.get(), parts,
+                              d_gamma.get(), d_norm_separate_alias.get(),
+                              request_q8 ? d_q8_separate_alias.get() : nullptr,
+                              kTokens, kHidden, 4, 1e-6F, nullptr,
+                              d_prior.get(), d_prior_w.get(),
+                              d_inject_out.get(), d_next_inject_bf16.get(),
+                              q::WeightType::kBF16)) {
+        throw std::runtime_error("separate inject combine rejected");
+      }
+      if (Download(&d_res_alias, kResidual) !=
+          Download(&d_res_separate_alias, kResidual)) {
+        throw std::runtime_error("aliased inject changed the residual");
+      }
+      const auto alias_norm = Download(&d_norm_alias, kResidual);
+      const auto separate_norm = Download(&d_norm_separate_alias, kResidual);
+      if (std::memcmp(alias_norm.data(), separate_norm.data(),
+                      d_norm_alias.bytes()) != 0) {
+        throw std::runtime_error("aliased inject changed the F16 norm");
+      }
+      if (Download(&d_inject_alias, inject_count) !=
+          Download(&d_inject_out, inject_count)) {
+        throw std::runtime_error("aliased inject changed the inject partials");
+      }
+      if (request_q8 &&
+          Download(&d_q8_alias, d_q8_alias.bytes()) !=
+              Download(&d_q8_separate_alias, d_q8_separate_alias.bytes())) {
+        throw std::runtime_error("aliased inject changed the Q8 norm");
+      }
+    }
     // The MMQ down projection writes F32 expert rows; its fused combine
     // must reproduce MoeEpilogueVec4 + HcCombine byte for byte as well.
     HipBuffer<float> d_res_f32(kResidual);
