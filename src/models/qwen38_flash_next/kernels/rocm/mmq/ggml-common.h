@@ -35,6 +35,12 @@ typedef half2 ggml_half2;
 #define QI1_0 (QK1_0 / 32)
 #define QR1_0 1
 
+// QI2_0 is not the QK/(4*QR) int32 count the other types use; it is the
+// per-lane chunk count of the hand-written vec_dot_q2_0_q8_1 (two 32-element
+// chunks per 64-element block) and MMVQ partitioning depends on it.
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -117,6 +123,13 @@ typedef struct {
     uint8_t qs[QK1_0 / 8]; // bits / quants
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
+
+#define QK2_0 64
+typedef struct {
+    ggml_half d;           // delta
+    uint8_t qs[QK2_0 / 4]; // 2 bits per element
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {

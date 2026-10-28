@@ -76,6 +76,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q5_1:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -185,6 +186,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -230,6 +232,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_Q2_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
@@ -517,9 +520,10 @@ static __device__ __forceinline__ void vec_dot_q4_0_q8_1_dp4a(
                 u[0]=tmp0[0]; u[2]=tmp0[1]; u[4]=tmp0[2]; u[6]=tmp0[3];
                 u[1]=tmp1[0]; u[3]=tmp1[1]; u[5]=tmp1[2]; u[7]=tmp1[3];
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0], u,
-                     x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                     x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -628,9 +632,10 @@ static __device__ __forceinline__ void vec_dot_q4_1_q8_1_dp4a(
                 u[0]=tmp0[0]; u[2]=tmp0[1]; u[4]=tmp0[2]; u[6]=tmp0[3];
                 u[1]=tmp1[0]; u[3]=tmp1[1]; u[5]=tmp1[2]; u[7]=tmp1[3];
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ>
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ>
                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_1], u,
-                     x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                     x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -852,6 +857,78 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+// Q2_0 (GSQ-RCO extension): 64-element blocks with one fp16 scale and two
+// bits per element. Unpacks each crumb to the signed byte (code - 1) and
+// stores the Q8_0 tile layout so the Q8_0 vec dots apply unchanged; each
+// block's scale feeds both of its 32-element halves.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_q2_0(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_hip_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_0, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kb2  = txi / 16;
+    const int kqb  = txi % 16;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride;
+
+        const uint8_t q0 = bxi[kb2].qs[kqb];
+        const int packed0 = __builtin_amdgcn_perm(0x020100FF, 0x020100FF,
+            (q0 & 0x03) | ((q0 & 0x0C) << 6) | ((q0 & 0x30) << 12) | ((q0 & 0xC0) << 18));
+        const uint8_t q1 = bxi[2 + kb2].qs[kqb];
+        const int packed1 = __builtin_amdgcn_perm(0x020100FF, 0x020100FF,
+            (q1 & 0x03) | ((q1 & 0x0C) << 6) | ((q1 & 0x30) << 12) | ((q1 & 0xC0) << 18));
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = packed0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = packed1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = packed0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = packed1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbxd/2;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0                 + kbxd] = bxi->d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = bxi->d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
@@ -1044,9 +1121,10 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_dp4a(
             for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
                     (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
-                     x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
+                     x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]));
             }
         }
     }
@@ -1195,7 +1273,9 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+                    // Keep the slot's chain explicit; see the AMD branch.
+                    float& acc = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), dA[n][l/2][k01/QI8_0]), dB[l%2], acc);
                 }
             }
         }
@@ -1228,9 +1308,10 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_dp4a(
             for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q8_1_q8_1_impl<QR5_1*VDR_Q5_1_Q8_1_MMQ>
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q8_1_q8_1_impl<QR5_1*VDR_Q5_1_Q8_1_MMQ>
                     (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
-                    x_dm[i*(MMQ_TILE_NE_K/QI5_1) + i/QI5_1 + k0/QI8_1], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i*(MMQ_TILE_NE_K/QI5_1) + i/QI5_1 + k0/QI8_1], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -1293,8 +1374,10 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     float2 dmA = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + k0/QI8_1]);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    // Keep the slot's chain explicit; see vec_dot_q8_0_q8_1_mma.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), dmA.x), dsB.x, acc);
+                    acc = __fmaf_rn(dmA.y, dsB.y, acc);
                 }
             }
         }
@@ -1365,8 +1448,10 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                    // Keep the slot's chain explicit; see the AMD branch.
+                    float& acc = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), dmA[n][l/2][k01/QI8_1].x), dsB[l%2].x, acc);
+                    acc = __fmaf_rn(dmA[n][l/2][k01/QI8_1].y, dsB[l%2].y, acc);
                 }
             }
         }
@@ -1399,11 +1484,12 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_dp4a(
             for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q8_0_16_q8_1_impl<QI8_0>(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q8_0_16_q8_1_impl<QI8_0>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
                     &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + k0/(QI8_0/2)],
-                    y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    y_df[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -1466,7 +1552,9 @@ static __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l] * x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4] * dB;
+                    // Keep the slot's chain explicit; see vec_dot_q8_0_q8_1_mma.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), x_df[i*MMQ_MMA_TILE_X_K_Q3_K + k0/4]), dB, acc);
                 }
             }
         }
@@ -1665,10 +1753,11 @@ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_dp4a(
                 const int i = i0 + threadIdx.x;
 
                 constexpr int ns = 2;
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q2_K_q8_1_impl_mmq<ns>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]));
             }
         }
     }
@@ -1688,10 +1777,11 @@ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_dp4a(
                 const int i = i0 + threadIdx.x;
 
                 constexpr int ns = 1;
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q2_K_q8_1_impl_mmq<ns>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]));
             }
         }
     }
@@ -1767,12 +1857,14 @@ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const float2 dm = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q2_K + k0/4]);
-                    float tmp = Cd.x[l]*dm.x;
+                    // Keep the slot's chain explicit; see vec_dot_q8_0_q8_1_mma.
+                    float tmp = __fmul_rn(float(Cd.x[l]), dm.x);
                     if (k01 >= MMQ_TILE_NE_K * 3/4) {
-                        tmp -= Cm.x[l]*dm.y;
+                        tmp = __fmaf_rn(-float(Cm.x[l]), dm.y, tmp);
                     }
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += tmp*dB;
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] -= dm.y*sB;
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(tmp, dB, acc);
+                    acc = __fmaf_rn(-dm.y, sB, acc);
                 }
             }
         }
@@ -1911,9 +2003,10 @@ static __device__ __forceinline__ void vec_dot_q3_K_q8_1_dp4a(
 
                 const int8_t * scales = ((const int8_t *) (x_sc + i*(MMQ_TILE_NE_K/8) + i/8)) + k0/4;
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q3_K_q8_1_impl_mmq(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q3_K_q8_1_impl_mmq(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], scales,
-                    x_df[i], y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_df[i], y_df[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -2065,9 +2158,10 @@ static __device__ __forceinline__ void vec_dot_q4_K_q8_1_dp4a(
 
                 const uint8_t * sc = (const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/32] + 2*(k01/16);
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q4_K_q8_1_impl_mmq(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q4_K_q8_1_impl_mmq(
                     &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -2222,9 +2316,10 @@ static __device__ __forceinline__ void vec_dot_q5_K_q8_1_dp4a(
 
                 const uint8_t * sc = ((const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k00/32]) + 2*(k01/16);
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q5_K_q8_1_impl_mmq(
                     &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -2343,9 +2438,10 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_dp4a(
 
                 const int8_t * sc = ((const int8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/16]);
 
-                sum[j0/nwarps*mmq_y/warp_size + i0/warp_size] += vec_dot_q6_K_q8_1_impl_mmq(
+                float& acc = sum[j0/nwarps*mmq_y/warp_size + i0/warp_size];
+                acc = __fadd_rn(acc, vec_dot_q6_K_q8_1_impl_mmq(
                     &x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc,
-                    x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]));
             }
         }
     }
@@ -2409,7 +2505,13 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const int8_t * sc = (const int8_t *) (x_sc + i*MMQ_MMA_TILE_X_K_Q6_K + k00/16);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*MMQ_MMA_TILE_X_K_Q6_K] * dB;
+                    // Keep the slot's chain explicit; see vec_dot_q8_0_q8_1_mma.
+                    // The four factors pair into two plain products joined by
+                    // one FMA: a longer __fmul_rn chain reassociates per tile
+                    // width under fast-math and changes the sums.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), float(sc[k01/4])),
+                                    __fmul_rn(x_df[i*MMQ_MMA_TILE_X_K_Q6_K], dB), acc);
                 }
             }
         }
@@ -3268,6 +3370,14 @@ template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
     static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q8_0<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_0> {
+    static constexpr int              vdr          = VDR_Q2_0_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q2_0<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
@@ -4311,6 +4421,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
