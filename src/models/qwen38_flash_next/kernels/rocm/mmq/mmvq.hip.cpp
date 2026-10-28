@@ -264,7 +264,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-template<ggml_type type, int c_rows_per_block, bool gated = false>
+template<ggml_type type, int c_rows_per_block, bool gated = false,
+         int row_tile_blocks = 0>
 __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
                   1) static __global__
     void mul_mat_vec_q_moe(const void* __restrict__ weights,
@@ -286,17 +287,24 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
 
   constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
 
+  const uint32_t row_block = row_tile_blocks == 0
+                                 ? blockIdx.x
+                                 : blockIdx.z * row_tile_blocks +
+                                       blockIdx.x % row_tile_blocks;
+  const uint32_t token_block =
+      row_tile_blocks == 0 ? blockIdx.z : blockIdx.x / row_tile_blocks;
   const bool is_up = gated && threadIdx.y != 0;
   const uint32_t token_idx =
-      gated ? 0 : blockIdx.z * blockDim.y + threadIdx.y;
+      gated ? 0 : token_block * blockDim.y + threadIdx.y;
   const void* vx = is_up ? up_weights : weights;
-  const int row0 = c_rows_per_block * blockIdx.x;
+  const int row0 = c_rows_per_block * row_block;
   const int blocks_per_row_x = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * warp_size / qi;
 
   const uint32_t channel_dst = blockIdx.y;
 
-  if (token_idx >= ncols_dst) {
+  if (token_idx >= ncols_dst ||
+      (row_tile_blocks != 0 && uint32_t(row0) >= nrows_x)) {
     return;
   }
 
@@ -575,6 +583,12 @@ __launch_bounds__(64) static __global__
   }
 
   constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
+  // The low-bit IQ formats decode each weight fragment once per row and K
+  // block, then reuse it across the group's tokens.
+  constexpr bool iq_fragment =
+      type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+      type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+      type == GGML_TYPE_IQ3_S;
   constexpr int columns = single_request ? 1 : tokens;
   int token = 0;
   if constexpr (split) {
@@ -602,6 +616,20 @@ __launch_bounds__(64) static __global__
       const Q4MoeFragment w0(
           weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
       const Q4MoeFragment w1(
+          weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+          kqs);
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const auto* x = input + t * input_stride + kb * (qk / QK8_1);
+        sum[t][0] += w0.Dot(x, kqs);
+        sum[t][1] += w1.Dot(x, kqs);
+      }
+    } else if constexpr (iq_fragment && !single_request) {
+      const IqMoeFragment<type> w0(
+          weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+      const IqMoeFragment<type> w1(
           weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
           kqs);
 #pragma unroll
@@ -884,7 +912,7 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
   }
 }
 
-template<ggml_type type, int rows_per_wave = 2>
+template<ggml_type type, int rows_per_wave = 2, int row_tile_blocks = 0>
 static void launch_moe(const void* weights, const block_q8_1* input,
                        const int32_t* ids, float* output, int k, int rows,
                        int tokens, int experts_used, int input_stride,
@@ -894,10 +922,15 @@ static void launch_moe(const void* weights, const block_q8_1* input,
   GGML_ASSERT(tokens > 0);
   const int block_tokens = std::min(tokens, mmvq_moe_max_batch(type));
   const int row_stride = k / ggml_blck_size(type);
-  mul_mat_vec_q_moe<type, rows_per_wave>
-      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, experts_used,
-              (tokens + block_tokens - 1) / block_tokens),
-         dim3(32, block_tokens), 0, stream>>>(
+  const int row_blocks = (rows + rows_per_wave - 1) / rows_per_wave;
+  const int token_blocks = (tokens + block_tokens - 1) / block_tokens;
+  const dim3 grid = row_tile_blocks == 0
+                        ? dim3(row_blocks, experts_used, token_blocks)
+                        : dim3(row_tile_blocks * token_blocks, experts_used,
+                               (row_blocks + row_tile_blocks - 1) /
+                                   row_tile_blocks);
+  mul_mat_vec_q_moe<type, rows_per_wave, false, row_tile_blocks>
+      <<<grid, dim3(32, block_tokens), 0, stream>>>(
           weights, input, ids, output, k, rows, row_stride, input_stride,
           rows * experts_used, rows * row_stride, rows, tokens, experts_used,
           nullptr, dst_slots);
@@ -956,6 +989,14 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q2_0:
+          // Down projection slots have independent inputs. Four rows reuse
+          // each short input across more weights without changing its sum.
+          if (k == 640 && experts_used == 1 && tokens > 1) {
+            launch_moe<GGML_TYPE_Q2_0, 4>(weights, input, ids, output, k, rows,
+                                          tokens, experts_used, input_stride,
+                                          stream, dst_slots);
+            break;
+          }
             launch_moe<GGML_TYPE_Q2_0>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
@@ -980,6 +1021,14 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_IQ4_NL:
+          // Sweep a bounded row slice across the slot groups before advancing
+          // rows, so repeated experts reuse weights without sorting the slots.
+          if (k == 640 && experts_used == 1 && tokens > 80) {
+            launch_moe<GGML_TYPE_IQ4_NL, 2, 256>(
+                weights, input, ids, output, k, rows, tokens, experts_used,
+                input_stride, stream);
+            break;
+          }
             launch_moe<GGML_TYPE_IQ4_NL>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
