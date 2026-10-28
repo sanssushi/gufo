@@ -306,7 +306,9 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
   for (const auto [length, boundary] :
        {std::pair{136U, 94U}, std::pair{136U, 103U}, std::pair{136U, 104U},
         std::pair{136U, 127U}, std::pair{136U, 128U}, std::pair{136U, 135U},
-        std::pair{2048U, 1025U}, std::pair{4096U, 2048U}}) {
+        std::pair{2048U, 1023U}, std::pair{2048U, 1025U},
+        std::pair{2048U, 1152U}, std::pair{4096U, 2047U},
+        std::pair{4096U, 2048U}}) {
     std::vector<std::int32_t> tokens(length);
     for (std::size_t i = 0; i < tokens.size(); ++i)
       tokens[i] = pattern[i % pattern.size()];

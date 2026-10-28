@@ -105,6 +105,51 @@ float Bf16ToFloat(std::uint16_t h) {
   return v;
 }
 
+// Every fused or BF16 path must preserve the reference path's bytes down to
+// the last bit: the CPU expansion of a BF16 weight is the F32 or F16 value
+// both routes compute with.
+template<typename T>
+void Exact(HipBuffer<T>& reference, HipBuffer<T>& actual, const char* name) {
+  std::vector<std::uint8_t> a(reference.bytes()), b(actual.bytes());
+  CheckHip(
+      hipMemcpy(a.data(), reference.get(), a.size(), hipMemcpyDeviceToHost),
+      "reference download");
+  CheckHip(hipMemcpy(b.data(), actual.get(), b.size(), hipMemcpyDeviceToHost),
+           "fused download");
+  if (a != b) {
+    throw std::runtime_error(std::string("HC fusion changed ") + name);
+  }
+}
+
+// A few rows and tokens against an independent double dot: the shared
+// F16 GEMM's math on the mixer shapes the BLAS contract checks do not cover.
+void SpotOracle(const std::vector<__half>& w, const std::vector<__half>& x,
+                const std::vector<float>& out, std::uint32_t m, std::uint32_t k,
+                std::uint32_t batch, const char* name) {
+  double scale = 0.0;
+  double worst = 0.0;
+  const std::uint32_t rows[4] = {0, m / 3, 2 * m / 3, m - 1};
+  for (std::uint32_t t = 0; t < batch; t += std::max(1U, batch / 4)) {
+    for (std::uint32_t r : rows) {
+      double expected = 0.0;
+      for (std::uint32_t i = 0; i < k; ++i) {
+        expected += static_cast<double>(
+                        __half2float(w[static_cast<std::size_t>(r) * k + i])) *
+                    __half2float(x[static_cast<std::size_t>(t) * k + i]);
+      }
+      const double actual = out[static_cast<std::size_t>(t) * m + r];
+      scale = std::max(scale, std::abs(expected));
+      worst = std::max(worst, std::abs(expected - actual));
+    }
+  }
+  std::cout << name << " worst |F16 - F64| " << worst << " (reference scale "
+            << scale << ")\n";
+  if (!std::isfinite(worst) || worst > 1e-4 * std::max(1.0, scale)) {
+    throw std::runtime_error(std::string(name) +
+                             " differs from the F64 oracle");
+  }
+}
+
 // Fusing the projection must preserve every downstream representation,
 // including the inject partials' reduction order and quantization ties.
 void CheckFusedProjection(std::uint32_t tokens) {
@@ -271,6 +316,63 @@ void CheckFusedInjectPartials(std::uint32_t tokens) {
   }
 }
 
+// The BF16 GEMM shapes of the GSQ mixes at every width the mixer chains
+// run (decode included) must reach the same numbers as the F16 staging of
+// their exact expansion: the fetch-side rounding is the CPU's.
+void CheckBf16Gemm(std::uint32_t tokens, std::size_t rows, std::size_t cols,
+                   const char* label) {
+  const std::size_t x_count = static_cast<std::size_t>(tokens) * cols;
+  const std::size_t out_count = static_cast<std::size_t>(tokens) * rows;
+  const auto norm = MakeValues(x_count, 0x87654321U, 0.5F);
+  std::vector<__half> norm_half(norm.size());
+  std::transform(norm.begin(), norm.end(), norm_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  const auto down = MakeValues(rows * cols, 0x13572468U, 0.02F);
+  std::vector<std::uint16_t> down_bf16(down.size());
+  std::vector<__half> down_half(down.size());
+  for (std::size_t i = 0; i < down.size(); ++i) {
+    down_bf16[i] = FloatToBf16(down[i]);
+    down_half[i] = __float2half_rn(Bf16ToFloat(down_bf16[i]));
+  }
+  HipBuffer<__half> d_norm(norm_half.size()), d_down_half(down_half.size());
+  HipBuffer<std::uint16_t> d_down_bf16(down_bf16.size());
+  HipBuffer<float> d_ref(out_count), d_out(out_count);
+  Upload(&d_norm, norm_half);
+  Upload(&d_down_half, down_half);
+  Upload(&d_down_bf16, down_bf16);
+  if (!q::UnquantizedF16Gemm(d_down_half.get(), d_norm.get(), d_ref.get(),
+                             tokens, rows, cols, nullptr))
+    throw std::runtime_error("HC BF16 reference projection rejected");
+  if (!q::UnquantizedF16Gemm(d_down_bf16.get(), d_norm.get(), d_out.get(),
+                             tokens, rows, cols, nullptr, q::WeightType::kBF16))
+    throw std::runtime_error("HC BF16 projection rejected");
+  Exact(d_ref, d_out, label);
+  const auto reference = Download(&d_ref, out_count);
+  SpotOracle(down_half, norm_half, reference, rows, cols, tokens, label);
+  // The 64 x 128 plan keeps one K order per output, so a token's row must
+  // stay bit-identical across any prefill chunk split.
+  if (tokens >= 129) {
+    const std::uint32_t head = tokens - 33;
+    HipBuffer<float> d_split(out_count);
+    for (const auto [off, n] :
+         {std::pair<std::uint32_t, std::uint32_t>{0, head},
+          {head, tokens - head}}) {
+      if (!q::UnquantizedF16Gemm(
+              d_down_bf16.get(),
+              d_norm.get() + static_cast<std::size_t>(off) * cols,
+              d_split.get() + static_cast<std::size_t>(off) * rows, n, rows,
+              cols, nullptr, q::WeightType::kBF16))
+        throw std::runtime_error("HC BF16 split projection rejected");
+    }
+    const auto split = Download(&d_split, out_count);
+    if (std::memcmp(split.data(), reference.data(),
+                    out_count * sizeof(float)) != 0) {
+      throw std::runtime_error("HC BF16 projection changed across a chunk");
+    }
+  }
+  std::cerr << label << " projection exact at " << tokens << " tokens\n";
+}
+
 // The decode 16-bit GEMV tier (vectorized row waves over F32 activations):
 // every encoding follows the F64 oracle, and an output row must not depend
 // on the token count, which is the batched-decode contract.
@@ -345,6 +447,14 @@ int main() {
       CheckFusedInjectPartials(n);
     constexpr std::size_t kRank = 320;
     constexpr std::size_t kDim = kStreams * kHidden;
+    CheckBf16Gemm(1, kRank, kDim, "HC BF16 down");
+    CheckBf16Gemm(8, kRank, kDim, "HC BF16 down");
+    CheckBf16Gemm(96, kRank, kDim, "HC BF16 down");
+    CheckBf16Gemm(2049, kRank, kDim, "HC BF16 down");
+    CheckBf16Gemm(1, kDim, kRank, "HC BF16 up");
+    CheckBf16Gemm(8, kDim, kRank, "HC BF16 up");
+    CheckBf16Gemm(96, kDim, kRank, "HC BF16 up");
+    CheckBf16Gemm(2049, kDim, kRank, "HC BF16 up");
     CheckDecodeGemv(1, kRank, kDim, "decode HC down");
     CheckDecodeGemv(8, kRank, kDim, "decode HC down");
     CheckDecodeGemv(8, kDim, kRank, "decode HC up");

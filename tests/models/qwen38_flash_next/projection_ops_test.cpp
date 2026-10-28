@@ -80,9 +80,12 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed,
 
 // Reuse the wide projection fixture to check the fused convolution through
 // its actual consumer, including the state carried into the next chunk.
-void CheckSsmProjection(const void* w, const __half* x, float* projected,
-                        const std::vector<float>& reference,
-                        std::uint32_t batch) {
+// `quant_type` picks the fused entry: kQ8_0 (the Q8 control stack) runs
+// DenseF16SsmGemm; every GSQ-RCO K-quant/IQ stack runs DenseQuantF16SsmGemm.
+void CheckSsmProjection(
+    const void* w, const __half* x, float* projected,
+    const std::vector<float>& reference, std::uint32_t batch,
+    gufo::core::GgmlType quant_type = gufo::core::GgmlType::kQ8_0) {
   constexpr std::uint32_t m = 16384, k = 2560, channels = 10240;
   constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
   const std::size_t conv_count = std::size_t(batch) * channels;
@@ -190,9 +193,16 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
     // The poison and uploads ran on the legacy stream, which does not order
     // the non-blocking streams of replay 2.
     CheckHip(hipDeviceSynchronize(), "SSM inputs");
-    if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
-                            k, channels, 4, replay == 2 ? main_stream : nullptr,
-                            0, replay == 2 ? z_stream : nullptr, z_start)) {
+    const bool launched =
+        quant_type == gufo::core::GgmlType::kQ8_0
+            ? q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch,
+                                 batch, m, k, channels, 4,
+                                 replay == 2 ? main_stream : nullptr, 0,
+                                 replay == 2 ? z_stream : nullptr, z_start)
+            : q::DenseQuantF16SsmGemm(quant_type, w, x, conv_w, conv_state,
+                                      fused, scratch, batch, m, k, channels, 4,
+                                      nullptr);
+    if (!launched) {
       throw std::runtime_error("SSM projection rejected the shape");
     }
     CheckHip(hipDeviceSynchronize(), "SSM projection");
@@ -1348,10 +1358,286 @@ DenseWeights MakeQuant(q::WeightType type, std::size_t m, std::size_t k,
   return w;
 }
 
+/// The GSQ-RCO ssm_in stacks store the K-quant/IQ dense formats and fuse the
+/// four-tap convolution into the quantized F16-tile projection. The fused
+/// pass must stay bit-identical to the separate dense F16-tile projection
+/// (same decode, same K order per output) through its consumer.
+void CheckSsmProjectionQuant(gufo::core::GgmlType type, std::uint32_t batch) {
+  constexpr std::uint32_t m = 16384, k = 2560;
+  const auto wtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  const DenseWeights w = MakeQuant(wtype, m, k, 0x51D6C0DEU);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t state = 0xC0FFEEU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  // The MMQ tier reads whole 256-element k-iterations past short rows;
+  // production uploads carry a zeroed tail (device_model.cpp kTailMargin).
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  __half* d_x_half = nullptr;
+  float* d_ref = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "SSM quant weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "SSM quant input");
+  CheckHip(hipMalloc(&d_x_half, x.size() * sizeof(__half)), "SSM quant halves");
+  CheckHip(hipMalloc(&d_ref, x.size() / k * m * 4), "SSM quant projection");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "SSM quant weights upload");
+  CheckHip(hipMemset(d_w + w.packed.size(), 0, tail), "SSM quant weights tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "SSM quant input upload");
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  if (!q::DenseQuantF16Gemm(type, d_w, d_x_half, d_ref, batch, m, k, nullptr)) {
+    throw std::runtime_error("SSM quant projection rejected the shape");
+  }
+  const auto reference = Download(d_ref, x.size() / k * m);
+  CheckSsmProjection(d_w, d_x_half, d_ref, reference, batch, type);
+  CheckHip(hipFree(d_w), "SSM quant free");
+  CheckHip(hipFree(d_x), "SSM quant free");
+  CheckHip(hipFree(d_x_half), "SSM quant free");
+  CheckHip(hipFree(d_ref), "SSM quant free");
+}
+
+/// Mixed-type SSM layers keep QKV and gate as separate projections. The
+/// standalone QKV matrix can still fuse the four-tap convolution while the
+/// independently typed gate runs unchanged. The fused pass must stay
+/// bit-identical to the separate QKV projection through GatedDeltaNet,
+/// including the boundary raw rows the rolling history and the checkpoint
+/// prefix read.
+void CheckSsmSeparateProjectionQuant(gufo::core::GgmlType type,
+                                     gufo::core::GgmlType gate_type,
+                                     std::uint32_t batch,
+                                     std::uint32_t checkpoint_tokens) {
+  constexpr std::uint32_t channels = 10240, gate_m = 6144, k = 2560;
+  constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
+  constexpr std::size_t tail = 4096;
+  const auto wtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  const auto gtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(gate_type));
+  const DenseWeights qkv = MakeQuant(wtype, channels, k, 0x6B1D1024U);
+  const DenseWeights gate = MakeQuant(gtype, gate_m, k, 0x9A7E6144U);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t seed = 0xC0FFEEU;
+  for (float& v : x)
+    v = Uniform(&seed, 2.0F);
+
+  struct Buffers {
+    std::vector<float*> pointers;
+    ~Buffers() {
+      for (float* p : pointers) {
+        (void)hipFree(p);
+      }
+    }
+    float* Make(std::size_t count) {
+      float* p = nullptr;
+      CheckHip(hipMalloc(&p, count * sizeof(float)), "separate SSM allocation");
+      pointers.push_back(p);
+      return p;
+    }
+  } buffers;
+  auto values = [&](std::size_t count, float scale, float offset = 0.0F) {
+    std::vector<float> v(count);
+    for (float& value : v) {
+      value = offset + Uniform(&seed, scale);
+    }
+    return v;
+  };
+  auto upload = [](float* p, const std::vector<float>& v) {
+    CheckHip(
+        hipMemcpy(p, v.data(), v.size() * sizeof(float), hipMemcpyHostToDevice),
+        "separate SSM upload");
+  };
+  auto constant = [&](float* p, std::size_t count, float value) {
+    std::vector<float> v(count, value);
+    upload(p, v);
+  };
+
+  std::uint8_t* d_qkv_w = nullptr;
+  std::uint8_t* d_gate_w = nullptr;
+  float* d_x = nullptr;
+  __half* d_x_half = nullptr;
+  CheckHip(hipMalloc(&d_qkv_w, qkv.packed.size() + tail),
+           "separate SSM QKV weights");
+  CheckHip(hipMalloc(&d_gate_w, gate.packed.size() + tail),
+           "separate SSM gate weights");
+  CheckHip(hipMalloc(&d_x, x.size() * sizeof(float)), "separate SSM input");
+  CheckHip(hipMalloc(&d_x_half, x.size() * sizeof(__half)),
+           "separate SSM halves");
+  CheckHip(hipMemcpy(d_qkv_w, qkv.packed.data(), qkv.packed.size(),
+                     hipMemcpyHostToDevice),
+           "separate SSM QKV weights upload");
+  CheckHip(hipMemcpy(d_gate_w, gate.packed.data(), gate.packed.size(),
+                     hipMemcpyHostToDevice),
+           "separate SSM gate weights upload");
+  CheckHip(hipMemset(d_qkv_w + qkv.packed.size(), 0, tail),
+           "separate SSM QKV weights tail");
+  CheckHip(hipMemset(d_gate_w + gate.packed.size(), 0, tail),
+           "separate SSM gate weights tail");
+  CheckHip(
+      hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "separate SSM input upload");
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+
+  const std::size_t conv_count = std::size_t(batch) * channels;
+  const std::size_t state_count = std::size_t(vh) * d * d;
+  const std::size_t out_count = std::size_t(batch) * value_dim;
+  const std::size_t hist_count = std::size_t(3) * channels;
+  const float poison = 1.0e30F;
+  const auto history = values(hist_count, 0.5F);
+  const auto initial_state = values(state_count, 0.05F);
+  float* qkv_ref = buffers.Make(conv_count);
+  float* z_ref = buffers.Make(out_count);
+  float* scratch_ref = buffers.Make(conv_count + 4 * channels);
+  float* qkv_fused = buffers.Make(conv_count + 8);
+  float* z_fused = buffers.Make(out_count);
+  float* scratch_fused = buffers.Make(conv_count + 4 * channels + 8);
+  float* conv_state = buffers.Make(hist_count);
+  float* state = buffers.Make(state_count);
+  float* qn = buffers.Make(std::size_t(batch) * kh * d);
+  float* kn = buffers.Make(std::size_t(batch) * kh * d);
+  float* raw = buffers.Make(out_count);
+  float* out = buffers.Make(out_count);
+  float* chk_state = buffers.Make(state_count);
+  float* chk_history = buffers.Make(hist_count);
+  float* conv_w = buffers.Make(std::size_t(channels) * 4);
+  float* ab = buffers.Make(std::size_t(batch) * 2 * vh);
+  float* a = buffers.Make(vh);
+  float* dt = buffers.Make(vh);
+  float* norm = buffers.Make(d);
+
+  const auto conv = values(channels * 4, 0.05F);
+  const auto alpha_beta = values(std::size_t(batch) * 2 * vh, 1.0F);
+  const auto decay = values(vh, 0.5F, -1.5F);
+  const auto delta = values(vh, 1.0F);
+  const auto norm_weight = values(d, 0.5F, 1.0F);
+  upload(conv_state, history);
+  upload(state, initial_state);
+  upload(conv_w, conv);
+  upload(ab, alpha_beta);
+  upload(a, decay);
+  upload(dt, delta);
+  upload(norm, norm_weight);
+  const auto consume = [&](const float* qkv_rows, const float* gate_rows,
+                           bool convolved, float* conv_state_rows,
+                           float* scratch, float* state_rows, float* out_rows,
+                           float* checkpoint_state, float* checkpoint_history) {
+    q::GatedDeltaNet(qkv_rows, channels, gate_rows, gate_m, ab, conv_w, a, dt,
+                     norm, conv_state_rows, scratch, qn, kn, raw, state_rows,
+                     out_rows, nullptr, {}, {}, batch, kh, vh, d, 4, true,
+                     convolved, 1e-6F, nullptr, nullptr,
+                     q::GdnCheckpoint{checkpoint_state, checkpoint_history,
+                                      checkpoint_tokens});
+  };
+  auto download = [](const float* p, std::size_t count) {
+    return Download(p, count);
+  };
+  auto same = [](const std::vector<float>& expected,
+                 const std::vector<float>& actual, const char* name) {
+    if (expected.size() != actual.size() ||
+        std::memcmp(expected.data(), actual.data(),
+                    expected.size() * sizeof(float)) != 0) {
+      throw std::runtime_error(std::string("separate SSM changed ") + name);
+    }
+    for (float value : actual) {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("nonfinite separate SSM ") + name);
+      }
+    }
+  };
+
+  if (!q::DenseQuantF16Gemm(type, d_qkv_w, d_x_half, qkv_ref, batch, channels,
+                            k, nullptr) ||
+      !q::DenseQuantF16Gemm(gate_type, d_gate_w, d_x_half, z_ref, batch, gate_m,
+                            k, nullptr)) {
+    throw std::runtime_error("separate SSM projection rejected the shape");
+  }
+  const auto qkv_reference = download(qkv_ref, conv_count);
+  const auto gate_reference = download(z_ref, out_count);
+  constant(chk_state, state_count, poison);
+  constant(chk_history, hist_count, poison);
+  consume(qkv_ref, z_ref, false, conv_state, scratch_ref, state, out, chk_state,
+          chk_history);
+  const auto expected_conv = download(scratch_ref, conv_count);
+  const auto expected_state = download(state, state_count);
+  const auto expected_history = download(conv_state, hist_count);
+  const auto expected_out = download(out, out_count);
+  const auto expected_checkpoint_state = download(chk_state, state_count);
+  const auto expected_checkpoint_history = download(chk_history, hist_count);
+
+  for (int replay = 0; replay < 2; ++replay) {
+    upload(conv_state, history);
+    upload(state, initial_state);
+    constant(chk_state, state_count, poison);
+    constant(chk_history, hist_count, poison);
+    CheckHip(hipMemset(qkv_fused, 0xFF, (conv_count + 8) * sizeof(float)),
+             "poison fused QKV");
+    CheckHip(hipMemset(scratch_fused, 0xFF,
+                       (conv_count + 4 * channels + 8) * sizeof(float)),
+             "poison fused convolution");
+    if (!q::DenseQuantF16SsmGemm(type, d_qkv_w, d_x_half, conv_w,
+                                 history.data(), qkv_fused, scratch_fused,
+                                 batch, channels, k, channels, 4, nullptr,
+                                 checkpoint_tokens)) {
+      throw std::runtime_error("standalone SSM projection rejected the shape");
+    }
+    if (!q::DenseQuantF16Gemm(gate_type, d_gate_w, d_x_half, z_fused, batch,
+                              gate_m, k, nullptr)) {
+      throw std::runtime_error("separate SSM gate rejected the shape");
+    }
+    same(expected_conv, download(scratch_fused, conv_count), "convolution");
+    same(gate_reference, download(z_fused, out_count), "gate projection");
+    const auto projected = download(qkv_fused, conv_count + 8);
+    for (std::uint32_t t = 0; t < batch; ++t) {
+      const std::uint32_t tile = t % 32;
+      const bool raw = tile < 3 || tile >= 29 || t + 3 >= batch ||
+                       (checkpoint_tokens != 0 && t < checkpoint_tokens &&
+                        t + 3 >= checkpoint_tokens);
+      if (raw && std::memcmp(projected.data() + std::size_t(t) * channels,
+                             qkv_reference.data() + std::size_t(t) * channels,
+                             std::size_t(channels) * sizeof(float)) != 0) {
+        throw std::runtime_error("standalone SSM changed a retained QKV row");
+      }
+    }
+    for (std::size_t i = conv_count; i < projected.size(); ++i) {
+      if (std::bit_cast<std::uint32_t>(projected[i]) != 0xFFFFFFFFU) {
+        throw std::runtime_error("standalone SSM overwrote its QKV guard");
+      }
+    }
+    consume(qkv_fused, z_fused, true, conv_state, scratch_fused, state, out,
+            chk_state, chk_history);
+    same(expected_history, download(conv_state, hist_count), "history");
+    same(expected_state, download(state, state_count), "recurrent state");
+    same(expected_out, download(out, out_count), "output");
+    same(expected_checkpoint_state, download(chk_state, state_count),
+         "checkpoint state");
+    same(expected_checkpoint_history, download(chk_history, hist_count),
+         "checkpoint history");
+  }
+  if (q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, 0, channels, k, channels, 4, nullptr) ||
+      q::DenseQuantF16SsmGemm(type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, batch, gate_m, k, channels, 4,
+                              nullptr)) {
+    throw std::runtime_error(
+        "standalone SSM projection accepted an unsupported shape");
+  }
+  CheckHip(hipFree(d_qkv_w), "separate SSM free");
+  CheckHip(hipFree(d_gate_w), "separate SSM free");
+  CheckHip(hipFree(d_x), "separate SSM free");
+  CheckHip(hipFree(d_x_half), "separate SSM free");
+  std::cout << "standalone fused SSM convolution, gate, state, history and "
+               "checkpoint are exact\n";
+}
+
 /// Formats outside the adapter set (Q5_1 is routed down-projection only,
 /// Q4_0 has no GPU kernels) must fail the executor's format probe and both
 /// dense entry points, so a widened whitelist cannot make decode and prefill
-/// disagree.
+/// disagree. The F16-tile dense set is the K-quant/IQ family: the Q8_0 route
+/// has its own GEMM and the low-bit formats stay on the adapter's MMQ.
 void CheckDenseRejectsNonDense() {
   for (int type : {static_cast<int>(q::WeightType::kQ5_1),
                    static_cast<int>(gufo::core::GgmlType::kQ4_0)}) {
@@ -1362,11 +1648,46 @@ void CheckDenseRejectsNonDense() {
     if (qfn_mmq_dense_vec(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) ==
         0)
       throw std::runtime_error("qfn_mmq_dense_vec accepted a non-dense type");
+    if (q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(type)))
+      throw std::runtime_error("KQuantWmmaType accepted a non-dense type");
+    if (q::DenseQuantF16Gemm(static_cast<gufo::core::GgmlType>(type), nullptr,
+                             nullptr, nullptr, 1, 1, 32, nullptr))
+      throw std::runtime_error("DenseQuantF16Gemm accepted a non-dense type");
   }
+  for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                             q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                             q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS}) {
+    if (!q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(
+            static_cast<std::uint32_t>(type))))
+      throw std::runtime_error("KQuantWmmaType rejected a K-quant format");
+  }
+  for (q::WeightType type : {q::WeightType::kQ8_0, q::WeightType::kQ2_0,
+                             q::WeightType::kIQ2_XXS, q::WeightType::kIQ2_XS,
+                             q::WeightType::kIQ2_S, q::WeightType::kIQ3_XXS}) {
+    if (q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(
+            static_cast<std::uint32_t>(type))))
+      throw std::runtime_error("KQuantWmmaType accepted a non-K-quant format");
+    if (q::DenseQuantF16Gemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            nullptr, nullptr, nullptr, 1, 1, 32, nullptr))
+      throw std::runtime_error(
+          "DenseQuantF16Gemm accepted a non-K-quant format");
+    if (q::DenseQuantF16SsmGemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1024, 16384,
+            2560, 10240, 4, nullptr))
+      throw std::runtime_error(
+          "DenseQuantF16SsmGemm accepted a non-K-quant format");
+  }
+  if (q::DenseQuantF16SsmGemm(gufo::core::GgmlType::kQ4_K, nullptr, nullptr,
+                              nullptr, nullptr, nullptr, nullptr, 0, 16384,
+                              2560, 10240, 4, nullptr))
+    throw std::runtime_error("DenseQuantF16SsmGemm accepted a short batch");
 }
 
-/// MMQ and MMVQ dense projections for a GSQ-RCO format over random packed
-/// blocks, against an F64 reference over the CPU-dequantized weights.
+/// MMQ, MMVQ and (for the K-quant/IQ formats production routes there) WMMA
+/// dense projections for a GSQ-RCO format over random packed blocks, against
+/// an F64 reference over the CPU-dequantized weights.
 void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
                      std::size_t n_tokens, std::uint32_t seed) {
   const DenseWeights w = MakeQuant(type, m, k, seed);
@@ -1382,6 +1703,10 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   float* d_x = nullptr;
   float* d_mmq = nullptr;
   float* d_vec = nullptr;
+  float* d_wmma = nullptr;
+  std::uint16_t* d_half = nullptr;
+  const bool wmma = q::KQuantWmmaType(
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)));
   // The MMQ tier reads whole 256-element k-iterations, so short rows
   // over-read past the tensor; production uploads carry a zeroed tail for
   // this (device_model.cpp kTailMargin).
@@ -1390,6 +1715,11 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   CheckHip(hipMalloc(&d_x, x.size() * 4), "dense quant input");
   CheckHip(hipMalloc(&d_mmq, zeros.size() * 4), "dense quant MMQ output");
   CheckHip(hipMalloc(&d_vec, zeros.size() * 4), "dense quant MMVQ output");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_wmma, zeros.size() * 4), "dense quant WMMA output");
+    CheckHip(hipMalloc(&d_half, n_tokens * k * sizeof(__half)),
+             "dense quant F16 input");
+  }
   CheckHip(
       hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
       "dense quant weights upload");
@@ -1404,6 +1734,11 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
   CheckHip(
       hipMemcpy(d_vec, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
       "dense quant MMVQ guards");
+  if (wmma) {
+    CheckHip(hipMemcpy(d_wmma, zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "dense quant WMMA guards");
+  }
   if (qfn_mmq_dense(static_cast<int>(type), d_w, d_x, d_mmq,
                     static_cast<int>(m), static_cast<int>(n_tokens),
                     static_cast<int>(k), nullptr) != 0)
@@ -1412,14 +1747,25 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
                         static_cast<int>(m), static_cast<int>(n_tokens),
                         static_cast<int>(k), nullptr) != 0)
     throw std::runtime_error("dense MMVQ failed");
+  if (wmma) {
+    q::NarrowActivations(d_x, d_half, false, n_tokens * k, nullptr);
+    if (!q::DenseQuantF16Gemm(
+            static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+            d_w, reinterpret_cast<const __half*>(d_half), d_wmma, n_tokens, m,
+            k, nullptr))
+      throw std::runtime_error("dense F16-tile WMMA failed");
+  }
   CheckHip(hipDeviceSynchronize(), "dense quant GEMMs");
   const auto mmq = Download(d_mmq, zeros.size());
   const auto vec = Download(d_vec, zeros.size());
+  const auto wmma_out = wmma ? Download(d_wmma, zeros.size())
+                             : std::vector<float>(zeros.size(), 0.0F);
   for (std::size_t i = n_tokens * m; i < zeros.size(); ++i) {
-    if (mmq[i] != poison || vec[i] != poison)
+    if (mmq[i] != poison || vec[i] != poison || (wmma && wmma_out[i] != poison))
       throw std::runtime_error("dense quant projection overwrote its guard");
   }
   double vs_mmq = 0.0, vs_ref = 0.0, mmq_vs_ref = 0.0, scale = 0.0;
+  double wmma_vs_ref = 0.0, wmma_vs_mmq = 0.0;
   for (std::size_t t = 0; t < n_tokens; ++t) {
     for (std::size_t row = 0; row < m; ++row) {
       double ref = 0.0;
@@ -1437,27 +1783,44 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
       vs_ref = std::max(vs_ref, std::abs(ref - static_cast<double>(u)));
       mmq_vs_ref = std::max(mmq_vs_ref, std::abs(ref - static_cast<double>(v)));
       scale = std::max(scale, std::abs(ref));
+      if (wmma) {
+        const float q = wmma_out[t * m + row];
+        if (!std::isfinite(q)) {
+          throw std::runtime_error("dense quant WMMA output is not finite");
+        }
+        wmma_vs_ref =
+            std::max(wmma_vs_ref, std::abs(ref - static_cast<double>(q)));
+        wmma_vs_mmq =
+            std::max(wmma_vs_mmq, std::abs(static_cast<double>(v - q)));
+      }
     }
   }
   // The vector/MMQ tiers approximate the F64 reference through the same
   // activation quantization, so each may sit a full quantization step from
-  // it and two apart from each other.
+  // it and two apart from each other. The F16-tile tier rounds its weight
+  // tiles and activation rows to F16 instead, a finer step on the same
+  // contract.
   if (!(vs_ref < 1e-2 * scale && mmq_vs_ref < 1e-2 * scale &&
-        vs_mmq < 2e-2 * scale)) {
+        vs_mmq < 2e-2 * scale && wmma_vs_ref < 1e-2 * scale &&
+        wmma_vs_mmq < 2e-2 * scale)) {
     throw std::runtime_error(
         "dense quant projection differs from the F64 oracle: m=" +
         std::to_string(m) + " k=" + std::to_string(k) +
         " n=" + std::to_string(n_tokens) + " vs_mmq=" + std::to_string(vs_mmq) +
-        " vs_ref=" + std::to_string(vs_ref) + " mmq_vs_ref=" +
-        std::to_string(mmq_vs_ref) + " scale=" + std::to_string(scale));
+        " vs_ref=" + std::to_string(vs_ref) +
+        " mmq_vs_ref=" + std::to_string(mmq_vs_ref) +
+        " wmma_vs_ref=" + std::to_string(wmma_vs_ref) + " wmma_vs_mmq=" +
+        std::to_string(wmma_vs_mmq) + " scale=" + std::to_string(scale));
   }
   std::cout << "dense " << std::to_string(static_cast<unsigned>(type))
             << " m=" << m << " k=" << k << " n=" << n_tokens
             << ": worst |MMVQ - MMQ| " << vs_mmq << ", worst |MMVQ - F64| "
-            << vs_ref << ", worst |MMVQ - F64| " << mmq_vs_ref << " (scale "
-            << scale << ")\n";
+            << vs_ref << ", worst |MMQ - F64| " << mmq_vs_ref
+            << ", worst |WMMA - F64| " << wmma_vs_ref << ", worst |WMMA - MMQ| "
+            << wmma_vs_mmq << " (scale " << scale << ")\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
-                  static_cast<void*>(d_mmq), static_cast<void*>(d_vec)})
+                  static_cast<void*>(d_mmq), static_cast<void*>(d_vec),
+                  static_cast<void*>(d_wmma), static_cast<void*>(d_half)})
     if (p != nullptr)
       CheckHip(hipFree(p), "dense quant free");
 }
@@ -1537,7 +1900,7 @@ void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
 /// adapter MMQ tier, or the F16-tile WMMA tier production uses at wide batch.
 void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
                           std::size_t length, std::size_t boundary,
-                          std::uint32_t seed) {
+                          std::uint32_t seed, bool wmma = false) {
   const DenseWeights w = MakeQuant(type, m, k, seed);
   std::vector<float> x(length * k);
   std::uint32_t state = seed ^ 0x5A5A5A5AU;
@@ -1550,12 +1913,17 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
   float* d_bulk = nullptr;
   float* d_head = nullptr;
   float* d_tail = nullptr;
+  std::uint16_t* d_half = nullptr;
   CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "chunk exact weights");
   CheckHip(hipMalloc(&d_x, x.size() * 4), "chunk exact input");
   CheckHip(hipMalloc(&d_bulk, length * m * 4), "chunk exact bulk output");
   CheckHip(hipMalloc(&d_head, boundary * m * 4), "chunk exact head output");
   CheckHip(hipMalloc(&d_tail, (length - boundary) * m * 4),
            "chunk exact tail output");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_half, length * k * sizeof(__half)),
+             "chunk exact F16 input");
+  }
   CheckHip(
       hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
       "chunk exact weights upload");
@@ -1566,9 +1934,16 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
            "chunk exact input upload");
   const auto run_tier = [&](float* out, std::size_t rows,
                             std::size_t row_offset) {
-    return qfn_mmq_dense(static_cast<int>(type), d_w, d_x + row_offset * k, out,
-                         static_cast<int>(m), static_cast<int>(rows),
-                         static_cast<int>(k), nullptr) == 0;
+    if (!wmma) {
+      return qfn_mmq_dense(static_cast<int>(type), d_w, d_x + row_offset * k,
+                           out, static_cast<int>(m), static_cast<int>(rows),
+                           static_cast<int>(k), nullptr) == 0;
+    }
+    q::NarrowActivations(d_x + row_offset * k, d_half, false, rows * k,
+                         nullptr);
+    return q::DenseQuantF16Gemm(
+        static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)),
+        d_w, reinterpret_cast<const __half*>(d_half), out, rows, m, k, nullptr);
   };
   if (!run_tier(d_bulk, length, 0))
     throw std::runtime_error("chunk exact bulk projection failed");
@@ -1612,12 +1987,129 @@ void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
   }
   std::cout << "dense chunk exact " << static_cast<unsigned>(type) << " m=" << m
             << " k=" << k << " length=" << length << " boundary=" << boundary
-            << " mmq\n";
+            << (wmma ? " wmma" : " mmq") << "\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_bulk), static_cast<void*>(d_head),
-                  static_cast<void*>(d_tail)})
+                  static_cast<void*>(d_tail), static_cast<void*>(d_half)})
     if (p != nullptr)
       CheckHip(hipFree(p), "chunk exact free");
+}
+
+/// A stacked upload (device_model Stack) merges same-type projections of
+/// one input into one weight matrix whose rows are the concatenated parts:
+/// the attention stack is [q|gate; k; v] and the SSM stack [qkv; gate].
+/// Every tier must produce each output row from its own weight row alone --
+/// the K order is per row -- so the stacked GEMM writes the same rows as
+/// the separate projections it merges, and a sliced call over one part of
+/// the stack (the MTP catch-up route) matches both.
+void CheckDenseStackExact(q::WeightType type,
+                          const std::vector<std::size_t>& parts, std::size_t k,
+                          std::size_t n_tokens, std::uint32_t seed) {
+  std::size_t stacked = 0;
+  std::vector<DenseWeights> w;
+  for (std::size_t m : parts) {
+    stacked += m;
+    w.push_back(MakeQuant(type, m, k, seed++));
+  }
+  std::vector<float> x(n_tokens * k);
+  std::uint32_t state = seed ^ 0x5A5A5A5AU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  const std::size_t bytes = QuantBlockBytes(type);
+  const std::size_t elements = QuantBlockElements(type);
+  std::vector<std::uint8_t> packed;
+  for (const DenseWeights& part : w) {
+    packed.insert(packed.end(), part.packed.begin(), part.packed.end());
+  }
+  constexpr std::size_t tail = 4096;
+  packed.resize(packed.size() + tail, 0);
+  const bool wmma = q::KQuantWmmaType(
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type)));
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_stacked = nullptr;
+  float* d_part = nullptr;
+  std::uint16_t* d_half = nullptr;
+  CheckHip(hipMalloc(&d_w, packed.size()), "stack exact weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "stack exact input");
+  CheckHip(hipMalloc(&d_stacked, n_tokens * stacked * 4),
+           "stack exact stacked output");
+  CheckHip(hipMalloc(&d_part, n_tokens * stacked * 4), "stack exact part");
+  if (wmma) {
+    CheckHip(hipMalloc(&d_half, n_tokens * k * sizeof(__half)),
+             "stack exact F16 input");
+  }
+  CheckHip(hipMemcpy(d_w, packed.data(), packed.size(), hipMemcpyHostToDevice),
+           "stack exact weights upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "stack exact input upload");
+  if (wmma) {
+    q::NarrowActivations(d_x, d_half, false, n_tokens * k, nullptr);
+  }
+  const char* tier = "";
+  const auto check_tier = [&](const char* name, auto&& gemm) {
+    tier = name;
+    gemm(d_w, stacked, d_stacked);
+    const auto full = Download(d_stacked, n_tokens * stacked);
+    std::size_t base = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+      const std::size_t m = parts[i];
+      gemm(d_w + base * (k / elements) * bytes, m, d_part);
+      CheckHip(hipDeviceSynchronize(), "stack exact GEMMs");
+      const auto part = Download(d_part, n_tokens * m);
+      for (std::size_t t = 0; t < n_tokens; ++t) {
+        if (std::memcmp(full.data() + t * stacked + base, part.data() + t * m,
+                        m * sizeof(float)) != 0) {
+          for (std::size_t r = 0; r < m; ++r) {
+            if (full[t * stacked + base + r] != part[t * m + r]) {
+              std::cerr << "MISMATCH type=" << static_cast<unsigned>(type)
+                        << " part=" << i << " m=" << m << " k=" << k
+                        << " n=" << n_tokens << " token=" << t << " row=" << r
+                        << " stacked=" << full[t * stacked + base + r]
+                        << " sliced=" << part[t * m + r] << " tier=" << tier
+                        << "\n";
+              throw std::runtime_error(
+                  "stacked projection row differs from its separate GEMM");
+            }
+          }
+        }
+      }
+      base += m;
+    }
+  };
+  check_tier("mmq", [&](const void* weights, std::size_t m, float* out) {
+    if (qfn_mmq_dense(static_cast<int>(type), weights, d_x, out,
+                      static_cast<int>(m), static_cast<int>(n_tokens),
+                      static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error(std::string("stack exact MMQ failed: ") + tier);
+  });
+  check_tier("mmvq", [&](const void* weights, std::size_t m, float* out) {
+    if (qfn_mmq_dense_vec(static_cast<int>(type), weights, d_x, out,
+                          static_cast<int>(m), static_cast<int>(n_tokens),
+                          static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error(std::string("stack exact MMVQ failed: ") + tier);
+  });
+  if (wmma) {
+    check_tier("wmma", [&](const void* weights, std::size_t m, float* out) {
+      if (!q::DenseQuantF16Gemm(static_cast<gufo::core::GgmlType>(
+                                    static_cast<std::uint32_t>(type)),
+                                weights,
+                                reinterpret_cast<const __half*>(d_half), out,
+                                n_tokens, m, k, nullptr))
+        throw std::runtime_error(std::string("stack exact WMMA failed: ") +
+                                 tier);
+    });
+  }
+  std::cout << "dense stack exact " << static_cast<unsigned>(type)
+            << " m=" << stacked << " k=" << k << " n=" << n_tokens
+            << " parts=" << parts.size()
+            << (wmma ? " wmma+mmq+mmvq" : " mmq+mmvq") << "\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_stacked), static_cast<void*>(d_part),
+                  static_cast<void*>(d_half)})
+    if (p != nullptr)
+      CheckHip(hipFree(p), "stack exact free");
 }
 
 /// Embedding gather for a GSQ-RCO token table against the CPU oracle.
@@ -1762,6 +2254,36 @@ int main() {
     CheckDenseChunkExact(q::WeightType::kIQ4_XS, 2560, 6144, 32, 16, seed++);
     CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 4096, 2048, seed++);
     CheckDenseChunkExact(q::WeightType::kQ2_0, 2560, 640, 136, 94, seed++);
+    // The F16-tile WMMA tier production runs at wide batch must keep the
+    // same contract, including across its 96-token launch-config boundary
+    // and the row-tile groups its production shapes draw.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                               q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS}) {
+      CheckDenseChunkExact(type, 64, 512, 160, 80, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 96, 32, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 136, 94, seed++, true);
+      CheckDenseChunkExact(type, 64, 512, 136, 135, seed++, true);
+    }
+    CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 136, 94, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 130, 97, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kQ4_K, 2560, 6144, 136, 94, seed++,
+                         true);
+    CheckDenseChunkExact(q::WeightType::kIQ4_NL, 2560, 640, 136, 94, seed++,
+                         true);
+    // Stacked-vs-separate exactness for the formats the GSQ-RCO mixes
+    // actually stack (same-type attention triples and SSM pairs), at the
+    // production shapes: [12288; 512; 512] attention and [10240; 6144]
+    // SSM projections over k=2560.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_XS}) {
+      CheckDenseStackExact(type, {12288, 512, 512}, 2560, 7, seed++);
+      CheckDenseStackExact(type, {12288, 512, 512}, 2560, 96, seed++);
+      CheckDenseStackExact(type, {10240, 6144}, 2560, 7, seed++);
+      CheckDenseStackExact(type, {10240, 6144}, 2560, 96, seed++);
+    }
     // Token-table gathers for the GSQ embedding formats.
     CheckEmbedQuant(q::WeightType::kIQ3_S, 17, 2560, seed++);
     CheckEmbedQuant(q::WeightType::kIQ4_XS, 17, 2560, seed++);
@@ -1801,6 +2323,31 @@ int main() {
       ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
       ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
     }
+    // The GSQ-RCO ssm stacks fuse the same convolution over every dense
+    // F16-tile weight format, at a full and a partial final token tile.
+    for (auto type :
+         {gufo::core::GgmlType::kQ4_K, gufo::core::GgmlType::kQ5_K,
+          gufo::core::GgmlType::kQ6_K, gufo::core::GgmlType::kIQ4_NL,
+          gufo::core::GgmlType::kIQ4_XS, gufo::core::GgmlType::kIQ3_S}) {
+      CheckSsmProjectionQuant(type, 1024);
+    }
+    CheckSsmProjectionQuant(gufo::core::GgmlType::kIQ4_XS, 1025);
+    // Mixed-type SSM layers: the standalone QKV matrix fuses the same
+    // convolution while the gate keeps its own type, with the checkpoint
+    // prefix and rolling history reading the retained raw rows. Every
+    // prefill pass wider than a vector batch takes the fused route.
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ6_K,
+                                    gufo::core::GgmlType::kIQ3_S, 9, 6);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kIQ4_XS,
+                                    gufo::core::GgmlType::kQ4_K, 33, 30);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ5_K,
+                                    gufo::core::GgmlType::kQ6_K, 470, 468);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ6_K,
+                                    gufo::core::GgmlType::kIQ3_S, 1024, 1000);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kIQ4_XS,
+                                    gufo::core::GgmlType::kQ4_K, 1025, 1025);
+    CheckSsmSeparateProjectionQuant(gufo::core::GgmlType::kQ5_K,
+                                    gufo::core::GgmlType::kQ6_K, 2049, 2046);
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.

@@ -24,4 +24,18 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
       <<<grid, 256, 0, stream>>>(w, x_tiled, out, batch, m, k);
 }
 
+bool KQuantWmmaType(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kIQ4_XS:
+    case core::GgmlType::kIQ3_S:
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
