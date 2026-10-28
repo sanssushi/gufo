@@ -364,14 +364,17 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 /// F16 as they are staged, so the convolution sees the same accumulated
 /// values as the separate projection. m is the stacked [QKV; gate] width
 /// (16384) or the standalone QKV width (10240, channels); other types
-/// launch nothing.
+/// launch nothing. A non-null `z_stream` receives the stacked Z rows' tiles
+/// after the QKV tiles (ordered through `z_start`), as DenseF16SsmGemm.
 bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
                           const float* conv_w, const float* history,
                           float* qkvz, float* convolved, std::uint32_t n_tokens,
                           std::uint32_t m, std::uint32_t k,
                           std::uint32_t channels, std::uint32_t kernel,
                           hipStream_t stream,
-                          std::uint32_t checkpoint_tokens = 0);
+                          std::uint32_t checkpoint_tokens = 0,
+                          hipStream_t z_stream = nullptr,
+                          hipEvent_t z_start = nullptr);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,

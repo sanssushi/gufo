@@ -199,9 +199,10 @@ void CheckSsmProjection(
                                  batch, m, k, channels, 4,
                                  replay == 2 ? main_stream : nullptr, 0,
                                  replay == 2 ? z_stream : nullptr, z_start)
-            : q::DenseQuantF16SsmGemm(quant_type, w, x, conv_w, conv_state,
-                                      fused, scratch, batch, m, k, channels, 4,
-                                      nullptr);
+            : q::DenseQuantF16SsmGemm(
+                  quant_type, w, x, conv_w, conv_state, fused, scratch, batch,
+                  m, k, channels, 4, replay == 2 ? main_stream : nullptr, 0,
+                  replay == 2 ? z_stream : nullptr, z_start);
     if (!launched) {
       throw std::runtime_error("SSM projection rejected the shape");
     }

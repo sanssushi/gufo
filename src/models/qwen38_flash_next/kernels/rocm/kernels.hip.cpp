@@ -8345,42 +8345,44 @@ bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
                           float* qkvz, float* convolved, std::uint32_t n_tokens,
                           std::uint32_t m, std::uint32_t k,
                           std::uint32_t channels, std::uint32_t kernel,
-                          hipStream_t stream, std::uint32_t checkpoint_tokens) {
+                          hipStream_t stream, std::uint32_t checkpoint_tokens,
+                          hipStream_t z_stream, hipEvent_t z_start) {
   if (n_tokens == 0 || (m != 16384 && m != 10240) || k != 2560 ||
       channels != 10240 || kernel != kSsmConvTaps || !KQuantWmmaType(type) ||
-      k % quant::QuantizedBlockElements(type) != 0) {
+      k % quant::QuantizedBlockElements(type) != 0 ||
+      (z_stream != nullptr && m != 16384)) {
     return false;
   }
   switch (type) {
     case core::GgmlType::kQ4_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ4_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     case core::GgmlType::kQ5_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ5_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     case core::GgmlType::kQ6_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ6_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ4_NL:
       LaunchDenseF16Ssm<core::GgmlType::kIQ4_NL>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ4_XS:
       LaunchDenseF16Ssm<core::GgmlType::kIQ4_XS>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ3_S:
       LaunchDenseF16Ssm<core::GgmlType::kIQ3_S>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoint_tokens);
+          stream, checkpoint_tokens, z_stream, z_start);
       return true;
     default:
       return false;
