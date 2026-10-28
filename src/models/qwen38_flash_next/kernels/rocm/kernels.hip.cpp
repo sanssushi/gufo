@@ -1315,12 +1315,12 @@ __global__ void SigmoidMulQ8Kernel(float* x, const float* g, std::size_t count,
   QuantizeQ8_1Lane(v, x_q8, i);
 }
 
-template<typename T>
-__global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
+template<typename T, typename S = float>
+__global__ void NarrowKernel(const S* x, T* out, std::size_t count) {
   const std::size_t i =
       blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
   if (i < count) {
-    out[i] = T(x[i]);
+    out[i] = T(static_cast<float>(x[i]));
   }
 }
 
@@ -6235,6 +6235,14 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        dim3(kThreads), 0, stream, x, static_cast<__half*>(out),
                        count);
   }
+}
+
+void NarrowBf16Weights(const void* x, void* out, std::size_t count,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL((NarrowKernel<__half, hip_bfloat16>), dim3(Blocks(count)),
+                     dim3(kThreads), 0, stream,
+                     static_cast<const hip_bfloat16*>(x),
+                     static_cast<__half*>(out), count);
 }
 
 std::size_t Q8TiledBytes(std::size_t batch, std::size_t k) {
