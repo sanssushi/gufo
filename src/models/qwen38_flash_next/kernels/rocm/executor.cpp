@@ -3492,32 +3492,33 @@ bool Executor::DefaultLinearAttention(const DeviceLayer& l,
       rows.count = checkpoint.count;
       for (std::uint32_t i = 0; i < checkpoint.count; ++i)
         rows.tokens[i] = checkpoint.tokens[i];
-      if (quant_ssm) {
-        convolved = DenseQuantF16SsmGemm(
-            l.ssm_in.type, l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-            l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
-            n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
-            stream_, rows);
-      } else {
-        // The Z rows feed only the output norm: the side stream computes them
-        // beside the convolution boundary, the alpha/beta GEMM and the
-        // recurrence; the epilogue waits for them before it reads z. With the
-        // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
-        // pp2048 and pp4096 within 1 %.
-        convolved = DenseF16SsmGemm(
-            l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-            l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
-            n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
-            stream_, rows, side_stream_, side_start_);
-        if (convolved) {
-          if (!Check(hipEventRecord(side_done_, side_stream_),
-                     "side stream join", error_msg)) {
-            (void)hipStreamSynchronize(side_stream_);
-            return false;
-          }
-          z_ready = side_done_;
-          z_join.event = side_done_;
+      // The Z rows feed only the output norm: the side stream computes them
+      // beside the convolution boundary, the alpha/beta GEMM and the
+      // recurrence; the epilogue waits for them before it reads z. With the
+      // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
+      // pp2048 and pp4096 within 1 %.
+      convolved =
+          quant_ssm
+              ? DenseQuantF16SsmGemm(l.ssm_in.type, l.ssm_in.data,
+                                     static_cast<const __half*>(s_.x_half),
+                                     l.ssm_conv1d.f32(), s.conv_state, s_.qkvz,
+                                     s_.conv_scratch, n_tokens, l.ssm_in.rows,
+                                     l.ssm_in.cols, channels, c.ssm_conv_kernel,
+                                     stream_, rows, side_stream_, side_start_)
+              : DenseF16SsmGemm(l.ssm_in.data,
+                                static_cast<const __half*>(s_.x_half),
+                                l.ssm_conv1d.f32(), s.conv_state, s_.qkvz,
+                                s_.conv_scratch, n_tokens, l.ssm_in.rows,
+                                l.ssm_in.cols, channels, c.ssm_conv_kernel,
+                                stream_, rows, side_stream_, side_start_);
+      if (convolved) {
+        if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
+                   error_msg)) {
+          (void)hipStreamSynchronize(side_stream_);
+          return false;
         }
+        z_ready = side_done_;
+        z_join.event = side_done_;
       }
     }
     if (!projections_ready && !convolved &&
@@ -3986,12 +3987,18 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
-  // Only the Q8_0 shared expert overlaps (see DefaultMoeFfn).
-  const bool overlap = (ExpertMatrixRows(n_tokens) ||
-                        (decode_overlap_ && n_tokens <= kVecBatch)) &&
-                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
+  const auto side_stream_type = [](const DeviceTensor& t) {
+    return t.format_state == nullptr && t.type != GgmlType::kF32 &&
+           t.type != GgmlType::kF16 && t.type != GgmlType::kBF16;
+  };
+  const bool q8_shared = l.shexp_gate.type == GgmlType::kQ8_0 &&
+                         l.shexp_up.type == GgmlType::kQ8_0 &&
+                         l.shexp_down.type == GgmlType::kQ8_0;
+  const bool overlap =
+      !last_only &&
+      ((ExpertMatrixRows(n_tokens) && side_stream_type(l.shexp_gate) &&
+        side_stream_type(l.shexp_up) && side_stream_type(l.shexp_down)) ||
+       (decode_overlap_ && n_tokens <= kVecBatch && q8_shared));
   const ext::qwen::flash_next::MoeRouting routing{
       s_.ids,
       s_.weights,
@@ -4056,9 +4063,8 @@ bool Executor::DefaultMoeFfn(const DeviceLayer& l,
   // the workload: both paths read weights and can contend for DRAM. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
   // main-stream work may use s_.x_q8t before JoinSide.
-  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
-  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
-  // stream.
+  // Quantized projections use stream_; unquantized BLAS handles are bound to
+  // the main stream. The decode calibration applies only to Q8_0 experts.
   // A decode pass replays from a captured graph, so the fork and join below
   // must stay inside the capture region: side_stream_ joins the capture
   // through side_start_, and the main stream joins back through side_done_.
