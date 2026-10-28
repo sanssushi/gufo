@@ -3536,31 +3536,31 @@ bool Executor::DefaultLinearAttention(const DeviceLayer& l,
       if (!StageGroup(jobs, {x, n_tokens, 1, nullptr}, n_tokens, error_msg))
         return false;
     } else {
-    // The convolution consumes QKV only, so a mixed-type layer can fuse it
-    // into the standalone QKV projection; the independently typed gate
-    // stays a separate projection. Speculative rows need every raw QKV row
-    // and keep the separate convolution path.
-    if (!speculative && WidePrefill(n_tokens) &&
-        n_tokens <= options_.max_batch && KQuantWmmaType(l.ssm_qkv.type) &&
-        l.ssm_qkv.cols <= model_->max_half_cols()) {
-      PrepareHalfInput(x, n_tokens, l.ssm_qkv.cols);
-      PassCheckpoints rows;
-      rows.count = checkpoint.count;
-      for (std::uint32_t i = 0; i < checkpoint.count; ++i)
-        rows.tokens[i] = checkpoint.tokens[i];
-      convolved = DenseQuantF16SsmGemm(
-          l.ssm_qkv.type, l.ssm_qkv.data, static_cast<const __half*>(s_.x_half),
-          l.ssm_conv1d.f32(), s.conv_state, s_.qkv, s_.conv_scratch, n_tokens,
-          l.ssm_qkv.rows, l.ssm_qkv.cols, channels, c.ssm_conv_kernel, stream_,
-          rows);
-    }
-    Q8Input xq;
-    if (!QuantizeFor({&l.ssm_qkv, &l.ssm_gate}, x, n_tokens, c.hidden_size, &xq,
-                     error_msg) ||
-        (!convolved && !Dense(l.ssm_qkv, xq, s_.qkv, error_msg)) ||
-        !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
-      return false;
-    }
+      // The convolution consumes QKV only, so a mixed-type layer can fuse it
+      // into the standalone QKV projection; the independently typed gate
+      // stays a separate projection. Speculative rows need every raw QKV row
+      // and keep the separate convolution path.
+      if (!speculative && WidePrefill(n_tokens) &&
+          n_tokens <= options_.max_batch && KQuantWmmaType(l.ssm_qkv.type) &&
+          l.ssm_qkv.cols <= model_->max_half_cols()) {
+        PrepareHalfInput(x, n_tokens, l.ssm_qkv.cols);
+        PassCheckpoints rows;
+        rows.count = checkpoint.count;
+        for (std::uint32_t i = 0; i < checkpoint.count; ++i)
+          rows.tokens[i] = checkpoint.tokens[i];
+        convolved = DenseQuantF16SsmGemm(
+            l.ssm_qkv.type, l.ssm_qkv.data,
+            static_cast<const __half*>(s_.x_half), l.ssm_conv1d.f32(),
+            s.conv_state, s_.qkv, s_.conv_scratch, n_tokens, l.ssm_qkv.rows,
+            l.ssm_qkv.cols, channels, c.ssm_conv_kernel, stream_, rows);
+      }
+      Q8Input xq;
+      if (!QuantizeFor({&l.ssm_qkv, &l.ssm_gate}, x, n_tokens, c.hidden_size,
+                       &xq, error_msg) ||
+          (!convolved && !Dense(l.ssm_qkv, xq, s_.qkv, error_msg)) ||
+          !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
+        return false;
+      }
     }
   }
   if (!projections_ready &&
@@ -4146,8 +4146,38 @@ bool Executor::DefaultMoeFfn(const DeviceLayer& l,
     try {
       const std::size_t offset =
           static_cast<std::size_t>(n_tokens - 1) * c.hidden_size;
-      const bool ok = MoeExperts(l, x + offset, out + offset, 1, error_msg);
+      // The buckets keep the prompt batch's padded size, but only this
+      // row's slots scatter: every other assignment in them is stale from
+      // the previous compaction, and the GEMM epilogue would scatter those
+      // rows into live output slots. Clear the maps; the fresh scatter
+      // rewrites its own rows and the padding clear redoes the rest.
+      const std::size_t compact_bytes =
+          RoutedCompactRows(
+              static_cast<std::size_t>(n_tokens) * c.num_experts_used,
+              c.num_experts) *
+          sizeof(std::int32_t);
+      const bool cleared =
+          Check(hipMemsetAsync(s_.rows_token, 0xFF, compact_bytes),
+                "catch-up routed map clear", error_msg) &&
+          Check(hipMemsetAsync(s_.rows_slot, 0xFF, compact_bytes),
+                "catch-up routed map clear", error_msg);
+      // RowScratch advances down_e by whole floats, but this route packs F16
+      // down rows (half the bytes): land the one-token GEMM's output on the
+      // caller's F16-stride view so the combine reads the same rows.
+      s_.down_e =
+          reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(s_.down_e) -
+                                   static_cast<std::size_t>(n_tokens - 1) *
+                                       c.num_experts_used * c.hidden_size * 2);
+      const bool ok =
+          cleared && MoeExperts(l, x + offset, out + offset, 1, error_msg);
+      // MoeExperts deferred its epilogue to the combine over the caller's
+      // scratch view; UseScratch drops the pending flag on the restore and
+      // the catch-up row would keep its attention value instead.
+      const bool pending = moe_pending_;
+      const bool f32_rows = moe_f32_rows_;
       UseScratch(base);
+      moe_pending_ = pending;
+      moe_f32_rows_ = f32_rows;
       return ok;
     } catch (...) {
       UseScratch(base);
@@ -4251,8 +4281,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // The wide pair leaves raw gate/up rows for the down projection's
     // quantize to activate in one pass (no SwigluKernel round trip); the
     // decode tiers fuse their own SwiGLU and keep it.
-    const bool pair_silu = ExpertMatrixRows(n_tokens) &&
-                           l.ffn_down_exps.format_state == nullptr;
+    const bool pair_silu =
+        ExpertMatrixRows(n_tokens) && l.ffn_down_exps.format_state == nullptr;
     if (!GatedExperts(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
                       n_tokens, used, error_msg, !pair_silu)) {
       return false;
@@ -6442,11 +6472,55 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   if (!Moe(l, s_.mixed, s_.block_out, tail_rows, error_msg, last_only)) {
     return false;
   }
+  if (trace && !trace->moe_router.empty() &&
+      !copy_trace(s_.router + static_cast<std::size_t>(tail_rows - 1) *
+                                  (c.num_experts + 1),
+                  trace->moe_router))
+    return false;
+  if (trace && !trace->moe_ids.empty() &&
+      !copy_trace(reinterpret_cast<const float*>(
+                      s_.ids + static_cast<std::size_t>(tail_rows - 1) *
+                                   c.num_experts_used),
+                  trace->moe_ids))
+    return false;
+  if (trace && !trace->moe_weights.empty() &&
+      !copy_trace(s_.weights + static_cast<std::size_t>(tail_rows - 1) *
+                                   c.num_experts_used,
+                  trace->moe_weights))
+    return false;
+  if (trace && !trace->moe_shared.empty() &&
+      !copy_trace(s_.shexp_out +
+                      static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
+                  trace->moe_shared))
+    return false;
+  if (trace && !trace->moe_inject.empty() &&
+      !copy_trace(s_.inject + static_cast<std::size_t>(tail_rows - 1) *
+                                  c.hc_count * inject_parts_,
+                  trace->moe_inject))
+    return false;
   Combine(s_.mtp_res, nullptr, tail_rows);
   if (trace &&
       !copy_trace(s_.block_out +
                       static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
                   trace->ffn_output))
+    return false;
+  if (trace && !trace->ffn_gate.empty() &&
+      !Check(
+          hipMemcpyAsync(trace->ffn_gate.data(),
+                         s_.gate_e + static_cast<std::size_t>(tail_rows - 1) *
+                                         c.num_experts_used * c.expert_ff,
+                         trace->ffn_gate.size() * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "MTP expert gate download", error_msg))
+    return false;
+  if (trace && !trace->ffn_shared.empty() &&
+      !Check(
+          hipMemcpyAsync(trace->ffn_shared.data(),
+                         s_.shexp_up + static_cast<std::size_t>(tail_rows - 1) *
+                                           c.shared_expert_ff,
+                         trace->ffn_shared.size() * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "MTP shared gate download", error_msg))
     return false;
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->hidden))
     return false;

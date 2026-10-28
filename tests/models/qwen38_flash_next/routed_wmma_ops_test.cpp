@@ -1094,8 +1094,9 @@ void CheckVectorGrouping(bool down = false) {
         q::Swiglu(scalar + guard, paired_scalar + guard, count, nullptr);
         const auto gated_reference = Download(scalar, dirty.size());
         const auto gated_widths =
-            !down && formats[f] == q::WeightType::kQ4_K
-                ? std::vector{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 31, 32, 33, 64}
+            !down && qfn_mmq_moe_gated_batch_type(
+                         static_cast<int>(formats[f])) != 0
+                ? std::vector{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 31, 32, 33, 64}
                 : std::vector{1, 2, 3, 4, 5, 6, 7, 8};
         for (int n : gated_widths) {
           CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
@@ -1164,6 +1165,196 @@ void CheckVectorGrouping(bool down = false) {
   }
   CheckHip(hipFree(dx), "grouping input free");
   CheckHip(hipFree(di), "grouping IDs free");
+}
+
+/// A routed call with one expert and one slot per token keeps its per-token
+/// ids: inactive slots write zero and every routed format, including Q5_1,
+/// takes that dispatch. Only the dense entry has the all-rows-share-one-expert
+/// contract.
+void CheckSingleExpertRouted() {
+  constexpr int rows = 2;
+  constexpr int cols = 2560;
+  constexpr int tokens = 64;
+  constexpr int used = 1;
+  constexpr std::size_t guard = 8;
+  constexpr float poison = -1234567.0F;
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 0x51E1E7U;
+  for (float& v : x)
+    v = Uniform(&seed, 2.0F);
+  auto* dx = Upload(x);
+  std::vector<std::int32_t> ids(tokens, 0);
+  for (int t = 3; t < tokens; t += 9)
+    ids[t] = -1;
+  auto* di = Upload(ids);
+  const std::vector<float> dirty(std::size_t{tokens} * used * rows + guard,
+                                 poison);
+  auto* out = Upload(dirty);
+  const std::vector<q::WeightType> formats = {
+      q::WeightType::kQ4_K, q::WeightType::kQ5_1, q::WeightType::kQ2_0,
+      q::WeightType::kIQ4_XS};
+  for (std::size_t f = 0; f < formats.size(); ++f) {
+    const Experts w =
+        MakeExperts(formats[f], 1, rows, cols, 0x9E1100U + 17U * f);
+    auto* d_w = Upload(w.packed);
+    std::vector<float> scalar(dirty.size(), poison);
+    for (int t = 0; t < tokens; ++t) {
+      CheckHip(hipMemcpy(out, dirty.data(), dirty.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison single-expert reference");
+      if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), d_w, dx + t * cols,
+                          di + t, out + guard, rows, cols, 1, 1, used,
+                          nullptr) != 0)
+        throw std::runtime_error("single-expert scalar routed call failed");
+      CheckHip(hipMemcpy(scalar.data() + t * used * rows, out + guard,
+                         used * rows * sizeof(float), hipMemcpyDeviceToHost),
+               "single-expert scalar output");
+    }
+    for (int n : {9, 64}) {
+      CheckHip(hipMemcpy(out, dirty.data(), dirty.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison single-expert batch");
+      if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), d_w, dx, di,
+                          out + guard, rows, cols, n, 1, used, nullptr) != 0)
+        throw std::runtime_error("single-expert routed batch failed");
+      const auto batch = Download(out, dirty.size());
+      if (std::memcmp(scalar.data(), batch.data() + guard,
+                      std::size_t{n} * used * rows * sizeof(float)) != 0)
+        throw std::runtime_error("single-expert routed rows differ at width " +
+                                 std::to_string(n));
+      for (std::size_t i = 0; i < batch.size(); ++i)
+        if ((i < guard || i >= guard + std::size_t{n} * used * rows) &&
+            batch[i] != poison)
+          throw std::runtime_error("single-expert routed guard changed");
+    }
+    CheckHip(hipFree(d_w), "single-expert weight free");
+  }
+  std::cout << "single-expert routed: per-token ids and Q5_1 exact at 9/64 "
+               "rows\n";
+  for (void* p : {static_cast<void*>(dx), static_cast<void*>(di),
+                  static_cast<void*>(out)})
+    CheckHip(hipFree(p), "single-expert scratch free");
+}
+
+/// Wide verification groups equal experts across the complete batch: one
+/// decoded weight fragment serves every token of its group. A disjoint route
+/// leaves one token per group, the single-token route, and a shared route
+/// puts eight tokens in a group that straddles the eight-row chunk boundary.
+/// Both must keep the separate projections plus SwiGLU byte for byte, as must
+/// an eight-row chunked pass over the same rows.
+void CheckWideGatedBatch() {
+  constexpr int cols = 2560;
+  constexpr int rows = 65;
+  constexpr int experts = 64;
+  constexpr int used = 1;
+  constexpr int tokens = 64;
+  constexpr std::size_t guard = 16;
+  constexpr float poison = -1234567.0F;
+  const std::vector<q::WeightType> formats = {
+      q::WeightType::kQ4_K,  q::WeightType::kIQ2_XXS, q::WeightType::kIQ2_XS,
+      q::WeightType::kIQ2_S, q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+      q::WeightType::kIQ4_XS};
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 0x9A5U;
+  for (std::size_t i = 0; i < x.size(); ++i)
+    x[i] = Uniform(&seed, (i / cols) % 2 ? 1.0F / 128.0F : 2.0F);
+  auto* dx = Upload(x);
+  const std::size_t count = std::size_t{tokens} * used * rows;
+  const std::vector<float> dirty(count + 2 * guard, poison);
+  auto* batch = Upload(dirty);
+  auto* chunks = Upload(dirty);
+  auto* gate_ref = Upload(dirty);
+  auto* up_ref = Upload(dirty);
+  const auto check_output = [&](const float* device, int n) {
+    const auto output = Download(device, dirty.size());
+    for (std::size_t i = 0; i < output.size(); ++i) {
+      if (i < guard || i >= guard + std::size_t{n} * used * rows) {
+        if (output[i] != poison)
+          throw std::runtime_error("wide gated output guard changed");
+        continue;
+      }
+      if (!std::isfinite(output[i]) || output[i] == poison)
+        throw std::runtime_error("wide gated output row is not finite");
+    }
+    return output;
+  };
+  for (std::size_t f = 0; f < formats.size(); ++f) {
+    auto gate = MakeExperts(formats[f], experts, rows, cols, 41 + 2 * f);
+    auto up = MakeExperts(formats[f], experts, rows, cols, 71 + 2 * f);
+    // One nonfinite scale per projection: each must clamp before SwiGLU, as
+    // the separate projections do.
+    const __half infinite_scale = __float2half(INFINITY);
+    const std::size_t scale = QuantScaleOffset(formats[f]);
+    std::memcpy(gate.packed.data() + scale, &infinite_scale,
+                sizeof(infinite_scale));
+    std::memcpy(up.packed.data() + scale + QuantBlockBytes(formats[f]),
+                &infinite_scale, sizeof(infinite_scale));
+    auto* wg = Upload(gate.packed);
+    auto* wu = Upload(up.packed);
+    for (int shared : {0, 1}) {
+      std::vector<std::int32_t> route(tokens);
+      for (int t = 0; t < tokens; ++t)
+        route[t] = shared ? t % 6 : t;
+      auto* dr = Upload(route);
+      CheckHip(hipMemcpy(gate_ref, dirty.data(), dirty.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison wide gate reference");
+      CheckHip(hipMemcpy(up_ref, dirty.data(), dirty.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison wide up reference");
+      if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), wg, dx, dr,
+                          gate_ref + guard, rows, cols, tokens, experts, used,
+                          nullptr) != 0 ||
+          qfn_mmq_moe_vec(static_cast<int>(formats[f]), wu, dx, dr,
+                          up_ref + guard, rows, cols, tokens, experts, used,
+                          nullptr) != 0)
+        throw std::runtime_error("wide gated reference projection failed");
+      q::Swiglu(gate_ref + guard, up_ref + guard,
+                static_cast<std::size_t>(tokens) * used * rows, nullptr);
+      const auto reference = check_output(gate_ref, tokens);
+      for (int n : {9, 17, 33, 64}) {
+        CheckHip(hipMemcpy(chunks, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison eight-row gated chunks");
+        for (int t = 0; t < n; t += 8) {
+          const int chunk = std::min(8, n - t);
+          if (qfn_mmq_moe_gated_vec(
+                  static_cast<int>(formats[f]), wg, wu, dx + t * cols,
+                  dr + t * used, chunks + guard + std::size_t{t} * used * rows,
+                  rows, cols, chunk, experts, used, nullptr) != 0)
+            throw std::runtime_error("eight-row gated chunk failed");
+        }
+        const auto chunked = check_output(chunks, n);
+        if (std::memcmp(reference.data() + guard, chunked.data() + guard,
+                        std::size_t{n} * used * rows * sizeof(float)) != 0)
+          throw std::runtime_error(
+              "eight-row gated chunks differ from the separate projections");
+        CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison wide gated output");
+        if (qfn_mmq_moe_gated_vec(static_cast<int>(formats[f]), wg, wu, dx, dr,
+                                  batch + guard, rows, cols, n, experts, used,
+                                  nullptr) != 0)
+          throw std::runtime_error("wide gated batch failed");
+        const auto wide = check_output(batch, n);
+        if (std::memcmp(reference.data() + guard, wide.data() + guard,
+                        std::size_t{n} * used * rows * sizeof(float)) != 0)
+          throw std::runtime_error("wide gated batch changed " +
+                                   std::string(TypeName(formats[f])) +
+                                   (shared != 0 ? " shared" : " disjoint") +
+                                   " routing at width " + std::to_string(n));
+      }
+      CheckHip(hipFree(dr), "wide gated IDs free");
+    }
+    CheckHip(hipFree(wu), "wide up weight free");
+    CheckHip(hipFree(wg), "wide gate weight free");
+  }
+  std::cout << "wide gated batch: disjoint and shared groups straddling the "
+               "eight-row boundary exact at 9/17/33/64 rows\n";
+  for (void* p : {static_cast<void*>(dx), static_cast<void*>(batch),
+                  static_cast<void*>(chunks), static_cast<void*>(gate_ref),
+                  static_cast<void*>(up_ref)})
+    CheckHip(hipFree(p), "wide gated scratch free");
 }
 
 /// The decode shared-expert pair runs one gated vector launch with a single
@@ -1926,6 +2117,8 @@ int main() {
     ReportVectorAccuracy();
     CheckVectorGrouping();
     CheckVectorGrouping(true);
+    CheckSingleExpertRouted();
+    CheckWideGatedBatch();
     CheckDenseGatedExact();
     for (q::WeightType type :
          {q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ6_K,

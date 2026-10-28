@@ -46,7 +46,8 @@ struct Arena {
 };
 struct Trace {
   std::vector<float> norm, fused, attention, hidden, head, ffn_input,
-      ffn_output;
+      ffn_output, ffn_gate, ffn_shared, moe_router, moe_ids, moe_weights,
+      moe_shared, moe_inject;
   q::MtpTrace spans;
   explicit Trace(const q::Config& c)
       : norm(c.HcDim()),
@@ -56,7 +57,17 @@ struct Trace {
         head(c.hidden_size),
         ffn_input(c.hidden_size),
         ffn_output(c.hidden_size),
-        spans{norm, fused, attention, hidden, head, ffn_input, ffn_output} {}
+        ffn_gate(std::size_t{c.num_experts_used} * c.expert_ff),
+        ffn_shared(c.shared_expert_ff),
+        moe_router(std::size_t{c.num_experts} + 1),
+        moe_ids(c.num_experts_used),
+        moe_weights(c.num_experts_used),
+        moe_shared(c.hidden_size),
+        moe_inject(std::size_t{c.hc_count} *
+                   q::rocm::HcInjectPartsVec4(c.hidden_size)),
+        spans{norm,      fused,       attention,  hidden,     head,
+              ffn_input, ffn_output,  ffn_gate,   ffn_shared, moe_router,
+              moe_ids,   moe_weights, moe_shared, moe_inject} {}
 };
 void Compare(std::span<const float> actual, std::span<const float> expected,
              const char* stage, double limit) {
@@ -200,20 +211,29 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       Compare(gpu.norm, cpu.norm, "full-hidden-norm", 2e-6);
       Compare(gpu.fused, cpu.fused, "split-fusion", 0.002);
       Compare(gpu.attention, cpu.attention, "attention-state", 0.002);
+      Compare(gpu.ffn_input, cpu.ffn_input, "ffn-mix", 0.002);
+      Compare(gpu.ffn_gate, cpu.ffn_gate, "ffn-gate", 0.002);
+      Compare(gpu.ffn_shared, cpu.ffn_shared, "ffn-shared", 0.002);
+      Compare(gpu.ffn_output, cpu.ffn_output, "ffn-experts", 0.00005);
       Compare(gpu.hidden, cpu.hidden, "recursive-carry", 0.00005);
       Compare(gpu.head, cpu.head, "head-mixer", 0.00005);
-      // Full Q8 vocabulary baseline uses the exact production dot arithmetic;
-      // independent host sorting checks candidate selection and vocabulary
-      // tail.
+      // Full vocabulary baseline uses the exact production dot arithmetic for
+      // the head's own type; independent host sorting checks candidate
+      // selection and vocabulary tail.
       Hip(hipMemcpyAsync(head_input, gpu.head.data(),
                          gpu.head.size() * sizeof(float), hipMemcpyHostToDevice,
                          stream));
-      Require(qfn_mmq_quantize_q8_1(head_input, quantized, 1, c.hidden_size,
-                                    stream) == 0 &&
-                  qfn_mmq_q8_0_dense_vec_preq(device.output().data, nullptr,
-                                              quantized, logits, c.vocab_size,
-                                              1, c.hidden_size, stream) == 0,
-              "full Q8 oracle projection failed");
+      const bool q8_head = device.output().type == gufo::core::GgmlType::kQ8_0;
+      Require(q8_head ? (qfn_mmq_quantize_q8_1(head_input, quantized, 1,
+                                               c.hidden_size, stream) == 0 &&
+                         qfn_mmq_q8_0_dense_vec_preq(
+                             device.output().data, nullptr, quantized, logits,
+                             c.vocab_size, 1, c.hidden_size, stream) == 0)
+                      : qfn_mmq_dense_vec(
+                            static_cast<int>(device.output().type),
+                            device.output().data, head_input, logits,
+                            c.vocab_size, 1, c.hidden_size, stream) == 0,
+              "full vocabulary oracle projection failed");
       Hip(hipMemcpyAsync(all_logits.data(), logits,
                          all_logits.size() * sizeof(float),
                          hipMemcpyDeviceToHost, stream));
@@ -422,11 +442,19 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
               exec.MtpForward(*tail, tokens, 0, {.trace = &tail_row.spans},
                               &error, source),
           error);
+      Hip(hipStreamSynchronize(stream));
       exact(full_row.norm, tail_row.norm, "wide hidden norm");
       exact(full_row.fused, tail_row.fused, "wide fusion");
       exact(full_row.attention, tail_row.attention, "wide attention");
       exact(full_row.ffn_input, tail_row.ffn_input, "wide FFN input");
       exact(full_row.ffn_output, tail_row.ffn_output, "wide FFN output");
+      exact(full_row.moe_router, tail_row.moe_router, "wide FFN router");
+      exact(full_row.moe_ids, tail_row.moe_ids, "wide FFN ids");
+      exact(full_row.moe_weights, tail_row.moe_weights, "wide FFN weights");
+      exact(full_row.ffn_shared, tail_row.ffn_shared, "wide FFN shexp_up");
+      exact(full_row.moe_shared, tail_row.moe_shared, "wide FFN shared");
+      exact(full_row.moe_inject, tail_row.moe_inject, "wide FFN inject");
+      exact(full_row.ffn_gate, tail_row.ffn_gate, "wide FFN gate");
       exact(full_row.hidden, tail_row.hidden, "wide recursive carry");
       exact(full_row.head, tail_row.head, "wide head mixer");
       const std::array head{
@@ -451,8 +479,9 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
     std::puts("MTP catch-up: full/tail candidates and recursive stages exact");
   }
   std::puts(
-      "MTP oracle PASS: full-width norm, byte-exact split, attention, "
-      "recursive carry, full-Q8 head, image IDs and independent batches");
+      "MTP oracle PASS: full-width norm, byte-exact split, attention, FFN "
+      "mix, FFN gate, FFN shared, FFN experts, recursive carry, "
+      "full-vocabulary head, image IDs and independent batches");
 }
 
 // Model-level cost calibration. Restore identical real states for every

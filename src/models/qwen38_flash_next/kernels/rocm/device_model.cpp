@@ -459,8 +459,7 @@ struct Uploader {
       const bool quantized =
           qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->format_state != nullptr ||
-            t->type != type ||
+        if (t->empty() || t->format_state != nullptr || t->type != type ||
             t->cols != (*parts.begin())->cols || !quantized) {
           return false;
         }
