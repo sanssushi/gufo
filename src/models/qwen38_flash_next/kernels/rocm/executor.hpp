@@ -485,14 +485,18 @@ private:
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
   bool RouteHints(std::uint32_t n_tokens, std::string* error_msg) const;
-  /// Routed gate/up projections followed by SwiGLU.
+  /// Routed gate/up projections followed by SwiGLU (`swiglu` false leaves
+  /// raw gate/up rows for the down projection's quantize to activate).
   bool GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                     const float* x, const std::int32_t* ids, float* out,
                     std::uint32_t n_tokens, std::uint32_t n_used,
-                    std::string* error_msg) const;
+                    std::string* error_msg, bool swiglu = true) const;
+  /// With non-null `silu_up`, x and silu_up are the raw gate/up pair and
+  /// the tiled projection forms their SwiGLU in its activation quantize.
   bool Experts(const DeviceTensor& w, const float* x, const std::int32_t* ids,
                float* out, std::uint32_t n_rows, std::uint32_t n_used,
-               std::uint32_t n_tokens, std::string* error_msg) const;
+               std::uint32_t n_tokens, std::string* error_msg,
+               const float* silu_up = nullptr) const;
   /// `normed` says the previous Combine already produced m's grouped norm
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
   /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
@@ -779,6 +783,7 @@ private:
   mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
+  mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
@@ -793,6 +798,8 @@ private:
   /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.
   mutable bool defer_residual_{false};
   mutable bool res_deferred_{false};
+  /// The pending epilogue reads F32 expert rows (the MMQ down projection).
+  mutable bool moe_f32_rows_{false};
   /// Set by GatedDense when s_.shexp_half holds the SwiGLU rows its F16
   /// down projection reads.
   mutable bool shexp_half_ready_{false};

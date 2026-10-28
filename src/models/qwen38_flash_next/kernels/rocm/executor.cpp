@@ -76,6 +76,12 @@ WeightType SmallType(GgmlType type) {
   }
 }
 
+// The fused gate/up SwiGLU vector path covers every routed expert format
+// except Q5_1 (down projections only); the adapter owns that set.
+bool GatedMoeType(GgmlType type) {
+  return qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
+}
+
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
@@ -1793,6 +1799,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   routed_64_tiles_ = 0;
   routed_pair_tiles_ = 0;
   routed_pair_offset_ = 0;
+  routed_pair_rows_ = 64;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -1827,6 +1834,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
     routed_pair_offset_ = n_tiles;
     append(128);
     routed_pair_tiles_ = n_tiles - routed_pair_offset_;
+    routed_pair_rows_ = 128;
   } else {
     append(routed_tile_rows_);
     routed_n_tiles_ = n_tiles;
@@ -1842,7 +1850,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
 bool Executor::Experts(const DeviceTensor& w, const float* x,
                        const std::int32_t* ids, float* out,
                        std::uint32_t n_rows, std::uint32_t n_used,
-                       std::uint32_t n_tokens, std::string* error_msg) const {
+                       std::uint32_t n_tokens, std::string* error_msg,
+                       const float* silu_up) const {
   const int M = static_cast<int>(w.rows);
   const int K = static_cast<int>(w.cols);
   const int E = static_cast<int>(w.experts);
@@ -1861,23 +1870,12 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   if (!tiled) {
     rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
                          E, U, stream_);
+  } else if (silu_up != nullptr) {
+    rc = qfn_mmq_moe_raw_silu(static_cast<int>(w.type), w.data, x, silu_up, ids,
+                              out, M, K, T, E, U, stream_);
   } else {
-    switch (w.type) {
-      case GgmlType::kQ4_K:
-        rc = qfn_mmq_q4_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_K:
-        rc = qfn_mmq_q5_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ5_1:
-        rc = qfn_mmq_q5_1_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      case GgmlType::kQ8_0:
-        rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
-        break;
-      default:
-        break;
-    }
+    rc = qfn_mmq_moe_raw(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
+                         E, U, stream_);
   }
   if (rc != 0) {
     AssignError(error_msg, "expert GEMM failed");
@@ -1889,12 +1887,11 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
 bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                             const float* x, const std::int32_t* ids, float* out,
                             std::uint32_t n_tokens, std::uint32_t n_used,
-                            std::string* error_msg) const {
+                            std::string* error_msg, bool swiglu) const {
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
-      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
-       a.type == GgmlType::kQ8_0)) {
+      GatedMoeType(a.type)) {
     // The shared expert quantized the same rows (or their producer did).
     const void* ready = ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
@@ -1922,14 +1919,14 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
       AssignError(error_msg, "expert vector pair GEMM failed");
       return false;
     }
-  } else if (same_shape && a.type == GgmlType::kQ4_K) {
-    // The wide Q4_K path shares its gather and tiled quantization as well.
+  } else if (same_shape) {
+    // The wide pair shares its gather and tiled quantization as well.
     RoutedHints(a, n_tokens);
-    if (qfn_mmq_q4_K_moe_pair_unique(
-            a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
-            static_cast<int>(a.cols), static_cast<int>(n_tokens),
-            static_cast<int>(a.experts), static_cast<int>(n_used),
-            stream_) != 0) {
+    if (qfn_mmq_moe_pair_unique(
+            static_cast<int>(a.type), a.data, b.data, x, ids, out, s_.up_e,
+            static_cast<int>(a.rows), static_cast<int>(a.cols),
+            static_cast<int>(n_tokens), static_cast<int>(a.experts),
+            static_cast<int>(n_used), stream_) != 0) {
       AssignError(error_msg, "expert pair GEMM failed");
       return false;
     }
@@ -1938,8 +1935,10 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                       error_msg)) {
     return false;
   }
-  Swiglu(out, s_.up_e, static_cast<std::size_t>(n_tokens) * n_used * a.rows,
-         stream_);
+  if (swiglu) {
+    Swiglu(out, s_.up_e, static_cast<std::size_t>(n_tokens) * n_used * a.rows,
+           stream_);
+  }
   return true;
 }
 
@@ -1967,32 +1966,55 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
   const bool defer = defer_residual_;
   defer_residual_ = false;
-  const bool deferred = res_deferred_;
+  bool deferred = res_deferred_;
   res_deferred_ = false;
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe), and with it
     // the previous combine's residual update when that was deferred too.
     moe_pending_ = false;
-    const auto* down = reinterpret_cast<const __half*>(s_.down_e);
-    const float* fused_w = deferred ? fused_inject : nullptr;
-    if (wide_mixer_ && MatrixRows(n_tokens) &&
-        HcCombineMoeF16(
-            res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
-            c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
-            gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
-            c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
-            deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
-      inject_fused_ = fused_w;
-      return;
-    }
-    if (deferred) {
-      HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
+    if (moe_f32_rows_) {
+      if (deferred) {
+        // HcCombineMoeF32 does not fold the deferred update: settle it
+        // here, before the epilogue or combine rewrites s_.block_out, and
+        // clear the flag so the tail apply below does not repeat it.
+        HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens,
+                        c.hidden_size, stream_);
+        deferred = false;
+      }
+      if (wide_mixer_ && MatrixRows(n_tokens) &&
+          HcCombineMoeF32(res, s_.down_e, s_.weights, s_.shexp_out,
+                          s_.router + c.num_experts, c.num_experts + 1,
+                          c.num_experts_used, s_.inject, inject_parts_, gamma,
+                          s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
+                          c.hc_count, c.rms_eps, stream_)) {
+        return;
+      }
+      MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
+                      s_.router + c.num_experts, c.num_experts + 1,
+                      s_.block_out, n_tokens, c.num_experts_used, c.hidden_size,
                       stream_);
+    } else {
+      const auto* down = reinterpret_cast<const __half*>(s_.down_e);
+      const float* fused_w = deferred ? fused_inject : nullptr;
+      if (wide_mixer_ && MatrixRows(n_tokens) &&
+          HcCombineMoeF16(
+              res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
+              c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
+              gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+              c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
+              deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
+        inject_fused_ = fused_w;
+        return;
+      }
+      if (deferred) {
+        HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens,
+                        c.hidden_size, stream_);
+      }
+      MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
+                         s_.router + c.num_experts, c.num_experts + 1,
+                         s_.block_out, n_tokens, c.num_experts_used,
+                         c.hidden_size, stream_);
     }
-    MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
-                       s_.router + c.num_experts, c.num_experts + 1,
-                       s_.block_out, n_tokens, c.num_experts_used,
-                       c.hidden_size, stream_);
   }
   if (deferred) {
     // Only a fused MoE combine follows a deferring one; settle the update
@@ -2796,12 +2818,9 @@ bool Executor::JoinSide(std::string* error_msg) const {
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
   return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-          l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+         RoutedF16Type(l.ffn_gate_exps.type, c.hidden_size) &&
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
-         (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-          l.ffn_down_exps.type == GgmlType::kQ8_0) &&
-         c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+         RoutedF16Type(l.ffn_down_exps.type, c.expert_ff);
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
@@ -2815,7 +2834,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   }
   // Tiled batches take the WMMA route: assignments compacted by expert
   // into 16-row padded buckets, token rows narrowed to F16 once, then the
-  // F16 matrix-core GEMM per (expert, row tile).
+  // F16 matrix-core GEMM per (expert, row tile). Every routed expert format
+  // takes this route (the RoutedF16Type set); WeightType ids mirror GgmlType.
   const bool wmma_experts = WmmaExperts(l, n_tokens);
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
@@ -2837,16 +2857,14 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Prefill pairs the gate/up projections and applies SwiGLU without
     // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const WeightType gate_type = static_cast<WeightType>(l.ffn_gate_exps.type);
     const bool gated_ok =
         routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
-                  c.expert_ff, c.hidden_size, stream_)
+                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
+                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
@@ -2861,9 +2879,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    const WeightType down_type = static_cast<WeightType>(l.ffn_down_exps.type);
     // Prefill takes the 64-token down tiles: they decode each expert's
     // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;
@@ -2880,13 +2896,17 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   } else {
+    // The wide pair leaves raw gate/up rows for the down projection's
+    // quantize to activate in one pass (no SwigluKernel round trip); the
+    // decode tiers fuse their own SwiGLU and keep it.
+    const bool pair_silu = ExpertMatrixRows(n_tokens);
     if (!GatedExperts(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
-                      n_tokens, used, error_msg)) {
+                      n_tokens, used, error_msg, !pair_silu)) {
       return false;
     }
     // The down projection sees one (token, slot) row per expert id.
     if (!Experts(l.ffn_down_exps, s_.gate_e, s_.ids, s_.down_e, slots, 1,
-                 n_tokens, error_msg)) {
+                 n_tokens, error_msg, pair_silu ? s_.up_e : nullptr)) {
       return false;
     }
   }
@@ -2897,6 +2917,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
     moe_pending_ = out == s_.block_out;
+    moe_f32_rows_ = false;
     if (!moe_pending_) {
       MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e), s_.weights,
                          s_.shexp_out, s_.router + c.num_experts,
@@ -2904,9 +2925,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                          stream_);
     }
   } else if (MatrixRows(n_tokens)) {
-    MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
-                    s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
-                    used, c.hidden_size, stream_);
+    // The MMQ down projection wrote F32 rows; the same combine seam folds
+    // the epilogue in when the FFN block output is the combine's source.
+    moe_pending_ = out == s_.block_out;
+    moe_f32_rows_ = true;
+    if (!moe_pending_) {
+      MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
+                      s_.router + c.num_experts, c.num_experts + 1, out,
+                      n_tokens, used, c.hidden_size, stream_);
+    }
   } else {
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);

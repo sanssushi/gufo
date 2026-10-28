@@ -232,7 +232,7 @@ Result RunLayer(const std::vector<std::uint32_t>& counts, int reps,
       return;
     }
     if (!q::RoutedGatedF16Gemm(d_gate, d_up, q::WeightType::kQ4_K, d_x,
-                               d_tiles + down_tiles, pair_tiles, d_bounds,
+                               d_tiles + down_tiles, pair_tiles, 128, d_bounds,
                                d_rows_token, d_rows_slot, d_mid, kFf, kHidden,
                                nullptr))
       throw std::runtime_error("gated GEMM rejected");
