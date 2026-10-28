@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -127,6 +128,81 @@ double WorstOverRms(const std::vector<float>& reference,
         worst, std::abs(static_cast<double>(reference[i]) - candidate[i]));
   }
   return worst / std::sqrt(ss / static_cast<double>(reference.size()));
+}
+
+std::size_t QuantBlockElements(q::WeightType type) {
+  switch (type) {
+    case q::WeightType::kQ8_0:
+    case q::WeightType::kIQ4_NL:
+      return 32;
+    case q::WeightType::kQ2_0:
+      return 64;
+    default:
+      return 256;
+  }
+}
+
+std::size_t QuantBlockBytes(q::WeightType type) {
+  switch (type) {
+    case q::WeightType::kQ8_0:
+      return 34;
+    case q::WeightType::kQ2_0:
+    case q::WeightType::kIQ4_NL:
+      return 18;
+    case q::WeightType::kQ4_K:
+      return 144;
+    case q::WeightType::kQ5_K:
+      return 176;
+    case q::WeightType::kQ6_K:
+      return 210;
+    case q::WeightType::kIQ2_XXS:
+      return 66;
+    case q::WeightType::kIQ2_XS:
+      return 74;
+    case q::WeightType::kIQ2_S:
+      return 82;
+    case q::WeightType::kIQ3_XXS:
+      return 98;
+    case q::WeightType::kIQ3_S:
+      return 110;
+    case q::WeightType::kIQ4_XS:
+      return 136;
+    default:
+      return 0;
+  }
+}
+
+struct DenseWeights {
+  std::vector<std::uint8_t> packed;
+};
+
+DenseWeights MakeQuant(q::WeightType type, std::size_t m, std::size_t k,
+                       std::uint32_t seed) {
+  const std::size_t elements = QuantBlockElements(type);
+  const std::size_t bytes = QuantBlockBytes(type);
+  const std::size_t blocks = m * (k / elements);
+  DenseWeights w;
+  w.packed.resize(blocks * bytes);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * bytes;
+    for (std::size_t i = 0; i < bytes; ++i)
+      blk[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    const __half d = __float2half(
+        0.03F +
+        0.02F * static_cast<float>(NextRandom(&seed) & 0xFFFFU) / 32768.0F);
+    if (type == q::WeightType::kQ6_K) {
+      std::memcpy(blk + bytes - 2, &d, 2);
+    } else {
+      std::memcpy(blk, &d, 2);
+      if (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K) {
+        const __half dmin = __float2half(
+            0.015F +
+            0.01F * static_cast<float>(NextRandom(&seed) & 0xFFFFU) / 32768.0F);
+        std::memcpy(blk + 2, &dmin, 2);
+      }
+    }
+  }
+  return w;
 }
 
 int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
@@ -317,6 +393,95 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           if (bits != 0x7F7F)
             throw std::runtime_error("padded GDN output overwrote padding");
         }
+      }
+      // A decode epilogue writes the output projection's Q8_1 rows. They must
+      // equal quantizing the stored F32 output, and the prequantized
+      // projection must reproduce the F32 entry for every dense format the
+      // producer feeds.
+      if (kTokens <= 8) {
+        const std::size_t qbytes = qfn_mmq_q8_1_bytes(kTokens, kZ);
+        HipBuffer<std::uint8_t> d_q(qbytes);
+        HipBuffer<std::uint8_t> d_q_ref(qbytes);
+        const std::size_t projection_count = kTokens * 64 + 16;
+        HipBuffer<float> d_projection(projection_count);
+        HipBuffer<float> d_projection_ref(projection_count);
+        CheckHip(hipMemset(d_q.get(), 0xA5, qbytes), "Q8 row guard");
+        Upload(&d_conv_state, conv_state);
+        Upload(&d_state, state);
+        q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
+                         d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
+                         d_dt.get(), d_norm_w.get(), d_conv_state.get(),
+                         d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
+                         d_state.get(), d_out.get(), nullptr, {}, {}, kTokens,
+                         kKHeads, kVHeads, kDim, kKernel, route == 1, false,
+                         kEps, nullptr, nullptr, {}, 0, d_q.get());
+        CheckHip(hipDeviceSynchronize(), "GDN Q8 synchronization");
+        const auto q8_out = Download(&d_out, kOut);
+        if (std::memcmp(q8_out.data(), outs[route].data(),
+                        kOut * sizeof(float)))
+          throw std::runtime_error("GDN Q8_1 producer changed the F32 output");
+        const auto q8_state = Download(&d_state, kStateCount);
+        if (std::memcmp(q8_state.data(), states[route].data(),
+                        kStateCount * sizeof(float)))
+          throw std::runtime_error("GDN Q8_1 producer changed the state");
+        if (qfn_mmq_quantize_q8_1(d_out.get(), d_q_ref.get(),
+                                  static_cast<int>(kTokens),
+                                  static_cast<int>(kZ), nullptr) != 0)
+          throw std::runtime_error("GDN Q8_1 reference failed");
+        std::vector<std::uint8_t> fused_q(qbytes);
+        std::vector<std::uint8_t> reference_q(qbytes);
+        CheckHip(
+            hipMemcpy(fused_q.data(), d_q.get(), qbytes, hipMemcpyDeviceToHost),
+            "GDN Q8_1 download");
+        CheckHip(hipMemcpy(reference_q.data(), d_q_ref.get(), qbytes,
+                           hipMemcpyDeviceToHost),
+                 "GDN Q8_1 reference download");
+        if (std::memcmp(reference_q.data(), fused_q.data(), qbytes) != 0)
+          throw std::runtime_error("GDN epilogue changed the Q8_1 rows");
+        const std::vector<q::WeightType> formats = {
+            q::WeightType::kQ8_0,    q::WeightType::kQ2_0,
+            q::WeightType::kQ4_K,    q::WeightType::kQ5_K,
+            q::WeightType::kQ6_K,    q::WeightType::kIQ2_XXS,
+            q::WeightType::kIQ2_XS,  q::WeightType::kIQ2_S,
+            q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+            q::WeightType::kIQ4_NL,  q::WeightType::kIQ4_XS};
+        std::uint32_t seed = 0x6D8F0000U + static_cast<std::uint32_t>(route);
+        for (q::WeightType type : formats) {
+          const DenseWeights w = MakeQuant(type, 64, kZ, seed++);
+          constexpr std::size_t tail = 4096;
+          std::uint8_t* d_w = nullptr;
+          CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "GDN Q8 weights");
+          CheckHip(hipMemcpy(d_w, w.packed.data(), w.packed.size(),
+                             hipMemcpyHostToDevice),
+                   "GDN Q8 weights upload");
+          CheckHip(hipMemset(d_w + w.packed.size(), 0, tail),
+                   "GDN Q8 weights tail");
+          const std::vector<float> dirty(projection_count, -1234567.0F);
+          Upload(&d_projection, dirty);
+          Upload(&d_projection_ref, dirty);
+          if (qfn_mmq_dense_vec(static_cast<int>(type), d_w, d_out.get(),
+                                d_projection_ref.get(), 64,
+                                static_cast<int>(kTokens), static_cast<int>(kZ),
+                                nullptr) != 0 ||
+              qfn_mmq_dense_vec_preq(static_cast<int>(type), d_w, d_q.get(),
+                                     d_projection.get(), 64,
+                                     static_cast<int>(kTokens),
+                                     static_cast<int>(kZ), nullptr) != 0)
+            throw std::runtime_error("GDN Q8 projection failed");
+          const auto expected = Download(&d_projection_ref, projection_count);
+          const auto actual = Download(&d_projection, projection_count);
+          if (std::memcmp(expected.data(), actual.data(),
+                          kTokens * 64 * sizeof(float)) != 0)
+            throw std::runtime_error(
+                "GDN Q8 projection differs from the F32 entry for type " +
+                std::to_string(static_cast<unsigned>(type)));
+          for (std::size_t i = kTokens * 64; i < projection_count; ++i)
+            if (actual[i] != -1234567.0F)
+              throw std::runtime_error("GDN Q8 projection overwrote its guard");
+          CheckHip(hipFree(d_w), "GDN Q8 weights free");
+        }
+        std::cout << "GDN Q8_1 handoff: producer rows and every dense format "
+                     "exact\n";
       }
       // The causal conv's output (the scratch's first rows) against a CPU
       // reference over the same history.

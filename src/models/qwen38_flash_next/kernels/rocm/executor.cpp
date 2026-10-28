@@ -149,6 +149,10 @@ bool GatedPairDecodeType(GgmlType type, std::uint32_t rows) {
 
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
+/// Extra halves after each wide Q6_K attention-output row, matching the
+/// padded F16 pitch the quantized [2560,6144] projection specialization
+/// reads.
+constexpr std::uint32_t kAttentionOutPad = 32;
 /// Wide dense Q8_0 projections take the F16 WMMA GEMM (F16 activation
 /// rows, weights dequantized as they are staged, no per-block scaling) when
 /// its 256-row tiles fill the device and the K sweep is short enough that
@@ -1747,11 +1751,11 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     return false;
   }
   // A wide batch writes the down projection's staged input directly (the
-  // F32 rows are read by nothing else): F16 rows for the F16 route, else
+  // F32 rows are read by nothing else): F16 rows for the F16 routes, else
   // the tiled Q8 layout; the cache lets Dense skip its activation pass.
   if (down != nullptr && down->cols == up.rows && MatrixRows(n_tokens) &&
       n_tokens <= options_.max_batch) {
-    if (DenseF16Route(*down, n_tokens)) {
+    if (DenseF16Route(*down, n_tokens) || KQuantWmmaType(down->type)) {
       // A private F16 buffer: s_.x_half keeps the narrowed token rows the
       // router left there, which the routed experts read next.
       SwigluHalf(out, s_.shexp_gate, s_.shexp_half,
@@ -2695,17 +2699,29 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                      n_tokens <= options_.max_batch;
   const bool half_output =
       tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
-  auto* out_half =
-      half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
+  // The GSQ K-quant/IQ outputs run the quantized F16-tile GEMM at wide batch:
+  // the epilogue writes its contiguous F16 rows directly, so the projection
+  // does not read an F32 copy and narrow it again.
+  const bool quant_half = MatrixRows(n_tokens) &&
+                          n_tokens <= options_.max_batch &&
+                          KQuantWmmaType(l.ssm_out.type);
+  auto* out_half = half_output || quant_half
+                       ? reinterpret_cast<__half*>(s_.gdn_out)
+                       : nullptr;
   // Shift successive rows off the 12 KiB pitch while retaining every half.
   // The existing F32 scratch has room for these slightly padded F16 rows.
-  const std::uint32_t half_stride =
-      half_output && n_tokens >= 1024 ? l.ssm_out.cols + 32 : 0;
-  // A decode batch's output projection reads the epilogue's Q8_1 rows.
+  // The quantized output projection accepts the same pitch on its wide
+  // [2560,6144] shape.
+  const bool padded_half =
+      (half_output ||
+       (quant_half && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144)) &&
+      n_tokens >= 1024;
+  const std::uint32_t half_stride = padded_half ? l.ssm_out.cols + 32 : 0;
+  // A decode batch's quantized output projection reads the epilogue's Q8_1
+  // rows; the adapter's MMVQ consumes them for every dense format.
   const std::uint32_t value_dim = c.SsmValueDim();
   const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&
-                        c.ssm_head_dim == 128 &&
-                        l.ssm_out.type == GgmlType::kQ8_0 &&
+                        c.ssm_head_dim == 128 && Q8DenseType(l.ssm_out.type) &&
                         l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
   if (!GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta,
                      l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
@@ -2725,9 +2741,15 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!project_output) {
     return true;
   }
-  if (half_output) {
-    if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
-                      l.ssm_out.cols, stream_, half_stride)) {
+  if (half_output || quant_half) {
+    const bool projected =
+        half_output
+            ? DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens,
+                           l.ssm_out.rows, l.ssm_out.cols, stream_, half_stride)
+            : DenseQuantF16Gemm(l.ssm_out.type, l.ssm_out.data, out_half, out,
+                                n_tokens, l.ssm_out.rows, l.ssm_out.cols,
+                                stream_, half_stride);
+    if (!projected) {
       AssignError(error_msg, "SSM output F16 GEMM failed");
       return false;
     }
@@ -2761,23 +2783,27 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::uint32_t checkpoint_tokens) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
+  const std::uint32_t q_dim = c.AttentionQDim();
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
+    const bool f16_projection = DenseF16Route(l.attn_qkv, n_tokens);
+    const bool quant_projection = KQuantWmmaType(l.attn_qkv.type) &&
+                                  l.attn_qkv.cols <= model_->max_half_cols();
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
-        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
-        l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
-        c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
-        c.rotary_dim == 64;
+        n_tokens <= options_.max_batch &&
+        (f16_projection || quant_projection) && l.attn_qkv.rows == 13312 &&
+        l.attn_qkv.cols == 2560 && c.num_heads == 24 && c.num_kv_heads == 2 &&
+        c.head_dim == 256 && c.rotary_dim == 64;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_);
+          s.rope, yarn_, f16_projection ? GgmlType::kQ8_0 : l.attn_qkv.type);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2798,17 +2824,44 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       }
     }
   } else {
-    Q8Input xq;
-    if (!projections_ready &&
-        (!QuantizeFor({&l.attn_q, &l.attn_k, &l.attn_v}, x, n_tokens,
-                      c.hidden_size, &xq, error_msg) ||
-         !Dense(l.attn_q, xq, s_.qg, error_msg) ||
-         !Dense(l.attn_k, xq, s_.k, error_msg) ||
-         !Dense(l.attn_v, xq, s_.v, error_msg))) {
-      return false;
+    // Mixed-type layers keep their three positional tensors. Wide prefill
+    // fuses each projection with its head normalization, RoPE and KV store
+    // under the shared projection-head numbering; decode and verification
+    // keep the separate path. The Q tensor still alternates query/gate rows.
+    const bool fused_mixed =
+        !projections_ready && WidePrefill(n_tokens) &&
+        n_tokens <= options_.max_batch && l.attn_q.rows == 12288 &&
+        l.attn_k.rows == 512 && l.attn_v.rows == 512 && l.attn_q.cols == 2560 &&
+        l.attn_k.cols == 2560 && l.attn_v.cols == 2560 &&
+        KQuantWmmaType(l.attn_q.type) && KQuantWmmaType(l.attn_k.type) &&
+        KQuantWmmaType(l.attn_v.type) &&
+        l.attn_q.cols <= model_->max_half_cols() && c.num_heads == 24 &&
+        c.num_kv_heads == 2 && c.head_dim == 256 && c.rotary_dim == 64;
+    if (fused_mixed) {
+      PrepareHalfInput(x, n_tokens, l.attn_q.cols);
+      prepared = AttentionMixedF16Gemm(
+          l.attn_q.data, l.attn_k.data, l.attn_v.data,
+          static_cast<const __half*>(s_.x_half), l.attn_q_norm.f32(),
+          l.attn_k_norm.f32(), s_.q, s_.attn_gate, s.k_cache, s.v_cache,
+          n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope, yarn_,
+          l.attn_q.type, l.attn_k.type, l.attn_v.type);
+      if (!prepared) {
+        AssignError(error_msg, "fused mixed attention projection failed");
+        return false;
+      }
+    } else {
+      Q8Input xq;
+      if (!projections_ready &&
+          (!QuantizeFor({&l.attn_q, &l.attn_k, &l.attn_v}, x, n_tokens,
+                        c.hidden_size, &xq, error_msg) ||
+           !Dense(l.attn_q, xq, s_.qg, error_msg) ||
+           !Dense(l.attn_k, xq, s_.k, error_msg) ||
+           !Dense(l.attn_v, xq, s_.v, error_msg))) {
+        return false;
+      }
+      UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                  nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
     }
-    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
-                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
   }
   if (!prepared) {
     RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
@@ -2892,6 +2945,25 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
              "partial attention output initialization", error_msg)) {
     return false;
   }
+  // A wide Q4_K, Q5_K or Q6_K attention-output projection reads the same
+  // 32-half padded F16 row pitch as the SSM output projection. The kernel
+  // writes the gated rows directly, replacing the F32 context write and the
+  // separate narrow pass; shorter, other-format and last-tile calls keep the
+  // F32 route.
+  const std::uint32_t half_pitch = q_dim + kAttentionOutPad;
+  const bool half_output =
+      project_output && !last_only && MatrixRows(n_tokens) &&
+      n_tokens <= options_.max_batch && n_tokens >= 1024 &&
+      (l.attn_out.type == GgmlType::kQ4_K ||
+       l.attn_out.type == GgmlType::kQ5_K ||
+       l.attn_out.type == GgmlType::kQ6_K) &&
+      l.attn_out.cols == q_dim && l.attn_out.rows == c.hidden_size &&
+      half_pitch <= model_->max_half_cols();
+  auto* const half_base =
+      half_output ? static_cast<__half*>(s_.x_half) : nullptr;
+  if (half_base != nullptr) {
+    half_src_ = nullptr;
+  }
   // Queries before the token budget always take the dense tiles, also in a
   // batch that crosses it, so each position's key sweep (and its rounding)
   // does not depend on where the prefill chunks fall. The sparse part goes
@@ -2902,7 +2974,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                                          ? std::min(rows, c.indexer_top_k - pos)
                                          : 0;
     const auto at = [&](std::uint32_t row) {
-      return std::size_t{first + row} * c.AttentionQDim();
+      return std::size_t{first + row} * q_dim;
+    };
+    const auto half_at = [&](std::uint32_t row) {
+      return half_base == nullptr
+                 ? nullptr
+                 : half_base + (std::size_t{first + row} * half_pitch);
     };
     return (dense_rows == rows ||
             WmmaCausalAttention(
@@ -2912,12 +2989,27 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                      : nullptr,
                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
-                c.compress_ratio, stream_, last)) &&
+                c.compress_ratio, stream_, last, half_at(dense_rows),
+                half_pitch)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
             WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
-                                c.head_dim, c.compress_ratio, stream_, last));
+                                c.head_dim, c.compress_ratio, stream_, last,
+                                half_at(0), half_pitch));
+  };
+  const auto project_attention = [&]() {
+    if (half_base == nullptr) {
+      return Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+    }
+    if (!DenseQuantF16Gemm(l.attn_out.type, l.attn_out.data,
+                           static_cast<const __half*>(s_.x_half), out, n_tokens,
+                           l.attn_out.rows, l.attn_out.cols, stream_,
+                           half_pitch)) {
+      AssignError(error_msg, "padded attention output projection failed");
+      return false;
+    }
+    return true;
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
@@ -2927,12 +3019,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       AssignError(error_msg, "checkpoint attention geometry is unsupported");
       return false;
     }
-    return !project_output ||
-           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+    return !project_output || project_attention();
   }
   if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
-    return !project_output ||
-           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+    return !project_output || project_attention();
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
@@ -2943,10 +3033,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
       split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
       c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0);
-  const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
-  // A decode batch's output projection reads the gate's Q8_1 rows.
-  if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
+  // A decode batch's quantized output projection reads the gate's Q8_1 rows;
+  // the adapter's MMVQ consumes them for every dense format.
+  if (project_output && split && Q8DenseType(l.attn_out.type) &&
       l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
       SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
     return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
@@ -3011,9 +3101,15 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     if (shexp_half_ready_) {
       shexp_half_ready_ = false;
-      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
-                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
-                        stream_)) {
+      const bool projected =
+          KQuantWmmaType(l.shexp_down.type)
+              ? DenseQuantF16Gemm(l.shexp_down.type, l.shexp_down.data,
+                                  s_.shexp_half, s_.shexp_out, n_tokens,
+                                  l.shexp_down.rows, l.shexp_down.cols, stream_)
+              : DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
+                             n_tokens, l.shexp_down.rows, l.shexp_down.cols,
+                             stream_);
+      if (!projected) {
         AssignError(error_msg, "shared expert F16 GEMM failed");
         return false;
       }

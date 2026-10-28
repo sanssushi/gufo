@@ -239,21 +239,24 @@ bool KQuantWmmaType(core::GgmlType type);
 /// Dense GEMM over K-quant/IQ weights whose tiles are dequantized to F16 at
 /// the LDS commit (DecodeQuantSub16 codes with one (scale, -offset) pair per
 /// 16-element sub-block) against F16 activation rows [batch][k]. out is
-/// [batch][m]. Returns false, launching nothing, for other types or a k that
-/// is not a whole weight block.
+/// [batch][m]. A nonzero `input_stride` is the activation row pitch in
+/// halves; only the padded [2560,6144] output shape at 1,024 or more tokens
+/// accepts one. Returns false, launching nothing, for other types, a k that
+/// is not a whole weight block or an unsupported pitch.
 bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
                        float* out, std::size_t batch, std::size_t m,
-                       std::size_t k, hipStream_t stream);
+                       std::size_t k, hipStream_t stream,
+                       std::size_t input_stride = 0);
 
 /// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
 /// Matches the separate operators' rounding. Supports at least 96 tokens.
 bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
-/// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
-/// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
-/// Requires at least 1024 tokens; cache capacity must include position +
+/// Stacked Q8_0 or K-quant/IQ QKV projection [13312,2560], head
+/// normalization and RoPE. Writes Q/gates in F32 and K/V caches in F16,
+/// preserving separate rounding. Fixed geometry: 24 query heads, two KV
+/// heads, 256 dimensions, 64 rotary. Cache capacity must include position +
 /// tokens.
 /// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 bool AttentionF16Gemm(const void* weights, const __half* input,
@@ -262,7 +265,26 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      const YarnRope& yarn = {});
+                      const YarnRope& yarn = {},
+                      core::GgmlType type = core::GgmlType::kQ8_0);
+
+/// Mixed-type attention Q/K/V projections [12288,2560], [512,2560],
+/// [512,2560], each with its own quantization type: Q holds the interleaved
+/// query/gate rows, K and V carry the two KV heads under global projection
+/// heads 48-51. Fuses each projection with its head normalization, RoPE and
+/// KV store, preserving the separate path's rounding. Fixed geometry as
+/// AttentionF16Gemm. Returns false, launching nothing, for other shapes or
+/// types.
+bool AttentionMixedF16Gemm(const void* q_weights, const void* k_weights,
+                           const void* v_weights, const __half* input,
+                           const float* q_gamma, const float* k_gamma,
+                           float* query, float* gate, __half* keys,
+                           __half* values, std::uint32_t n_tokens,
+                           const std::uint32_t* position, float theta,
+                           float eps, hipStream_t stream,
+                           const qwen::vision::DeviceRope* rope,
+                           const YarnRope& yarn, core::GgmlType q_type,
+                           core::GgmlType k_type, core::GgmlType v_type);
 
 /// Exact Q8_0 or BF16 HC up projection and F16-input mixer for the Flash
 /// Next 2560-hidden, rank-320 geometry. `up_type` is kQ8_0 or kBF16 (the
@@ -584,9 +606,12 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// false, launching nothing, when the geometry is not the model's 24 x 256
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
-/// Returns false when the visible extent exceeds
-/// WmmaCausalAttentionContextLimit or the mask stride; the caller falls back
-/// to Attention.
+/// With `out_half` set, live rows are narrowed to F16 at the row pitch
+/// `out_stride` (at least 6,144 halves, a multiple of 8) instead of writing
+/// `out`; the bytes equal the F32 result narrowed by NarrowActivations. The
+/// half form is rejected with `last_only`. Returns false when the visible
+/// extent exceeds WmmaCausalAttentionContextLimit or the mask stride; the
+/// caller falls back to Attention.
 bool WmmaCausalAttention(const float* q, const float* gate,
                          const __half* k_cache, const __half* v_cache,
                          const std::uint32_t* mask, std::uint32_t mask_words,
@@ -594,7 +619,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only = false, __half* out_half = nullptr,
+                         std::uint32_t out_stride = 0);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

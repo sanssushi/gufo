@@ -242,7 +242,8 @@ void CheckSsmProjection(
 void CheckAttentionProjection(
     const void* weights, const __half* input, const float* projected,
     std::uint32_t batch,
-    const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
+    const gufo::models::qwen38_flash_next::YarnRope& yarn = {},
+    gufo::core::GgmlType type = gufo::core::GgmlType::kQ8_0) {
   constexpr std::uint32_t start = 131069;
   const std::size_t query_bytes = (std::size_t(batch) * 6144 + 16) * 4;
   const std::size_t cache_bytes =
@@ -304,7 +305,7 @@ void CheckAttentionProjection(
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, position,
-                           1e7F, 1e-6F, stream, vision.rope(), yarn))
+                           1e7F, 1e-6F, stream, vision.rope(), yarn, type))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
@@ -336,7 +337,7 @@ void CheckAttentionProjection(
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
                           static_cast<__half*>(actual[3]) + 8, 0, position,
-                          1e7F, 1e-6F, nullptr, nullptr, yarn))
+                          1e7F, 1e-6F, nullptr, nullptr, yarn, type))
     throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
@@ -504,6 +505,77 @@ void CheckW8A8Tail(std::size_t m, std::size_t k, std::uint32_t seed) {
   (void)hipFree(d_tiled);
   (void)hipFree(d_long);
   (void)hipFree(d_short);
+}
+
+/// The shared-expert producer hands its down projection F16 rows directly.
+/// Those bytes must equal the F32 SwiGLU followed by the activation narrow.
+void CheckSwigluHalf() {
+  constexpr std::size_t kCount = 4099;  // odd count with a partial float4 tail
+  std::vector<float> gate(kCount), up(kCount);
+  std::uint32_t seed = 0x5A17C0DEU;
+  for (std::size_t i = 0; i < kCount; ++i) {
+    gate[i] = Uniform(&seed, 4.0F);
+    up[i] = Uniform(&seed, 4.0F);
+  }
+  // F16 ties: the exact midpoints between adjacent half values must round
+  // nearest-even. Cover normals, subnormals and both signs; the large
+  // products stay below F16 saturation.
+  const float mid = (1.0F + (1.0F + std::ldexp(1.0F, -10))) * 0.5F;
+  const float subnormal_mid = std::ldexp(1.5F, -24);
+  const float ties[][2] = {{1.0F, mid},
+                           {mid, 1.0F},
+                           {-1.0F, -mid},
+                           {-mid, -1.0F},
+                           {1.0F, subnormal_mid},
+                           {subnormal_mid, 1.0F},
+                           {-1.0F, -subnormal_mid},
+                           {300.0F, 200.0F}};
+  for (std::size_t i = 0; i < sizeof(ties) / sizeof(ties[0]); ++i) {
+    gate[i * 7] = ties[i][0];
+    up[i * 7] = ties[i][1];
+  }
+  void* d_gate = nullptr;
+  void* d_up = nullptr;
+  void* d_ref_gate = nullptr;
+  void* d_ref = nullptr;
+  void* d_actual = nullptr;
+  CheckHip(hipMalloc(&d_gate, kCount * sizeof(float)), "SwiGLU gate");
+  CheckHip(hipMalloc(&d_up, kCount * sizeof(float)), "SwiGLU up");
+  CheckHip(hipMalloc(&d_ref_gate, kCount * sizeof(float)), "SwiGLU reference");
+  CheckHip(hipMalloc(&d_ref, kCount * sizeof(__half)), "SwiGLU half reference");
+  CheckHip(hipMalloc(&d_actual, kCount * sizeof(__half)), "SwiGLU half output");
+  CheckHip(hipMemcpy(d_gate, gate.data(), kCount * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "SwiGLU gate upload");
+  CheckHip(
+      hipMemcpy(d_up, up.data(), kCount * sizeof(float), hipMemcpyHostToDevice),
+      "SwiGLU up upload");
+  CheckHip(hipMemcpy(d_ref_gate, d_gate, kCount * sizeof(float),
+                     hipMemcpyDeviceToDevice),
+           "SwiGLU reference copy");
+  q::Swiglu(static_cast<float*>(d_ref_gate), static_cast<const float*>(d_up),
+            kCount, nullptr);
+  q::NarrowActivations(static_cast<const float*>(d_ref_gate), d_ref, false,
+                       kCount, nullptr);
+  q::SwigluHalf(static_cast<const float*>(d_gate),
+                static_cast<const float*>(d_up), static_cast<__half*>(d_actual),
+                kCount, nullptr);
+  std::vector<__half> reference(kCount), actual(kCount);
+  CheckHip(hipMemcpy(reference.data(), d_ref, kCount * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "SwiGLU half reference download");
+  CheckHip(hipMemcpy(actual.data(), d_actual, kCount * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "SwiGLU half output download");
+  if (std::memcmp(reference.data(), actual.data(), kCount * sizeof(__half)) !=
+      0)
+    throw std::runtime_error("SwiGLU F16 producer changed rounding");
+  std::cout << "SwiGLU F16 producer: exact\n";
+  (void)hipFree(d_gate);
+  (void)hipFree(d_up);
+  (void)hipFree(d_ref_gate);
+  (void)hipFree(d_ref);
+  (void)hipFree(d_actual);
 }
 
 void CheckRoutedQ8Placement() {
@@ -1358,6 +1430,268 @@ DenseWeights MakeQuant(q::WeightType type, std::size_t m, std::size_t k,
   return w;
 }
 
+/// The GSQ-RCO same-type attention stacks run the fused projection epilogue
+/// over the K-quant/IQ F16-tile decode. The fused Q/gates and K/V cache bytes
+/// must equal the separate DenseQuantF16Gemm projection followed by
+/// PrepareAttention, in both YaRN modes and at partial token-tile widths.
+void CheckAttentionProjectionQuant(gufo::core::GgmlType type,
+                                   std::uint32_t batch) {
+  constexpr std::uint32_t m = 13312, k = 2560;
+  const auto wtype =
+      static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  const DenseWeights w = MakeQuant(wtype, m, k, 0x5EED0000U + batch);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t seed = 0x51A7E000U ^ batch;
+  for (float& v : x)
+    v = Uniform(&seed, 2.0F);
+  // Production uploads carry a zeroed tail for the wide MMQ reads.
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  __half* d_x_half = nullptr;
+  float* d_projection = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "attention quant weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "attention quant input");
+  CheckHip(hipMalloc(&d_x_half, x.size() * sizeof(__half)),
+           "attention quant halves");
+  CheckHip(hipMalloc(&d_projection, static_cast<std::size_t>(batch) * m * 4),
+           "attention quant projection");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "attention quant weights upload");
+  CheckHip(hipMemset(d_w + w.packed.size(), 0, tail), "attention quant tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "attention quant input upload");
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  if (!q::DenseQuantF16Gemm(type, d_w, d_x_half, d_projection, batch, m, k,
+                            nullptr))
+    throw std::runtime_error("attention quant projection rejected the shape");
+  CheckAttentionProjection(d_w, d_x_half, d_projection, batch, {}, type);
+  CheckAttentionProjection(
+      d_w, d_x_half, d_projection, batch,
+      gufo::models::qwen38_flash_next::MakeYarnRope(
+          {.factor = 2.5F, .original_context = 262144}, 64, 1e7F),
+      type);
+  for (void* p :
+       {static_cast<void*>(d_w), static_cast<void*>(d_x),
+        static_cast<void*>(d_x_half), static_cast<void*>(d_projection)})
+    CheckHip(hipFree(p), "attention quant free");
+}
+
+/// A mixed-type attention layer keeps Q, K and V as separate tensors with
+/// independent quantization types. The fused Q/gates and K/V cache bytes
+/// must equal the current Dense projections followed by unpack, norm, RoPE
+/// and KV stores, in both YaRN modes, at partial and full token tiles and
+/// through graph replay. A CPU double projection bounds the result
+/// independently of the GPU decoders.
+void CheckAttentionMixed(
+    gufo::core::GgmlType q_type, gufo::core::GgmlType k_type,
+    gufo::core::GgmlType v_type, std::uint32_t batch,
+    const gufo::models::qwen38_flash_next::YarnRope& yarn) {
+  constexpr std::uint32_t qm = 12288, kvm = 512, k = 2560, start = 131069;
+  constexpr std::size_t tail = 4096;
+  const auto weight_type = [](gufo::core::GgmlType type) {
+    return static_cast<q::WeightType>(static_cast<std::uint32_t>(type));
+  };
+  const DenseWeights qw =
+      MakeQuant(weight_type(q_type), qm, k, 0xF1000000U ^ batch);
+  const DenseWeights kw =
+      MakeQuant(weight_type(k_type), kvm, k, 0xF1000100U ^ batch);
+  const DenseWeights vw =
+      MakeQuant(weight_type(v_type), kvm, k, 0xF1000200U ^ batch);
+  std::vector<float> x(static_cast<std::size_t>(batch) * k);
+  std::uint32_t seed = 0xF1A70000U ^ batch;
+  for (float& v : x) {
+    v = Uniform(&seed, 2.0F);
+  }
+  const std::size_t q_count = std::size_t(batch) * qm;
+  const std::size_t kv_count = std::size_t(batch) * kvm;
+  const std::size_t qout_count = std::size_t(batch) * 6144;
+  const std::size_t cache_count = std::size_t(start + batch) * 512;
+  struct Buffers {
+    std::vector<void*> pointers;
+    ~Buffers() {
+      for (void* p : pointers)
+        (void)hipFree(p);
+    }
+    void* Make(std::size_t bytes) {
+      void* p = nullptr;
+      CheckHip(hipMalloc(&p, bytes), "mixed attention allocation");
+      pointers.push_back(p);
+      CheckHip(hipMemset(p, 0xA5, bytes), "mixed attention guards");
+      return p;
+    }
+  } buffers;
+  auto* d_qw =
+      static_cast<std::uint8_t*>(buffers.Make(qw.packed.size() + tail));
+  auto* d_kw =
+      static_cast<std::uint8_t*>(buffers.Make(kw.packed.size() + tail));
+  auto* d_vw =
+      static_cast<std::uint8_t*>(buffers.Make(vw.packed.size() + tail));
+  auto* d_x = static_cast<float*>(buffers.Make(x.size() * sizeof(float)));
+  auto* d_qg = static_cast<float*>(buffers.Make(q_count * sizeof(float)));
+  auto* d_kraw = static_cast<float*>(buffers.Make(kv_count * sizeof(float)));
+  auto* d_vraw = static_cast<float*>(buffers.Make(kv_count * sizeof(float)));
+  auto* d_xh = static_cast<__half*>(buffers.Make(x.size() * sizeof(__half)));
+  void* expected[4];
+  void* actual[4];
+  const auto bytes = [&](unsigned i) {
+    return i < 2 ? (qout_count + 16) * sizeof(float)
+                 : (cache_count + 16) * sizeof(__half);
+  };
+  for (unsigned i = 0; i < 4; ++i) {
+    expected[i] = buffers.Make(bytes(i));
+    actual[i] = buffers.Make(bytes(i));
+  }
+  auto* position =
+      static_cast<std::uint32_t*>(buffers.Make(sizeof(std::uint32_t)));
+  CheckHip(hipMemcpy(position, &start, sizeof(start), hipMemcpyHostToDevice),
+           "mixed attention position");
+  std::vector<float> gamma(512);
+  seed = 0x34185A9U;
+  for (float& value : gamma)
+    value = 1.0F + Uniform(&seed, 0.5F);
+  auto* d_gamma =
+      static_cast<float*>(buffers.Make(gamma.size() * sizeof(float)));
+  CheckHip(hipMemcpy(d_gamma, gamma.data(), gamma.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "mixed attention norm weights");
+  CheckHip(hipMemcpy(d_qw, qw.packed.data(), qw.packed.size(),
+                     hipMemcpyHostToDevice),
+           "mixed attention Q weights");
+  CheckHip(hipMemcpy(d_kw, kw.packed.data(), kw.packed.size(),
+                     hipMemcpyHostToDevice),
+           "mixed attention K weights");
+  CheckHip(hipMemcpy(d_vw, vw.packed.data(), vw.packed.size(),
+                     hipMemcpyHostToDevice),
+           "mixed attention V weights");
+  CheckHip(hipMemset(d_qw + qw.packed.size(), 0, tail),
+           "mixed attention Q tail");
+  CheckHip(hipMemset(d_kw + kw.packed.size(), 0, tail),
+           "mixed attention K tail");
+  CheckHip(hipMemset(d_vw + vw.packed.size(), 0, tail),
+           "mixed attention V tail");
+  CheckHip(
+      hipMemcpy(d_x, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "mixed attention input");
+  q::NarrowActivations(d_x, d_xh, false, x.size(), nullptr);
+
+  if (!q::DenseQuantF16Gemm(q_type, d_qw, d_xh, d_qg, batch, qm, k, nullptr) ||
+      !q::DenseQuantF16Gemm(k_type, d_kw, d_xh, d_kraw, batch, kvm, k,
+                            nullptr) ||
+      !q::DenseQuantF16Gemm(v_type, d_vw, d_xh, d_vraw, batch, kvm, k, nullptr))
+    throw std::runtime_error("mixed attention projection rejected");
+  // The separate projections are the current chain's inputs; keep their
+  // bytes before the in-place normalization and rotation.
+  const auto host_qg = Download(d_qg, q_count);
+  const auto host_k = Download(d_kraw, kv_count);
+  const auto host_v = Download(d_vraw, kv_count);
+  q::UnpackQGate(d_qg, qm, static_cast<float*>(expected[0]) + 8,
+                 static_cast<float*>(expected[1]) + 8, nullptr, nullptr, batch,
+                 24, 256, 0, nullptr);
+  q::RmsNormRows(static_cast<float*>(expected[0]) + 8, d_gamma,
+                 static_cast<float*>(expected[0]) + 8, batch * 24, 256, 1,
+                 1e-6F, nullptr);
+  q::RmsNormRows(d_kraw, d_gamma + 256, d_kraw, batch * 2, 256, 1, 1e-6F,
+                 nullptr);
+  q::Rope(static_cast<float*>(expected[0]) + 8, batch, 24, 256, 64, position,
+          1e7F, nullptr, nullptr, yarn);
+  q::Rope(d_kraw, batch, 2, 256, 64, position, 1e7F, nullptr, nullptr, yarn);
+  q::StoreKv(d_kraw, static_cast<__half*>(expected[2]) + 8, batch, 512,
+             position, nullptr);
+  q::StoreKv(d_vraw, static_cast<__half*>(expected[3]) + 8, batch, 512,
+             position, nullptr);
+  CheckHip(hipDeviceSynchronize(), "mixed attention reference");
+
+  // Sample a few projected rows against an independent double-precision dot
+  // product of the dequantized weights and the narrowed activations.
+  const auto half_round = [](float value) {
+    return static_cast<double>(__half2float(__float2half_rn(value)));
+  };
+  const auto cpu_check = [&](const DenseWeights& w,
+                             const std::vector<float>& out, std::uint32_t rows,
+                             std::uint32_t row, std::uint32_t token,
+                             const char* name) {
+    double dot = 0.0, magnitude = 0.0;
+    for (std::uint32_t i = 0; i < k; ++i) {
+      const double term = half_round(w.values[std::size_t(row) * k + i]) *
+                          half_round(x[std::size_t(token) * k + i]);
+      dot += term;
+      magnitude += std::abs(term);
+    }
+    const double actual = out[std::size_t(token) * rows + row];
+    if (std::abs(actual - dot) > 2e-3 * magnitude + 1e-2)
+      throw std::runtime_error(
+          std::string("mixed attention CPU projection ") + name + " row " +
+          std::to_string(row) + " token " + std::to_string(token) + ": " +
+          std::to_string(actual) + " vs " + std::to_string(dot) +
+          " magnitude " + std::to_string(magnitude));
+  };
+  for (const std::uint32_t token : {0U, batch - 1}) {
+    for (const std::uint32_t row : {0U, 1U, qm - 1})
+      cpu_check(qw, host_qg, qm, row, token, "Q");
+    for (const std::uint32_t row : {0U, kvm - 1}) {
+      cpu_check(kw, host_k, kvm, row, token, "K");
+      cpu_check(vw, host_v, kvm, row, token, "V");
+    }
+  }
+
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t replay = nullptr;
+  CheckHip(hipStreamCreate(&stream), "mixed attention stream");
+  gufo::models::qwen::vision::DeviceInput vision;
+  vision.PrepareRope(stream);
+  const auto* descriptor = vision.rope();
+  vision.PrepareRope(stream);
+  if (descriptor == nullptr || vision.rope() != descriptor)
+    throw std::runtime_error("prepared image descriptor is not stable");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "mixed attention capture");
+  if (!q::AttentionMixedF16Gemm(d_qw, d_kw, d_vw, d_xh, d_gamma, d_gamma + 256,
+                                static_cast<float*>(actual[0]) + 8,
+                                static_cast<float*>(actual[1]) + 8,
+                                static_cast<__half*>(actual[2]) + 8,
+                                static_cast<__half*>(actual[3]) + 8, batch,
+                                position, 1e7F, 1e-6F, stream, vision.rope(),
+                                yarn, q_type, k_type, v_type))
+    throw std::runtime_error("mixed attention fusion rejected the model shape");
+  CheckHip(hipStreamEndCapture(stream, &graph), "mixed attention capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "mixed attention graph");
+  for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    vision.RestoreLayout({}, stream);
+    if (vision.rope() != descriptor)
+      throw std::runtime_error("text restore replaced the image descriptor");
+    for (unsigned i = 0; i < 4; ++i)
+      CheckHip(hipMemsetAsync(actual[i], 0xA5, bytes(i), stream),
+               "mixed attention replay guards");
+    CheckHip(hipGraphLaunch(replay, stream), "mixed attention replay");
+    CheckHip(hipStreamSynchronize(stream), "mixed attention wait");
+    for (unsigned i = 0; i < 4; ++i) {
+      std::vector<std::byte> a(bytes(i)), b(bytes(i));
+      CheckHip(
+          hipMemcpy(a.data(), expected[i], bytes(i), hipMemcpyDeviceToHost),
+          "mixed attention reference download");
+      CheckHip(hipMemcpy(b.data(), actual[i], bytes(i), hipMemcpyDeviceToHost),
+               "mixed attention output download");
+      if (a != b)
+        throw std::runtime_error(
+            "mixed attention changed rounding, cache boundaries or replay");
+    }
+  }
+  if (q::AttentionMixedF16Gemm(nullptr, nullptr, nullptr, nullptr, nullptr,
+                               nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+                               position, 1e7F, 1e-6F, nullptr, nullptr, yarn,
+                               q_type, k_type, v_type))
+    throw std::runtime_error("mixed attention accepted an empty batch");
+  CheckHip(hipGraphExecDestroy(replay), "mixed attention graph free");
+  CheckHip(hipGraphDestroy(graph), "mixed attention graph definition free");
+  CheckHip(hipStreamDestroy(stream), "mixed attention stream free");
+  std::cout << "fused mixed attention projection yarn=" << yarn.enabled
+            << ": exact against the separate chain, including replay\n";
+}
+
 /// The GSQ-RCO ssm_in stacks store the K-quant/IQ dense formats and fuse the
 /// four-tap convolution into the quantized F16-tile projection. The fused
 /// pass must stay bit-identical to the separate dense F16-tile projection
@@ -1825,6 +2159,122 @@ void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
       CheckHip(hipFree(p), "dense quant free");
 }
 
+/// The wide quantized SSM output projection accepts the GDN epilogue's
+/// padded F16 pitch: padded and packed rows must produce the same bytes,
+/// the padding stays untouched, and a pitch is rejected below the supported
+/// [2560,6144] wide shape.
+void CheckDenseQuantStrided(q::WeightType type, std::uint32_t seed) {
+  constexpr std::size_t m = 2560;
+  constexpr std::size_t k = 6144;
+  constexpr std::size_t pitch = k + 32;
+  const auto ggml =
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type));
+  const DenseWeights w = MakeQuant(type, m, k, seed);
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "stride weights");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "stride weights upload");
+  CheckHip(
+      hipMemset(static_cast<std::uint8_t*>(d_w) + w.packed.size(), 0, tail),
+      "stride weights tail");
+  constexpr float poison = -1234567.0F;
+  constexpr std::size_t guard = 8;
+  for (const std::size_t tokens : {std::size_t{1023}, std::size_t{1024},
+                                   std::size_t{1025}, std::size_t{2049}}) {
+    std::vector<float> x(tokens * k);
+    std::uint32_t state = seed ^ static_cast<std::uint32_t>(tokens);
+    for (float& v : x) {
+      v = Uniform(&state, 2.0F);
+    }
+    const std::vector<float> zeros(tokens * m + guard, poison);
+    float* d_x = nullptr;
+    float* d_out = nullptr;
+    float* d_strided = nullptr;
+    __half* d_half = nullptr;
+    __half* d_padded = nullptr;
+    CheckHip(hipMalloc(&d_x, x.size() * 4), "stride input");
+    CheckHip(hipMalloc(&d_out, zeros.size() * 4), "stride output");
+    CheckHip(hipMalloc(&d_strided, zeros.size() * 4), "stride padded output");
+    CheckHip(hipMalloc(&d_half, tokens * k * sizeof(__half)),
+             "stride F16 input");
+    CheckHip(hipMalloc(&d_padded, tokens * pitch * sizeof(__half)),
+             "stride padded input");
+    CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+             "stride input upload");
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "stride output guards");
+    CheckHip(hipMemcpy(d_strided, zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "stride padded guards");
+    q::NarrowActivations(d_x, d_half, false, tokens * k, nullptr);
+    CheckHip(hipMemset(d_padded, 0x7F, tokens * pitch * sizeof(__half)),
+             "stride padding poison");
+    CheckHip(hipMemcpy2D(d_padded, pitch * sizeof(__half), d_half,
+                         k * sizeof(__half), k * sizeof(__half), tokens,
+                         hipMemcpyDeviceToDevice),
+             "stride padded input");
+    if (!q::DenseQuantF16Gemm(ggml, d_w, d_half, d_out, tokens, m, k, nullptr))
+      throw std::runtime_error("dense strided packed projection failed");
+    if (tokens >= 1024) {
+      if (!q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                                nullptr, pitch))
+        throw std::runtime_error("dense strided padded projection failed");
+    } else {
+      if (q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, pitch))
+        throw std::runtime_error(
+            "dense projection accepted a narrow padded pitch");
+      CheckHip(hipDeviceSynchronize(), "narrow padded rejection");
+      const auto rejected = Download(d_strided, zeros.size());
+      if (std::memcmp(rejected.data(), zeros.data(), zeros.size() * 4) != 0)
+        throw std::runtime_error("rejected padded pitch wrote into its output");
+      for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_out),
+                      static_cast<void*>(d_strided), static_cast<void*>(d_half),
+                      static_cast<void*>(d_padded)})
+        CheckHip(hipFree(p), "stride free");
+      continue;
+    }
+    if (tokens == 1024) {
+      // A pitch below the row width, and one that is not a whole 8 halves,
+      // are both rejected before launch.
+      if (q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, k - 32) ||
+          q::DenseQuantF16Gemm(ggml, d_w, d_padded, d_strided, tokens, m, k,
+                               nullptr, k + 33))
+        throw std::runtime_error("dense projection accepted an invalid pitch");
+    }
+    CheckHip(hipDeviceSynchronize(), "stride projections");
+    const auto packed = Download(d_out, zeros.size());
+    const auto strided = Download(d_strided, zeros.size());
+    if (std::memcmp(packed.data(), strided.data(), tokens * m * 4) != 0)
+      throw std::runtime_error("padded projection changed the output bytes");
+    for (std::size_t i = tokens * m; i < zeros.size(); ++i)
+      if (packed[i] != poison || strided[i] != poison)
+        throw std::runtime_error(
+            "padded projection overwrote its output guard");
+    const auto padded_host = Download(d_padded, tokens * pitch);
+    for (std::size_t t = 0; t < tokens; ++t) {
+      for (std::size_t i = k; i < pitch; ++i) {
+        std::uint16_t bits;
+        std::memcpy(&bits, &padded_host[t * pitch + i], sizeof(bits));
+        if (bits != 0x7F7F)
+          throw std::runtime_error(
+              "padded projection overwrote the activation padding");
+      }
+    }
+    for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_out),
+                    static_cast<void*>(d_strided), static_cast<void*>(d_half),
+                    static_cast<void*>(d_padded)})
+      CheckHip(hipFree(p), "stride free");
+  }
+  std::cout << "dense strided " << static_cast<unsigned>(type)
+            << " m=2560 k=6144 exact\n";
+  CheckHip(hipFree(d_w), "stride weights free");
+}
+
 /// The dense vector projection computes every token of a decode or
 /// verification batch in one call: its rows must stay bit-identical to the
 /// one-token waves at any batch width (the batched-decode contract).
@@ -1925,6 +2375,147 @@ void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_out), static_cast<void*>(d_q)})
     CheckHip(hipFree(p), "dense vec free");
+}
+
+std::size_t QuantScaleOffset(q::WeightType type) {
+  return type == q::WeightType::kQ6_K ? QuantBlockBytes(type) - 2 : 0;
+}
+
+/// The attention output gate fuses its sigmoid multiply with the projection's
+/// Q8_1 row quantization. The quantized projection must read those rows for
+/// every dense format instead of quantizing the gated F32 row again: the
+/// fused producer's codes, scales and sums must equal the standalone pass,
+/// and the projection bytes must equal the F32 entry's.
+void CheckAttentionOutputHandoff() {
+  constexpr std::size_t m = 64;
+  constexpr std::size_t k = 6144;  // attention output width
+  constexpr std::size_t tokens = 8;
+  constexpr std::size_t guard = 16;
+  constexpr float poison = -1234567.0F;
+  const std::vector<q::WeightType> formats = {
+      q::WeightType::kQ8_0,   q::WeightType::kQ2_0,   q::WeightType::kQ4_K,
+      q::WeightType::kQ5_K,   q::WeightType::kQ6_K,   q::WeightType::kIQ2_XXS,
+      q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,  q::WeightType::kIQ3_XXS,
+      q::WeightType::kIQ3_S,  q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS};
+  std::vector<float> src(tokens * k);
+  std::vector<float> gate(tokens * k);
+  std::uint32_t state = 0x0A77E710U;
+  for (float& v : src)
+    v = Uniform(&state, 2.0F);
+  for (float& v : gate)
+    v = Uniform(&state, 1.0F);
+  // Round-half ties on both signs and an all-zero row: sigmoid(0) = 0.5, so
+  // row 0's scale is 1 and +-0.5 are exact quantization ties.
+  src[0] = 254.0F;
+  src[1] = 1.0F;
+  src[2] = -1.0F;
+  gate[0] = gate[1] = gate[2] = 0.0F;
+  for (std::size_t i = k; i < 2 * k; ++i) {
+    src[i] = 0.0F;
+    gate[i] = 0.0F;
+  }
+  float* d_gate = nullptr;
+  float* d_src = nullptr;
+  float* d_x = nullptr;
+  float* d_z = nullptr;
+  float* d_ref = nullptr;
+  float* d_actual = nullptr;
+  CheckHip(hipMalloc(&d_gate, gate.size() * 4), "attention gate input");
+  CheckHip(hipMalloc(&d_src, src.size() * 4), "attention source input");
+  CheckHip(hipMalloc(&d_x, src.size() * 4), "attention plain input");
+  CheckHip(hipMalloc(&d_z, src.size() * 4), "attention q8 input");
+  const std::size_t out_count = tokens * m + guard;
+  CheckHip(hipMalloc(&d_ref, out_count * 4), "attention projection");
+  CheckHip(hipMalloc(&d_actual, out_count * 4), "attention prequantized");
+  const std::size_t qbytes = qfn_mmq_q8_1_bytes(tokens, k);
+  std::uint8_t* d_q = nullptr;
+  std::uint8_t* d_q_ref = nullptr;
+  CheckHip(hipMalloc(&d_q, qbytes), "attention q8 rows");
+  CheckHip(hipMalloc(&d_q_ref, qbytes), "attention q8 reference");
+  const std::vector<float> dirty(out_count, poison);
+  std::uint32_t seed = 0x8A770000U;
+  for (std::size_t f = 0; f < formats.size(); ++f) {
+    for (int poisoned = 0; poisoned < 2; ++poisoned) {
+      const DenseWeights w = MakeQuant(formats[f], m, k, seed++);
+      std::vector<std::uint8_t> packed = w.packed;
+      if (poisoned != 0) {
+        // One nonfinite weight scale per format: the prequantized entry must
+        // reproduce the F32 entry's clamping and nonfinite output bytes.
+        const __half infinite_scale = __float2half(INFINITY);
+        std::memcpy(packed.data() + QuantScaleOffset(formats[f]),
+                    &infinite_scale, sizeof(infinite_scale));
+      }
+      constexpr std::size_t tail = 4096;
+      std::uint8_t* d_w = nullptr;
+      CheckHip(hipMalloc(&d_w, packed.size() + tail), "attention weights");
+      CheckHip(
+          hipMemcpy(d_w, packed.data(), packed.size(), hipMemcpyHostToDevice),
+          "attention weights upload");
+      CheckHip(hipMemset(d_w + packed.size(), 0, tail),
+               "attention weights tail");
+      for (std::size_t n = 1; n <= tokens; ++n) {
+        const std::size_t count = n * k;
+        CheckHip(hipMemcpy(d_x, src.data(), count * 4, hipMemcpyHostToDevice),
+                 "attention plain input upload");
+        CheckHip(hipMemcpy(d_z, src.data(), count * 4, hipMemcpyHostToDevice),
+                 "attention q8 input upload");
+        CheckHip(hipMemcpy(d_ref, dirty.data(), dirty.size() * 4,
+                           hipMemcpyHostToDevice),
+                 "poison attention projection");
+        CheckHip(hipMemcpy(d_actual, dirty.data(), dirty.size() * 4,
+                           hipMemcpyHostToDevice),
+                 "poison attention prequantized");
+        q::SigmoidMul(d_x, d_gate, count, nullptr);
+        if (!q::SigmoidMulQ8_1(d_z, d_gate, count, d_q, nullptr))
+          throw std::runtime_error("fused attention output gate failed");
+        const auto plain = Download(d_x, count);
+        const auto fused = Download(d_z, count);
+        if (std::memcmp(plain.data(), fused.data(), count * 4) != 0)
+          throw std::runtime_error(
+              "fused attention output gate changed the F32 rows");
+        if (qfn_mmq_quantize_q8_1(d_x, d_q_ref, static_cast<int>(n),
+                                  static_cast<int>(k), nullptr) != 0)
+          throw std::runtime_error("attention q8 reference failed");
+        const std::size_t row_bytes = qbytes / tokens;
+        const auto reference_q = Download(d_q_ref, qbytes);
+        const auto fused_q = Download(d_q, qbytes);
+        if (std::memcmp(reference_q.data(), fused_q.data(), n * row_bytes) != 0)
+          throw std::runtime_error(
+              "fused attention output gate changed the Q8_1 rows for type " +
+              std::to_string(static_cast<unsigned>(formats[f])) + " width " +
+              std::to_string(n));
+        if (qfn_mmq_dense_vec(static_cast<int>(formats[f]), d_w, d_x, d_ref,
+                              static_cast<int>(m), static_cast<int>(n),
+                              static_cast<int>(k), nullptr) != 0 ||
+            qfn_mmq_dense_vec_preq(static_cast<int>(formats[f]), d_w, d_q,
+                                   d_actual, static_cast<int>(m),
+                                   static_cast<int>(n), static_cast<int>(k),
+                                   nullptr) != 0)
+          throw std::runtime_error("attention projection failed");
+        const auto expected = Download(d_ref, out_count);
+        const auto actual = Download(d_actual, out_count);
+        if (std::memcmp(expected.data(), actual.data(),
+                        n * m * sizeof(float)) != 0)
+          throw std::runtime_error(
+              "attention output projection differs from the F32 entry for "
+              "type " +
+              std::to_string(static_cast<unsigned>(formats[f])) + " width " +
+              std::to_string(n));
+        for (std::size_t i = n * m; i < out_count; ++i)
+          if (actual[i] != poison)
+            throw std::runtime_error(
+                "attention output projection overwrote its guard");
+      }
+      CheckHip(hipFree(d_w), "attention weights free");
+    }
+  }
+  std::cout << "attention output handoff: Q8_1 rows and every dense format "
+               "exact at 1..8 tokens\n";
+  for (void* p : {static_cast<void*>(d_gate), static_cast<void*>(d_src),
+                  static_cast<void*>(d_x), static_cast<void*>(d_z),
+                  static_cast<void*>(d_ref), static_cast<void*>(d_actual),
+                  static_cast<void*>(d_q), static_cast<void*>(d_q_ref)})
+    CheckHip(hipFree(p), "attention handoff free");
 }
 
 /// One-shot and chunked prefill must write identical logits per output
@@ -2237,6 +2828,7 @@ int main() {
     CheckW8A8PassWidths(2560, 6144, 1549, 0x5B6144U);
     CheckW8A8PassWidths(320, 10240, 1549, 0x5A0320U);
     CheckW8A8PassWidths(640, 2560, 1619, 0x5A0640U);
+    CheckSwigluHalf();
     CheckDenseRejectsNonDense();
     // Per-type dense projections against the CPU-dequantized oracle: the
     // decode-width vector path, the tiled MMQ path, and a wide batch.
@@ -2306,6 +2898,12 @@ int main() {
                          true);
     CheckDenseChunkExact(q::WeightType::kIQ4_NL, 2560, 640, 136, 94, seed++,
                          true);
+    // The wide SSM output projection accepts the GDN producer's padded F16
+    // pitch for every K-quant/IQ format.
+    for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                               q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
+                               q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS})
+      CheckDenseQuantStrided(type, seed++);
     // Stacked-vs-separate exactness for the formats the GSQ-RCO mixes
     // actually stack (same-type attention triples and SSM pairs), at the
     // production shapes: [12288; 512; 512] attention and [10240; 6144]
@@ -2338,6 +2936,38 @@ int main() {
     CheckDenseVecTokens(q::WeightType::kIQ4_NL, 2560, 640, 8, seed++);
     CheckDenseVecTokens(q::WeightType::kQ2_0, 2560, 640, 8, seed++);
     CheckDenseVecTokens(q::WeightType::kQ2_0, 129, 320, 8, seed++);
+    // Same-type attention stacks run the fused projection epilogue over
+    // every dense K-quant/IQ format, at a partial token tile and a full
+    // prefill chunk width.
+    for (auto type :
+         {gufo::core::GgmlType::kQ4_K, gufo::core::GgmlType::kQ5_K,
+          gufo::core::GgmlType::kQ6_K, gufo::core::GgmlType::kIQ4_NL,
+          gufo::core::GgmlType::kIQ4_XS, gufo::core::GgmlType::kIQ3_S}) {
+      CheckAttentionProjectionQuant(type, 33);
+      CheckAttentionProjectionQuant(type, 1024);
+    }
+    CheckAttentionProjectionQuant(gufo::core::GgmlType::kQ6_K, 1025);
+    CheckAttentionProjectionQuant(gufo::core::GgmlType::kQ6_K, 2049);
+    // Mixed-type attention layers run the same fused epilogue per
+    // independently typed Q/K/V tensor, in both YaRN modes, at partial and
+    // full token tiles.
+    for (const auto yarn :
+         {gufo::models::qwen38_flash_next::YarnRope{},
+          gufo::models::qwen38_flash_next::MakeYarnRope(
+              {.factor = 2.5F, .original_context = 262144}, 64, 1e7F)}) {
+      for (const std::uint32_t batch : {9U, 33U, 1024U, 1025U, 2049U}) {
+        CheckAttentionMixed(gufo::core::GgmlType::kIQ4_XS,
+                            gufo::core::GgmlType::kQ6_K,
+                            gufo::core::GgmlType::kQ5_K, batch, yarn);
+      }
+      CheckAttentionMixed(gufo::core::GgmlType::kQ4_K,
+                          gufo::core::GgmlType::kQ6_K,
+                          gufo::core::GgmlType::kIQ4_XS, 33, yarn);
+      CheckAttentionMixed(gufo::core::GgmlType::kQ5_K,
+                          gufo::core::GgmlType::kIQ4_XS,
+                          gufo::core::GgmlType::kQ6_K, 1024, yarn);
+    }
+    CheckAttentionOutputHandoff();
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.

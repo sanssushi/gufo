@@ -105,6 +105,14 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
   return values;
 }
 
+std::vector<__half> DownloadHalf(HipBuffer<__half>* source, std::size_t count) {
+  std::vector<__half> values(count);
+  CheckHip(hipMemcpy(values.data(), source->get(), count * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "half download");
+  return values;
+}
+
 void CheckPreparation(std::uint32_t n, std::uint32_t start,
                       std::uint32_t rotary, const qfn::YarnRope& yarn = {}) {
   constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
@@ -547,6 +555,54 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     throw std::runtime_error("WMMA attention replay changed the output");
   }
   {
+    // The wide Q6_K attention-output projection reads the gated rows at a
+    // padded F16 pitch. The producer's bytes must equal the F32 output
+    // narrowed by the production conversion, and must touch only the live
+    // columns of each row.
+    constexpr std::uint32_t kPad = 32;
+    const std::uint32_t pitch = kQWidth + kPad;
+    const __half poison = __float2half_rn(1234.5F);
+    const std::size_t padded_count = std::size_t(n_tokens) * pitch + 8;
+    const std::vector<__half> poisoned(padded_count, poison);
+    HipBuffer<__half> d_half(padded_count);
+    HipBuffer<__half> d_narrow(q_count);
+    Upload(&d_half, poisoned);
+    if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
+                                mask_ptr, mask_words, d_wmma.get(), n_tokens,
+                                start_pos, kHeads, kKvHeads, kDim, kRatio,
+                                nullptr, false, d_half.get(), pitch)) {
+      throw std::runtime_error(
+          "WMMA attention rejected the padded half output");
+    }
+    q::NarrowActivations(d_wmma.get(), d_narrow.get(), false, q_count, nullptr);
+    CheckHip(hipDeviceSynchronize(), "half attention synchronization");
+    const auto half = DownloadHalf(&d_half, padded_count);
+    const auto narrow = DownloadHalf(&d_narrow, q_count);
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+      for (std::uint32_t i = 0; i < kQWidth; ++i) {
+        const __half expected = narrow[std::size_t(t) * kQWidth + i];
+        const __half actual = half[std::size_t(t) * pitch + i];
+        if (std::memcmp(&expected, &actual, sizeof(__half)) != 0) {
+          throw std::runtime_error(
+              "padded half attention differs from the F32 narrow");
+        }
+      }
+      for (std::uint32_t i = kQWidth; i < pitch; ++i) {
+        if (std::memcmp(&half[std::size_t(t) * pitch + i], &poison,
+                        sizeof(__half)) != 0) {
+          throw std::runtime_error(
+              "padded half attention overwrote its row padding");
+        }
+      }
+    }
+    for (std::size_t i = std::size_t(n_tokens) * pitch; i < padded_count; ++i) {
+      if (std::memcmp(&half[i], &poison, sizeof(__half)) != 0) {
+        throw std::runtime_error(
+            "padded half attention overwrote its output guard");
+      }
+    }
+  }
+  {
     constexpr float poison = -12345.0F;
     Upload(&d_wmma, std::vector<float>(q_count, poison));
     if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
@@ -885,6 +941,13 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
   HipBuffer<float> queries(count), gates(count), full(count), chunked(count);
   HipBuffer<__half> keys(std::size_t(n) * kKvWidth),
       values(std::size_t(n) * kKvWidth);
+  constexpr std::uint32_t kPad = 32;
+  const std::uint32_t pitch = kQWidth + kPad;
+  const __half poison = __float2half_rn(4321.0F);
+  std::vector<__half> poisoned(std::size_t(n) * pitch + 8, poison);
+  HipBuffer<__half> half_full(poisoned.size()), half_chunked(poisoned.size());
+  Upload(&half_full, poisoned);
+  Upload(&half_chunked, poisoned);
   Upload(&queries, MakeValues(count, 412, 4.0F));
   Upload(&gates, MakeValues(count, 721, 3.0F));
   for (auto* destination : {&keys, &values}) {
@@ -895,20 +958,33 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
                    [](float x) { return __float2half(x); });
     Upload(destination, half);
   }
-  const auto run = [&](std::uint32_t start, std::uint32_t rows, float* out) {
+  const auto run = [&](std::uint32_t start, std::uint32_t rows, float* out,
+                       __half* half) {
     const auto offset = std::size_t(start) * kQWidth;
-    if (!q::WmmaCausalAttention(queries.get() + offset, gates.get() + offset,
-                                keys.get(), values.get(), nullptr, 0,
-                                out + offset, rows, start, kHeads, kKvHeads,
-                                kDim, kRatio, nullptr)) {
+    if (!q::WmmaCausalAttention(
+            queries.get() + offset, gates.get() + offset, keys.get(),
+            values.get(), nullptr, 0, out + offset, rows, start, kHeads,
+            kKvHeads, kDim, kRatio, nullptr, false,
+            half == nullptr ? nullptr : half + std::size_t(start) * pitch,
+            pitch)) {
       throw std::runtime_error("chunk attention rejected geometry");
     }
   };
-  run(0, n, full.get());
-  run(0, split, chunked.get());
-  run(split, n - split, chunked.get());
+  run(0, n, full.get(), nullptr);
+  run(0, split, chunked.get(), nullptr);
+  run(split, n - split, chunked.get(), nullptr);
+  run(0, n, full.get(), half_full.get());
+  run(0, split, chunked.get(), half_chunked.get());
+  run(split, n - split, chunked.get(), half_chunked.get());
+  CheckHip(hipDeviceSynchronize(), "chunk attention");
   const auto a = Download(&full, count);
   const auto b = Download(&chunked, count);
+  const auto ha = DownloadHalf(&half_full, poisoned.size());
+  const auto hb = DownloadHalf(&half_chunked, poisoned.size());
+  HipBuffer<__half> narrowed(count);
+  q::NarrowActivations(full.get(), narrowed.get(), false, count, nullptr);
+  CheckHip(hipDeviceSynchronize(), "chunk narrow");
+  const auto narrow = DownloadHalf(&narrowed, count);
   std::size_t differences = 0, first = count;
   float max_error = 0;
   for (std::size_t i = 0; i < count; ++i) {
@@ -916,6 +992,39 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
       ++differences;
       first = std::min(first, i);
       max_error = std::max(max_error, std::abs(a[i] - b[i]));
+    }
+  }
+  for (std::uint32_t t = 0; t < n; ++t) {
+    for (std::uint32_t i = 0; i < kQWidth; ++i) {
+      const std::size_t index = std::size_t(t) * pitch + i;
+      if (std::memcmp(&ha[index], &narrow[std::size_t(t) * kQWidth + i],
+                      sizeof(__half)) != 0 ||
+          std::memcmp(&ha[index], &hb[index], sizeof(__half)) != 0) {
+        std::uint16_t hb_bits, n_bits, c_bits;
+        std::memcpy(&hb_bits, &ha[index], sizeof(hb_bits));
+        std::memcpy(&n_bits, &narrow[std::size_t(t) * kQWidth + i],
+                    sizeof(n_bits));
+        std::memcpy(&c_bits, &hb[index], sizeof(c_bits));
+        throw std::runtime_error(
+            "chunk attention changed the padded half rows t=" +
+            std::to_string(t) + " i=" + std::to_string(i) + " full=0x" +
+            std::to_string(hb_bits) + " narrow=0x" + std::to_string(n_bits) +
+            " chunk=0x" + std::to_string(c_bits));
+      }
+    }
+    for (std::uint32_t i = kQWidth; i < pitch; ++i) {
+      if (std::memcmp(&ha[std::size_t(t) * pitch + i], &poison,
+                      sizeof(__half)) != 0 ||
+          std::memcmp(&hb[std::size_t(t) * pitch + i], &poison,
+                      sizeof(__half)) != 0) {
+        throw std::runtime_error("chunk attention overwrote its row padding");
+      }
+    }
+  }
+  for (std::size_t i = std::size_t(n) * pitch; i < poisoned.size(); ++i) {
+    if (std::memcmp(&ha[i], &poison, sizeof(__half)) != 0 ||
+        std::memcmp(&hb[i], &poison, sizeof(__half)) != 0) {
+      throw std::runtime_error("chunk attention overwrote its output guard");
     }
   }
   std::cout << "chunk attention n=" << n << " split=" << split
@@ -928,6 +1037,7 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
 void CheckWmmaLiveExtent() {
   HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
   HipBuffer<__half> k(kKvWidth), v(kKvWidth);
+  HipBuffer<__half> half_out(std::size_t{4} * (kQWidth + 32));
   HipBuffer<std::uint32_t> mask(3200);
   // Both cases are refused before any launch, so the small buffers are safe.
   const auto accepts = [&](std::uint32_t n, std::uint32_t start,
@@ -946,8 +1056,18 @@ void CheckWmmaLiveExtent() {
     throw std::runtime_error("WMMA context limit is not 2^30 tokens");
   if (accepts(4, limit - 3, (1U << 23) + 1))
     throw std::runtime_error("WMMA accepted an extent past 2^28 blocks");
+  const auto accepts_half = [&](bool last_only, std::uint32_t pitch) {
+    return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
+                                  mask.get(), 3200, out.get(), 4, 0, kHeads,
+                                  kKvHeads, kDim, kRatio, nullptr, last_only,
+                                  half_out.get(), pitch);
+  };
+  if (accepts_half(true, kQWidth + 32))
+    throw std::runtime_error("WMMA accepted half output with last_only");
+  if (accepts_half(false, kQWidth - 8) || accepts_half(false, kQWidth + 4))
+    throw std::runtime_error("WMMA accepted an invalid half output pitch");
   std::cout << "WMMA live extent: limit " << limit
-            << " tokens, narrow stride refused\n";
+            << " tokens, narrow stride and half pitch refused\n";
 }
 
 }  // namespace

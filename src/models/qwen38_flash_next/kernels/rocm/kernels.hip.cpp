@@ -4145,7 +4145,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
-    float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
+    float* __restrict__ out, __half* __restrict__ out_half,
+    std::uint32_t out_stride, std::uint32_t start_pos, std::uint32_t n_tokens,
     std::uint32_t first_query_group = 0) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
@@ -4891,7 +4892,15 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         if (gate != nullptr) {
           value *= SigmoidF(gate[offset]);
         }
-        out[offset] = value;
+        if (out_half != nullptr) {
+          const std::size_t half_offset =
+              (static_cast<std::size_t>(row_query(rb, row)) * out_stride) +
+              (static_cast<std::size_t>(row_head(rb, row)) * kHeadDim) +
+              (dim_tile * 16) + sub;
+          out_half[half_offset] = __float2half_rn(value);
+        } else {
+          out[offset] = value;
+        }
       }
     }
   }
@@ -6975,6 +6984,9 @@ struct AttentionProjectionOutput {
   float eps;
   const qwen::vision::DeviceRope* rope;
   YarnRope yarn;
+  /// First global projection head this matrix carries: query/gate heads
+  /// 0-47, key heads 48-49, value heads 50-51.
+  std::uint32_t head_base;
 };
 
 /// Eight BF16 weight lanes (one uint4 fragment) rounded to F16 lanes as
@@ -7381,7 +7393,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     constexpr unsigned stride = 36, dim = 256, width = 6144, kvwidth = 512;
     float* scratch = reinterpret_cast<float*>(s_lds);
     float* tile = scratch + wave_id * 16 * stride;
-    const unsigned projection_head = r_block / 256;
+    const unsigned projection_head = attention.head_base + r_block / 256;
     const bool query = projection_head < 48 && (projection_head % 2) == 0;
     const bool key = projection_head >= 48 && projection_head < 50;
     const bool gate = projection_head < 48 && (projection_head % 2) == 1;
@@ -7669,13 +7681,80 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   }
 }
 
+template<core::GgmlType QType, int kRowGroup>
+void LaunchAttentionF16(const void* weights, const __half* input,
+                        std::uint32_t n_tokens, std::uint32_t rows,
+                        const AttentionProjectionOutput& output,
+                        hipStream_t stream) {
+  // One 256-row tile per query, gate, key or value head. Four row tiles per
+  // token tile in launch order share each activation tile's read (8.8 to
+  // 7.9 ms at 4,096 tokens); the two-tile K/V matrices launch one tile per
+  // group. One K block per LDS stage halves the stage to 24 KB, so three
+  // blocks share a WGP instead of two (7.8 to 7.3 ms); the K order is
+  // unchanged.
+  const dim3 grid((n_tokens + 127) / 128, rows / 256);
+  if (output.yarn.enabled != 0) {
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<256, 128, 1, 8, 1, kRowGroup, false, false, true,
+                            false, false, false, true, false, QType>),
+        grid, dim3(kThreads), 0, stream, weights, input, nullptr, n_tokens,
+        rows, 2560, nullptr, nullptr, nullptr, nullptr, nullptr, output);
+  } else {
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<256, 128, 1, 8, 1, kRowGroup, false, false, true,
+                            false, false, false, false, false, QType>),
+        grid, dim3(kThreads), 0, stream, weights, input, nullptr, n_tokens,
+        rows, 2560, nullptr, nullptr, nullptr, nullptr, nullptr, output);
+  }
+}
+
+template<int kRowGroup>
+bool LaunchAttentionType(core::GgmlType type, const void* weights,
+                         const __half* input, std::uint32_t n_tokens,
+                         std::uint32_t rows,
+                         const AttentionProjectionOutput& output,
+                         hipStream_t stream) {
+  switch (type) {
+    case core::GgmlType::kQ8_0:
+      LaunchAttentionF16<core::GgmlType::kQ8_0, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kQ4_K:
+      LaunchAttentionF16<core::GgmlType::kQ4_K, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kQ5_K:
+      LaunchAttentionF16<core::GgmlType::kQ5_K, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kQ6_K:
+      LaunchAttentionF16<core::GgmlType::kQ6_K, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kIQ4_NL:
+      LaunchAttentionF16<core::GgmlType::kIQ4_NL, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kIQ4_XS:
+      LaunchAttentionF16<core::GgmlType::kIQ4_XS, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    case core::GgmlType::kIQ3_S:
+      LaunchAttentionF16<core::GgmlType::kIQ3_S, kRowGroup>(
+          weights, input, n_tokens, rows, output, stream);
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope,
-                      const YarnRope& yarn) {
+                      const YarnRope& yarn, core::GgmlType type) {
   if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
@@ -7683,26 +7762,42 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
     return false;
   const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
                                          keys,    values,  position, theta,
-                                         eps,     rope,    yarn};
-  // One 256-row tile per query, gate, key or value head (52). Four row
-  // tiles per token tile in launch order share each activation tile's read
-  // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
-  // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
-  // 7.3 ms); the K order is unchanged.
-  if (yarn.enabled != 0) {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false,
-                                           true, false, false, false, true>),
-                       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
-                       stream, weights, input, nullptr, n_tokens, 13312, 2560,
-                       nullptr, nullptr, nullptr, nullptr, nullptr, output);
-    return true;
-  }
-  hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
-      dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
-      input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
-      nullptr, output);
-  return true;
+                                         eps,     rope,    yarn,     0};
+  return LaunchAttentionType<4>(type, weights, input, n_tokens, 13312, output,
+                                stream);
+}
+
+bool AttentionMixedF16Gemm(const void* q_weights, const void* k_weights,
+                           const void* v_weights, const __half* input,
+                           const float* q_gamma, const float* k_gamma,
+                           float* query, float* gate, __half* keys,
+                           __half* values, std::uint32_t n_tokens,
+                           const std::uint32_t* position, float theta,
+                           float eps, hipStream_t stream,
+                           const qwen::vision::DeviceRope* rope,
+                           const YarnRope& yarn, core::GgmlType q_type,
+                           core::GgmlType k_type, core::GgmlType v_type) {
+  if (n_tokens == 0 || q_weights == nullptr || k_weights == nullptr ||
+      v_weights == nullptr || input == nullptr || q_gamma == nullptr ||
+      k_gamma == nullptr || query == nullptr || gate == nullptr ||
+      keys == nullptr || values == nullptr || position == nullptr)
+    return false;
+  // Q and gate alternate within each query head (heads 0-47); K and V carry
+  // the same two heads under their global projection numbers. Each matrix
+  // addresses its own rows locally, while the global head selects the
+  // epilogue destination.
+  AttentionProjectionOutput output{q_gamma,  k_gamma, query, gate, keys, values,
+                                   position, theta,   eps,   rope, yarn, 0};
+  if (!LaunchAttentionType<4>(q_type, q_weights, input, n_tokens, 12288, output,
+                              stream))
+    return false;
+  output.head_base = 48;
+  if (!LaunchAttentionType<1>(k_type, k_weights, input, n_tokens, 512, output,
+                              stream))
+    return false;
+  output.head_base = 50;
+  return LaunchAttentionType<1>(v_type, v_weights, input, n_tokens, 512, output,
+                                stream);
 }
 
 bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
@@ -7856,7 +7951,7 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 template<core::GgmlType QType>
 void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
-                         hipStream_t stream) {
+                         hipStream_t stream, std::size_t input_stride) {
   if (batch >= 96) {
     constexpr int kWideBM = 256;
     constexpr int kBN = 128;
@@ -7866,11 +7961,22 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
       // The output projection's activation is 50 MB at 4,096 tokens. In
       // grid order the resident blocks each walk a different token tile of
       // it; walking five row tiles of a token tile first shares each
-      // activation tile between them. Only the launch order changes.
-      hipLaunchKernelGGL(
-          (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
-                              false, false, false, false, false, QType>),
-          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+      // activation tile between them. Only the launch order changes. The
+      // padded pitch keeps the producer-written rows off the 12 KiB cache
+      // set stride.
+      if (input_stride != 0) {
+        hipLaunchKernelGGL(
+            (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
+                                false, false, true, false, false, QType>),
+            grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
+            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, 0,
+            input_stride);
+      } else {
+        hipLaunchKernelGGL(
+            (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
+                                false, false, false, false, false, QType>),
+            grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+      }
     } else if (batch >= 1024 && m == 2560) {
       // Shared-expert down: pairs of row tiles per token tile (-11 %).
       hipLaunchKernelGGL(
@@ -7895,36 +8001,42 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
 
 bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
                        float* out, std::size_t batch, std::size_t m,
-                       std::size_t k, hipStream_t stream) {
+                       std::size_t k, hipStream_t stream,
+                       std::size_t input_stride) {
   if (w == nullptr || x == nullptr || out == nullptr || batch == 0 || m == 0 ||
       !KQuantWmmaType(type) || k == 0 ||
       k % quant::QuantizedBlockElements(type) != 0) {
     return false;
   }
+  if (input_stride != 0 && input_stride != k &&
+      (batch < 1024 || m != 2560 || k != 6144 || input_stride < k ||
+       input_stride % 8 != 0)) {
+    return false;
+  }
   switch (type) {
     case core::GgmlType::kQ4_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ4_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ4_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kQ5_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ5_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ5_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kQ6_K:
-      LaunchDenseQuantF16<core::GgmlType::kQ6_K>(w, x, out, batch, m, k,
-                                                 stream);
+      LaunchDenseQuantF16<core::GgmlType::kQ6_K>(w, x, out, batch, m, k, stream,
+                                                 input_stride);
       return true;
     case core::GgmlType::kIQ4_NL:
       LaunchDenseQuantF16<core::GgmlType::kIQ4_NL>(w, x, out, batch, m, k,
-                                                   stream);
+                                                   stream, input_stride);
       return true;
     case core::GgmlType::kIQ4_XS:
       LaunchDenseQuantF16<core::GgmlType::kIQ4_XS>(w, x, out, batch, m, k,
-                                                   stream);
+                                                   stream, input_stride);
       return true;
     case core::GgmlType::kIQ3_S:
       LaunchDenseQuantF16<core::GgmlType::kIQ3_S>(w, x, out, batch, m, k,
-                                                  stream);
+                                                  stream, input_stride);
       return true;
     default:
       return false;
@@ -8530,11 +8642,15 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only) {
+                         bool last_only, __half* out_half,
+                         std::uint32_t out_stride) {
   if (WmmaCausalAttentionContextLimit(heads, kv_heads, d, ratio) == 0 ||
       n_tokens == 0) {
     return false;
   }
+  if (out_half != nullptr &&
+      (last_only || out_stride < kWmmaAttnWidth || out_stride % 8 != 0))
+    return false;
   if (mask != nullptr) {
     // The kernel reads the union mask over the LIVE visible extent;
     // mask_words is only the row stride and may be wider (the session
@@ -8556,7 +8672,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     hipLaunchKernelGGL(
         (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
         dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, first_group);
+        out, out_half, out_stride, start_pos, n_tokens, first_group);
     return true;
   }
   const std::uint32_t first_group =
@@ -8567,7 +8683,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   hipLaunchKernelGGL(
       (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-      out, start_pos, n_tokens, first_group);
+      out, out_half, out_stride, start_pos, n_tokens, first_group);
   return true;
 }
 
