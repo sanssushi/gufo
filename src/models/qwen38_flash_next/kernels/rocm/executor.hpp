@@ -723,10 +723,12 @@ private:
   /// `normed` says the previous Combine already produced m's grouped norm
   /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
   /// `half_only` leaves only the F16 copy of `mixed`; `no_f32` keeps its
-  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads.
+  /// F16 and tiled Q8 copies but skips the F32 rows nothing reads. `q8t`
+  /// says a following dense projection reads the tiled Q8 copy of `mixed`.
   bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
              float* inject, std::uint32_t n_tokens, std::string* error_msg,
-             bool half_only = false, bool no_f32 = false) const;
+             bool half_only = false, bool no_f32 = false,
+             bool q8t = true) const;
   /// Share mixer projections across decode requests without selecting the
   /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -735,12 +737,18 @@ private:
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
-  /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
-  /// partials in s_.inject (inject_fused_). A decode combine whose `next`
-  /// mixer HcMix runs immediately after, with nothing reading res or xn in
-  /// between, is left to that mixer's single launch (FusedMixer).
+  /// mixer's F32 or BF16 `inject_w` (`inject_type`), the fused MoE combine
+  /// also leaves its inject partials in s_.inject (inject_fused_). A decode
+  /// combine whose `next` mixer HcMix runs immediately after, with nothing
+  /// reading res or xn in between, is left to that mixer's single launch
+  /// (FusedMixer). Decode batches write the norm's Q8_1 rows when that
+  /// mixer's down projection reads them (`norm_q8_1`). `padded_norm` writes
+  /// the F16 rows with a 32-half pad when the next mixer's wide BF16 down
+  /// projection reads them.
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr,
+               const void* inject_w = nullptr, bool norm_q8 = true,
+               bool norm_q8_1 = true, WeightType inject_type = WeightType::kF32,
+               bool padded_norm = false,
                const DeviceMixer* next = nullptr) const;
   /// Whether HcMix runs a decode batch of `m` as one HcMixQ8Fused launch.
   bool FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const;
@@ -865,8 +873,8 @@ private:
     return std::tie(moe_pending_, defer_residual_, res_deferred_,
                     shexp_half_ready_, q8t_src_, q8t_rows_, q8t_cols_,
                     half_src_, half_rows_, half_cols_, half_bf16_, xn_half_,
-                    inject_parts_, inject_fused_, q8_slot_, xn_q8_ready_,
-                    mixed_q8_ready_, pending_combine_);
+                    xn_half_pitch_, inject_parts_, inject_fused_, q8_slot_,
+                    xn_q8_ready_, mixed_q8_ready_, pending_combine_);
   }
   /// A copy of the DispatchState values, to assign back to it.
   [[nodiscard]] auto SavedDispatch() const {
@@ -1174,6 +1182,9 @@ private:
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
+  /// Extra halves per s_.xn_half row, reserved when the model's BF16 HC-down
+  /// reads a padded norm. Zero preserves the packed row layout.
+  std::uint32_t hc_norm_pad_{0};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
   /// Set before an attention-side combine whose FFN combine fuses the MoE
@@ -1198,11 +1209,14 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  /// Within-row stride of the current s_.xn_half rows in halves; zero is
+  /// packed. The allocation always reserves the padded row capacity.
+  mutable std::uint32_t xn_half_pitch_{0};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
-  /// Inject weights whose partials the last combine already wrote to
-  /// s_.inject, so the following HcMix skips its inject pass.
-  mutable const float* inject_fused_{nullptr};
+  /// Inject weights (F32 or BF16) whose partials the last combine already
+  /// wrote to s_.inject, so the following HcMix skips its inject pass.
+  mutable const void* inject_fused_{nullptr};
   mutable unsigned q8_slot_{0};
   /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
   struct ReadyRows {

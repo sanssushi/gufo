@@ -75,7 +75,7 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
   s.tokens += r;
   s.res += r * c.HcDim();
   s.xn += r * c.HcDim();
-  s.xn_half += r * c.HcDim();
+  s.xn_half += r * (c.HcDim() + hc_norm_pad_);
   s.lo += r * c.hc_low_rank;
   s.hc_gate += r * c.HcDim();
   s.mixed += r * c.hidden_size;
@@ -134,6 +134,7 @@ void Executor::UseScratch(const Scratch& scratch) const {
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   xn_half_ = false;
+  xn_half_pitch_ = 0;
   moe_pending_ = false;
   moe_f32_rows_ = false;
 }
@@ -153,6 +154,7 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                           std::string* error) const {
   const auto& c = config();
   xn_half_ = false;
+  xn_half_pitch_ = 0;
   mixed_q8_ready_ = {};
   if (!normed) {
     xn_q8_ready_ = {};
@@ -1366,7 +1368,8 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
           pending_combine_.mixer == nullptr && !res_deferred_ &&
           !defer_residual_ && !moe_pending_) {
         DropReadyQ8();
-        Combine(base.res, l.hc_ffn.norm.f32(), rows, nullptr, &l.hc_ffn);
+        Combine(base.res, l.hc_ffn.norm.f32(), rows, nullptr, true, true,
+                WeightType::kF32, false, &l.hc_ffn);
         if (!HcMix(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                    error))
           return false;
