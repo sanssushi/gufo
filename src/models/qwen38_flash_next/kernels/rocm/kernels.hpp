@@ -485,6 +485,16 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);
 
+/// Batched form of the 16-bit few-row long-K waves (the BF16 [320, 10240]
+/// hyper-connection down projection): every eight-row group of `n_tokens`
+/// runs in one grid, and a ragged final group stores only its live rows.
+/// Each row keeps the eight-row wave's arithmetic. Returns false when the
+/// shape is outside the wide class (BF16 weights, m <= 512, k >= 8192) or
+/// `n_tokens` fits one group; the caller then keeps its own decomposition.
+bool SmallGemmWideBatch(const void* w, WeightType type, const float* x,
+                        float* out, std::uint32_t n_tokens, std::uint32_t m,
+                        std::uint32_t k, hipStream_t stream);
+
 /// PLE gate: for every stream s, sc = dot(key_n[t][s], query_n[t][s]) /
 /// sqrt(hidden); gated[t][s][i] = value[t][i] * sigmoid(sgn(sc) *
 /// sqrt(max(|sc|, 1e-6))).

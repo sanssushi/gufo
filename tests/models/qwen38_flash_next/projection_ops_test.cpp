@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -2409,12 +2410,145 @@ void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
             "prequantized dense projection overwrote its guard");
     }
   }
+  // The eight-row chunks the wide call replaces run the same rows: their
+  // bytes must equal both the scalar reference and the whole-batch calls.
+  for (int mode = 0; mode < 2; ++mode) {
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "dense vec guards");
+    for (std::size_t row = 0; row < tokens; row += 8) {
+      const auto count = std::min<std::size_t>(8, tokens - row);
+      const int rc =
+          mode == 0
+              ? qfn_mmq_dense_vec(static_cast<int>(type), d_w, d_x + row * k,
+                                  d_out + row * m, static_cast<int>(m),
+                                  static_cast<int>(count), static_cast<int>(k),
+                                  nullptr)
+              : qfn_mmq_dense_vec_preq(
+                    static_cast<int>(type), d_w,
+                    static_cast<const std::uint8_t*>(d_q) +
+                        qfn_mmq_q8_1_bytes(static_cast<int>(row),
+                                           static_cast<int>(k)),
+                    d_out + row * m, static_cast<int>(m),
+                    static_cast<int>(count), static_cast<int>(k), nullptr);
+      if (rc != 0)
+        throw std::runtime_error("dense vec eight-row chunk failed");
+    }
+    const auto chunked = Download(d_out, zeros.size());
+    if (std::memcmp(scalar.data(), chunked.data(),
+                    tokens * m * sizeof(float)) != 0)
+      throw std::runtime_error(
+          "dense vec eight-row chunks differ from the scalar rows: m=" +
+          std::to_string(m) + " k=" + std::to_string(k));
+    for (std::size_t i = tokens * m; i < zeros.size(); ++i)
+      if (chunked[i] != poison)
+        throw std::runtime_error("dense vec chunk overwrote its guard");
+  }
   std::cout << "dense vec " << std::to_string(static_cast<unsigned>(type))
             << " m=" << m << " k=" << k << ": rows exact at 1.." << tokens
-            << " tokens, prequantized exact\n";
+            << " tokens, prequantized exact, eight-row chunks exact\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_out), static_cast<void*>(d_q)})
     CheckHip(hipFree(p), "dense vec free");
+}
+
+/// Two streams drive the grouped dense entry at once over disjoint rows,
+/// weight copies and distinct activation inputs: each stream's live
+/// quantization scratch must keep its own bytes. Every allocation, upload and
+/// scalar reference runs before the launch-only section, and both arenas are
+/// warmed there, so nothing between the two launches allocates or drains the
+/// device.
+void CheckDenseVecStreams(std::uint32_t seed) {
+  constexpr std::size_t m = 129, k = 2560, rows = 33, guard = 8;
+  constexpr float poison = -1234567.0F;
+  const q::WeightType types[3] = {q::WeightType::kIQ4_XS, q::WeightType::kQ5_K,
+                                  q::WeightType::kQ6_K};
+  hipStream_t streams[3] = {};
+  for (auto& stream : streams)
+    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+             "dense vec streams");
+  std::array<std::vector<float>, 3> x;
+  for (auto& input : x) {
+    input.resize(rows * k);
+    for (float& v : input)
+      v = Uniform(&seed, 2.0F);
+  }
+  const std::vector<float> zeros(rows * m + guard, poison);
+  std::array<DenseWeights, 3> w{MakeQuant(types[0], m, k, seed),
+                                MakeQuant(types[1], m, k, seed ^ 0x5EEDU),
+                                MakeQuant(types[2], m, k, seed ^ 0xA11CEU)};
+  std::array<std::uint8_t*, 3> d_w{};
+  std::array<float*, 3> d_x{}, d_out{};
+  std::array<std::vector<float>, 3> scalar;
+  constexpr std::size_t tail = 4096;
+  for (int i = 0; i < 3; ++i) {
+    CheckHip(hipMalloc(&d_w[i], w[i].packed.size() + tail), "stream weights");
+    CheckHip(hipMalloc(&d_x[i], x[i].size() * 4), "stream input");
+    CheckHip(hipMalloc(&d_out[i], zeros.size() * 4), "stream output");
+    CheckHip(hipMemcpy(d_w[i], w[i].packed.data(), w[i].packed.size(),
+                       hipMemcpyHostToDevice),
+             "stream weights upload");
+    CheckHip(hipMemset(static_cast<std::uint8_t*>(d_w[i]) + w[i].packed.size(),
+                       0, tail),
+             "stream weights tail");
+    CheckHip(
+        hipMemcpy(d_x[i], x[i].data(), x[i].size() * 4, hipMemcpyHostToDevice),
+        "stream input upload");
+    scalar[i].resize(rows * m, poison);
+    for (std::size_t t = 0; t < rows; ++t) {
+      if (qfn_mmq_dense_vec(static_cast<int>(types[i]), d_w[i],
+                            d_x[i] + static_cast<std::size_t>(t) * k, d_out[i],
+                            static_cast<int>(m), 1, static_cast<int>(k),
+                            nullptr) != 0)
+        throw std::runtime_error("stream scalar projection failed");
+      CheckHip(hipMemcpy(scalar[i].data() + t * m, d_out[i], m * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "stream scalar output");
+    }
+    CheckHip(hipMemcpy(d_out[i], zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "stream guards");
+  }
+  // Warm each stream's arena at the tested shape, then re-poison the outputs
+  // so the two measured launches have no allocation left to make.
+  for (int i = 0; i < 3; ++i) {
+    if (qfn_mmq_dense_vec(static_cast<int>(types[i]), d_w[i], d_x[i], d_out[i],
+                          static_cast<int>(m), static_cast<int>(rows),
+                          static_cast<int>(k), streams[i]) != 0)
+      throw std::runtime_error("stream warm projection failed");
+    CheckHip(hipStreamSynchronize(streams[i]), "stream warm sync");
+    CheckHip(hipMemcpy(d_out[i], zeros.data(), zeros.size() * 4,
+                       hipMemcpyHostToDevice),
+             "stream guards");
+  }
+  // Both grouped launches were enqueued back to back before either stream
+  // drained, each reading its own activation rows and quantization scratch.
+  for (int i = 0; i < 3; ++i)
+    if (qfn_mmq_dense_vec(static_cast<int>(types[i]), d_w[i], d_x[i], d_out[i],
+                          static_cast<int>(m), static_cast<int>(rows),
+                          static_cast<int>(k), streams[i]) != 0)
+      throw std::runtime_error("stream batched projection failed");
+  for (auto& stream : streams)
+    CheckHip(hipStreamSynchronize(stream), "dense vec stream sync");
+  for (int i = 0; i < 3; ++i) {
+    const auto got = Download(d_out[i], zeros.size());
+    if (std::memcmp(scalar[i].data(), got.data(), rows * m * sizeof(float)) !=
+        0)
+      throw std::runtime_error("dense vec stream rows differ: m=" +
+                               std::to_string(m) + " k=" + std::to_string(k));
+    for (std::size_t j = rows * m; j < zeros.size(); ++j)
+      if (got[j] != poison)
+        throw std::runtime_error("dense vec stream overwrote its guard");
+  }
+  std::cout
+      << "dense vec concurrent streams: distinct rows and live scratch exact, "
+         "guards clean\n";
+  for (int i = 0; i < 2; ++i)
+    for (void* p : {static_cast<void*>(d_w[i]), static_cast<void*>(d_x[i]),
+                    static_cast<void*>(d_out[i])})
+      CheckHip(hipFree(p), "dense vec stream free");
+  for (auto& stream : streams)
+    CheckHip(hipStreamDestroy(stream), "dense vec stream destroy");
 }
 
 std::size_t QuantScaleOffset(q::WeightType type) {
@@ -2965,21 +3099,38 @@ int main() {
     CheckEmbedQuant(q::WeightType::kIQ3_S, 5, 512, seed++);
     CheckEmbedQuant(q::WeightType::kIQ4_XS, 5, 512, seed++);
     // Decode and verification batch widths share the dense vector entry: the
-    // rows must be bit-identical across the batch width.
+    // rows must be bit-identical across the batch width, including the
+    // grouped full-eight-row groups a wide verification adds.
     for (q::WeightType type :
          {q::WeightType::kQ8_0, q::WeightType::kQ2_0, q::WeightType::kQ4_K,
           q::WeightType::kQ5_K, q::WeightType::kQ6_K, q::WeightType::kIQ2_XXS,
           q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,
           q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
           q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS}) {
-      CheckDenseVecTokens(type, 64, 512, 8, seed++);
-      CheckDenseVecTokens(type, 129, 2560, 8, seed++);
+      CheckDenseVecTokens(type, 64, 512, 17, seed++);
+      CheckDenseVecTokens(type, 129, 2560, 17, seed++);
     }
-    CheckDenseVecTokens(q::WeightType::kQ6_K, 2560, 6144, 8, seed++);
-    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 2560, 6144, 8, seed++);
-    CheckDenseVecTokens(q::WeightType::kIQ4_NL, 2560, 640, 8, seed++);
-    CheckDenseVecTokens(q::WeightType::kQ2_0, 2560, 640, 8, seed++);
-    CheckDenseVecTokens(q::WeightType::kQ2_0, 129, 320, 8, seed++);
+    // Production dense, SSM-out, shared-expert and attention/head shapes.
+    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 6144, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 2560, 6144, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 2560, 6144, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 640, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kIQ4_NL, 2560, 640, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ2_0, 2560, 640, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ2_0, 129, 320, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 8192, 2560, 33, seed++);
+    // The wide verification route reuses a five-/six-bit weight row across
+    // sixteen tokens: both K geometries and both row families.
+    CheckDenseVecTokens(q::WeightType::kQ5_K, 6144, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 6144, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ5_K, 10240, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 16384, 2560, 33, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ5_K, 2560, 6144, 33, seed++);
+    // The wide verification width (eight full groups).
+    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 129, 2560, 64, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 640, 2560, 64, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ5_K, 640, 2560, 64, seed++);
+    CheckDenseVecStreams(seed++);
     // Same-type attention stacks run the fused projection epilogue over
     // every dense K-quant/IQ format, at a partial token tile and a full
     // prefill chunk width.

@@ -453,13 +453,21 @@ extern "C" int qfn_mmq_moe_gated_type(int weight_type) {
   }
 }
 
+// Non-zero when the gated vector entry groups a complete verification batch
+// (up to MMVQ_MAX_ROUTED_BATCH rows) by expert for this routed format.
+extern "C" int qfn_mmq_moe_gated_batch_type(int weight_type) {
+  const auto type = static_cast<ggml_type>(weight_type);
+  return type == GGML_TYPE_Q4_K || mmvq_moe_grouped_gated(type) ? 1 : 0;
+}
+
 static int moe_vector_projection(const char* tag, int weight_type, const void* W,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_f32, int M, int K, int n_tokens,
                                  int n_experts, int n_expert_used,
                                  hipStream_t stream, const void* W_b,
                                  float* out_b, bool gated,
-                                 const void* X_q8 = nullptr) {
+                                 const void* X_q8 = nullptr,
+                                 bool dense_rows = false) {
   const auto type = static_cast<ggml_type>(weight_type);
   if (!qfn_mmq_moe_gated_type(weight_type) && type != GGML_TYPE_Q5_1) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
@@ -486,9 +494,10 @@ static int moe_vector_projection(const char* tag, int weight_type, const void* W
             n_experts);
     return -1;
   }
-  const int max_gated_rows = type == GGML_TYPE_Q4_K
-                                 ? MMVQ_MAX_ROUTED_BATCH
-                                 : MMVQ_MAX_BATCH_SIZE;
+  const int max_gated_rows =
+      type == GGML_TYPE_Q4_K || mmvq_moe_grouped_gated(type)
+          ? MMVQ_MAX_ROUTED_BATCH
+          : MMVQ_MAX_BATCH_SIZE;
   if (gated && (n_tokens > max_gated_rows || n_expert_used > 32 ||
                 !qfn_mmq_moe_gated_type(weight_type))) {
     fprintf(stderr,
@@ -582,10 +591,12 @@ static int moe_vector_projection(const char* tag, int weight_type, const void* W
   for (int projection = 0; projection < (W_b ? 2 : 1); ++projection) {
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
-    if (n_experts == 1 && n_expert_used == 1 && n_tokens > 1 &&
-        n_tokens <= MMVQ_MAX_BATCH_SIZE) {
-      // The single-expert contract (dense rows): every token shares the
-      // expert, so the multi-token waves compute them per weight-row pair.
+    if (dense_rows && n_experts == 1 && n_expert_used == 1 &&
+        n_tokens > 1 && n_tokens <= MMVQ_MAX_ROUTED_BATCH) {
+      // The single-expert dense contract: every token shares the zero id, so
+      // the multi-token waves compute them per weight-row pair. Wider batches
+      // keep the same eight-row groups in one grouped launch. Routed callers
+      // keep the dispatch below because their ids may include inactive slots.
       mul_mat_vec_dense_multi(weights, type, input, ids, output, K, M,
                               n_tokens, input_stride, stream);
     } else {
@@ -677,7 +688,7 @@ static int dense_vector_projection(const char* tag, int weight_type,
   }
   return moe_vector_projection(tag, weight_type, W, X_f32, ids.get(), out_f32,
                                M, K, N, 1, 1, stream, nullptr, nullptr, false,
-                               X_q8);
+                               X_q8, true);
 }
 
 extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,

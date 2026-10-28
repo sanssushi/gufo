@@ -879,6 +879,140 @@ void CheckBf16UpNarrow() {
   std::cerr << "HC BF16 up exact with guards at widths 1-8\n";
 }
 
+// The batched HC-up route narrows every row once and issues one exact GEMM;
+// from 17 rows it replaces the eight-row chunks. Its bytes must equal the
+// chunks at every verification width, including the ragged tail, a head/tail
+// split and graph replay. Weight rows span F16's subnormal range and its
+// round-to-nearest ties.
+void CheckBf16UpBatches(std::uint32_t tokens) {
+  constexpr std::size_t kRows = static_cast<std::size_t>(kHidden) * kStreams;
+  constexpr std::size_t kCols = 320;
+  constexpr std::uint32_t kChunk = 8;
+  constexpr std::size_t kGuard = 32;
+  constexpr float kPoison = 1234.5F;
+  const auto x =
+      MakeValues(static_cast<std::size_t>(tokens) * kCols, 0x24681357U, 0.5F);
+  std::vector<__half> x_half(x.size());
+  std::transform(x.begin(), x.end(), x_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  const auto base = MakeValues(kRows * kCols, 0x13572468U, 0.02F);
+  std::vector<std::uint16_t> weights(base.size());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    weights[i] = FloatToBf16(base[i]);
+  }
+  const std::uint16_t specials[] = {0x0001, 0x007F, 0x0080, 0x3380,
+                                    0x33C0, 0x3C00, 0x4100, 0xC080};
+  constexpr std::size_t kSpecialCount = sizeof(specials) / sizeof(specials[0]);
+  for (std::size_t i = 0; i < weights.size(); i += 977) {
+    weights[i] = specials[(i / 977) % kSpecialCount];
+  }
+  std::vector<__half> weights_half(weights.size());
+  for (std::size_t i = 0; i < weights.size(); ++i) {
+    weights_half[i] = __float2half_rn(Bf16ToFloat(weights[i]));
+  }
+  const std::size_t out_count = static_cast<std::size_t>(tokens) * kRows;
+  HipBuffer<std::uint16_t> d_weights(weights.size());
+  HipBuffer<float> d_x(x.size()), d_ref(out_count),
+      d_out(out_count + 2 * kGuard);
+  HipBuffer<__half> d_full(x.size()), d_chunk(kChunk * kCols);
+  Upload(&d_weights, weights);
+  Upload(&d_x, x);
+  const std::vector<float> poison(d_out.bytes() / sizeof(float), kPoison);
+  const auto reset = [&] {
+    CheckHip(hipMemcpy(d_out.get(), poison.data(), d_out.bytes(),
+                       hipMemcpyHostToDevice),
+             "poison batched up output");
+  };
+  // The eight-row chunks the batched route replaces: narrow and launch per
+  // group, with the last group carrying the ragged tail.
+  for (std::uint32_t r = 0; r < tokens; r += kChunk) {
+    const std::uint32_t count = std::min(kChunk, tokens - r);
+    q::NarrowActivations(d_x.get() + static_cast<std::size_t>(r) * kCols,
+                         d_chunk.get(), false, std::size_t{count} * kCols,
+                         nullptr);
+    if (!q::UnquantizedF16Gemm(
+            d_weights.get(), d_chunk.get(),
+            d_ref.get() + static_cast<std::size_t>(r) * kRows, count, kRows,
+            kCols, nullptr, q::WeightType::kBF16)) {
+      throw std::runtime_error("HC BF16 up chunk rejected");
+    }
+  }
+  const auto reference = Download(&d_ref, out_count);
+  const auto compare = [&](const char* when) {
+    const auto actual = Download(&d_out, poison.size());
+    if (std::memcmp(reference.data(), actual.data() + kGuard,
+                    out_count * sizeof(float)) != 0) {
+      throw std::runtime_error(std::string("batched HC BF16 up changed (") +
+                               when + ", " + std::to_string(tokens) +
+                               " tokens)");
+    }
+    for (std::size_t i = 0; i < kGuard; ++i) {
+      if (actual[i] != kPoison || actual[kGuard + out_count + i] != kPoison) {
+        throw std::runtime_error(
+            std::string("batched HC BF16 up wrote outside the live rows (") +
+            when + ")");
+      }
+    }
+  };
+  // Narrow all rows once, then one GEMM over the full verification batch.
+  reset();
+  q::NarrowActivations(d_x.get(), d_full.get(), false, x.size(), nullptr);
+  if (!q::UnquantizedF16Gemm(d_weights.get(), d_full.get(),
+                             d_out.get() + kGuard, tokens, kRows, kCols,
+                             nullptr, q::WeightType::kBF16)) {
+    throw std::runtime_error("batched HC BF16 up rejected");
+  }
+  compare("eager");
+  SpotOracle(weights_half, x_half, reference, kRows, kCols, tokens,
+             "HC BF16 up batched");
+  // A head/tail split keeps every output row's K order, so a ragged second
+  // piece produces the same bytes as the single call.
+  if (tokens >= 17) {
+    const std::uint32_t head = tokens / 2;
+    reset();
+    for (const auto [off, count] :
+         {std::pair<std::uint32_t, std::uint32_t>{0, head},
+          {head, tokens - head}}) {
+      q::NarrowActivations(d_x.get() + static_cast<std::size_t>(off) * kCols,
+                           d_full.get(), false,
+                           static_cast<std::size_t>(count) * kCols, nullptr);
+      if (!q::UnquantizedF16Gemm(
+              d_weights.get(), d_full.get(),
+              d_out.get() + kGuard + static_cast<std::size_t>(off) * kRows,
+              count, kRows, kCols, nullptr, q::WeightType::kBF16)) {
+        throw std::runtime_error("batched HC BF16 up split rejected");
+      }
+    }
+    compare("split");
+  }
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+           "capture");
+  q::NarrowActivations(d_x.get(), d_full.get(), false, x.size(), stream);
+  const bool captured =
+      q::UnquantizedF16Gemm(d_weights.get(), d_full.get(), d_out.get() + kGuard,
+                            tokens, kRows, kCols, stream, q::WeightType::kBF16);
+  CheckHip(hipStreamEndCapture(stream, &graph), "capture end");
+  if (!captured) {
+    throw std::runtime_error("batched HC BF16 up capture rejected");
+  }
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  for (int replay = 0; replay < 3; ++replay) {
+    reset();
+    CheckHip(hipGraphLaunch(exec, stream), "replay");
+    CheckHip(hipStreamSynchronize(stream), "replay sync");
+    compare("graph replay");
+  }
+  (void)hipGraphExecDestroy(exec);
+  (void)hipGraphDestroy(graph);
+  (void)hipStreamDestroy(stream);
+  std::cerr << "HC BF16 up batched exact at " << tokens << " tokens\n";
+}
+
 // Fusing the BF16 up and inject of the GSQ mixes must match the CPU
 // expansion of those weights through the separate GEMM and F32-inject
 // epilogue bit for bit.
@@ -1567,9 +1701,15 @@ void CheckPaddedChain(std::uint32_t tokens, bool deferred) {
 
 // The decode 16-bit GEMV tier (vectorized row waves over F32 activations):
 // every encoding follows the F64 oracle, and an output row must not depend
-// on the token count, which is the batched-decode contract.
+// on the token count, which is the batched-decode contract. From nine rows
+// the BF16 hyper-connection down projection runs one grouped grid over the
+// batch's eight-row groups, so the whole call must equal explicit eight-row
+// groups and scalar rows byte for byte.
 void CheckDecodeGemv(std::uint32_t tokens, std::size_t rows, std::size_t cols,
-                     const char* label) {
+                     const char* label, bool subnormal_weights = false) {
+  constexpr std::size_t kGuard = 32;
+  constexpr std::uint32_t kGroup = 8;
+  constexpr float kPoison = 1234.5F;
   const std::size_t x_count = static_cast<std::size_t>(tokens) * cols;
   const std::size_t out_count = static_cast<std::size_t>(tokens) * rows;
   const auto x = MakeValues(x_count, 0x12345678U, 1.0F);
@@ -1580,24 +1720,66 @@ void CheckDecodeGemv(std::uint32_t tokens, std::size_t rows, std::size_t cols,
   for (std::size_t i = 0; i < w.size(); ++i) {
     w_bf16[i] = FloatToBf16(w[i]);
     w_half[i] = __float2half_rn(w[i]);
+  }
+  if (subnormal_weights) {
+    // BF16 subnormals, the smallest normal, a normal value and a negative
+    // normal: the expansion is exact, so they only widen the input domain.
+    const std::uint16_t specials[] = {0x0001, 0x007F, 0x0080, 0x3F80, 0xBF80};
+    constexpr std::size_t kSpecialCount =
+        sizeof(specials) / sizeof(specials[0]);
+    for (std::size_t i = 0; i < w_bf16.size(); i += 977) {
+      w_bf16[i] = specials[(i / 977) % kSpecialCount];
+    }
+  }
+  for (std::size_t i = 0; i < w.size(); ++i) {
     w_bf16_exact[i] = Bf16ToFloat(w_bf16[i]);
     w_half_exact[i] = __half2float(w_half[i]);
   }
   HipBuffer<std::uint16_t> d_bf16(w_bf16.size());
   HipBuffer<__half> d_half(w_half.size());
-  HipBuffer<float> d_x(x.size()), d_out(out_count), d_one(rows);
+  HipBuffer<float> d_x(x.size()), d_out(out_count + 2 * kGuard),
+      d_one(rows + 2 * kGuard), d_groups(out_count), d_scalars(out_count);
   Upload(&d_bf16, w_bf16);
   Upload(&d_half, w_half);
   Upload(&d_x, x);
+  const std::vector<float> poison(d_out.bytes() / sizeof(float), kPoison);
+  const auto reset = [&](HipBuffer<float>* buffer) {
+    CheckHip(hipMemcpy(buffer->get(), poison.data(), buffer->bytes(),
+                       hipMemcpyHostToDevice),
+             "poison decode GEMV output");
+  };
   for (int encoding = 0; encoding < 2; ++encoding) {
+    const bool batched = tokens > kGroup;
+    if (batched && encoding != 0) {
+      // The batched wide entry is the BF16 hyper-connection down projection;
+      // a wider F16 call keeps the four-element split waves.
+      continue;
+    }
     const auto& exact = encoding == 0 ? w_bf16_exact : w_half_exact;
     const void* w_ptr = encoding == 0 ? static_cast<const void*>(d_bf16.get())
                                       : static_cast<const void*>(d_half.get());
     const q::WeightType type =
         encoding == 0 ? q::WeightType::kBF16 : q::WeightType::kF16;
-    q::SmallGemm(w_ptr, type, d_x.get(), d_out.get(), tokens, rows, cols,
-                 nullptr);
-    const auto out = Download(&d_out, out_count);
+    reset(&d_out);
+    if (batched) {
+      if (!q::SmallGemmWideBatch(w_ptr, type, d_x.get(), d_out.get() + kGuard,
+                                 tokens, rows, cols, nullptr)) {
+        throw std::runtime_error(std::string(label) +
+                                 " batched wide route rejected");
+      }
+    } else {
+      q::SmallGemm(w_ptr, type, d_x.get(), d_out.get() + kGuard, tokens, rows,
+                   cols, nullptr);
+    }
+    const auto guarded = Download(&d_out, poison.size());
+    const std::vector<float> out(guarded.begin() + kGuard,
+                                 guarded.begin() + kGuard + out_count);
+    for (std::size_t i = 0; i < kGuard; ++i) {
+      if (guarded[i] != kPoison || guarded[kGuard + out_count + i] != kPoison) {
+        throw std::runtime_error(std::string(label) +
+                                 " wrote outside the live rows");
+      }
+    }
     double scale = 0.0;
     double worst = 0.0;
     const std::size_t sample_rows[4] = {0, rows / 3, 2 * rows / 3, rows - 1};
@@ -1619,14 +1801,110 @@ void CheckDecodeGemv(std::uint32_t tokens, std::size_t rows, std::size_t cols,
     }
     // The same row at one token and at a full decode batch: separate
     // templates, one reduction.
-    q::SmallGemm(w_ptr, type, d_x.get(), d_one.get(), 1, rows, cols, nullptr);
-    const auto one = Download(&d_one, rows);
-    if (!std::equal(one.begin(), one.end(), out.begin())) {
+    reset(&d_one);
+    q::SmallGemm(w_ptr, type, d_x.get(), d_one.get() + kGuard, 1, rows, cols,
+                 nullptr);
+    const auto one_guarded = Download(&d_one, poison.size());
+    if (!std::equal(one_guarded.begin() + kGuard,
+                    one_guarded.begin() + kGuard + rows, out.begin())) {
       throw std::runtime_error(std::string(label) +
                                " row depends on the token count");
     }
+    for (std::size_t i = 0; i < kGuard; ++i) {
+      if (one_guarded[i] != kPoison ||
+          one_guarded[kGuard + rows + i] != kPoison) {
+        throw std::runtime_error(std::string(label) +
+                                 " one-row call wrote outside the live rows");
+      }
+    }
+    if (tokens <= kGroup) {
+      continue;
+    }
+    // The batch decomposition the grouped entry replaces: explicit eight-row
+    // groups with the ragged tail, then one call per row.
+    for (std::uint32_t r = 0; r < tokens; r += kGroup) {
+      q::SmallGemm(w_ptr, type, d_x.get() + static_cast<std::size_t>(r) * cols,
+                   d_groups.get() + static_cast<std::size_t>(r) * rows,
+                   std::min(kGroup, tokens - r), rows, cols, nullptr);
+    }
+    const auto groups = Download(&d_groups, out_count);
+    if (std::memcmp(groups.data(), out.data(), out_count * sizeof(float)) !=
+        0) {
+      throw std::runtime_error(std::string(label) +
+                               " groups changed between chunked and batched");
+    }
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      q::SmallGemm(w_ptr, type, d_x.get() + static_cast<std::size_t>(t) * cols,
+                   d_scalars.get() + static_cast<std::size_t>(t) * rows, 1,
+                   rows, cols, nullptr);
+    }
+    const auto scalars = Download(&d_scalars, out_count);
+    if (std::memcmp(scalars.data(), out.data(), out_count * sizeof(float)) !=
+        0) {
+      throw std::runtime_error(std::string(label) +
+                               " rows changed between scalar and batched");
+    }
+    // The grouped launch is captured with the rest of the wide batch; replay
+    // must issue the same grid and rewrite the same bytes.
+    hipStream_t stream = nullptr;
+    CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t exec = nullptr;
+    CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+             "capture");
+    if (!q::SmallGemmWideBatch(w_ptr, type, d_x.get(), d_out.get() + kGuard,
+                               tokens, rows, cols, stream)) {
+      throw std::runtime_error(std::string(label) +
+                               " batched wide route rejected in capture");
+    }
+    CheckHip(hipStreamEndCapture(stream, &graph), "capture end");
+    CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+             "instantiate");
+    for (int replay = 0; replay < 3; ++replay) {
+      reset(&d_out);
+      CheckHip(hipGraphLaunch(exec, stream), "replay");
+      CheckHip(hipStreamSynchronize(stream), "replay sync");
+      const auto replayed = Download(&d_out, poison.size());
+      if (std::memcmp(replayed.data() + kGuard, out.data(),
+                      out_count * sizeof(float)) != 0) {
+        throw std::runtime_error(std::string(label) +
+                                 " changed on graph replay");
+      }
+      for (std::size_t i = 0; i < kGuard; ++i) {
+        if (replayed[i] != kPoison ||
+            replayed[kGuard + out_count + i] != kPoison) {
+          throw std::runtime_error(std::string(label) +
+                                   " replay wrote outside the live rows");
+        }
+      }
+    }
+    (void)hipGraphExecDestroy(exec);
+    (void)hipGraphDestroy(graph);
+    (void)hipStreamDestroy(stream);
   }
   std::cerr << label << " GEMV exact at " << tokens << " tokens\n";
+}
+
+// The grouped wide entry is dispatched only for the BF16 hyper-connection
+// down projection class; every other shape keeps its caller's decomposition.
+void CheckDecodeGemvBatchedRejects() {
+  constexpr std::size_t kRows = 320;
+  constexpr std::size_t kCols = 10240;
+  HipBuffer<std::uint16_t> d_bf16(kRows * kCols);
+  HipBuffer<__half> d_half(kRows * kCols);
+  HipBuffer<float> d_x(16 * kCols), d_out(16 * kRows);
+  const auto accepts = [&](q::WeightType type, const void* w,
+                           std::uint32_t tokens, std::uint32_t rows,
+                           std::uint32_t cols) {
+    return q::SmallGemmWideBatch(w, type, d_x.get(), d_out.get(), tokens, rows,
+                                 cols, nullptr);
+  };
+  if (accepts(q::WeightType::kBF16, d_bf16.get(), 8, kRows, kCols) ||
+      accepts(q::WeightType::kF16, d_half.get(), 16, kRows, kCols) ||
+      accepts(q::WeightType::kBF16, d_bf16.get(), 16, 513, kCols) ||
+      accepts(q::WeightType::kBF16, d_bf16.get(), 16, kRows, 8191)) {
+    throw std::runtime_error("batched wide route accepted a foreign shape");
+  }
 }
 
 }  // namespace
@@ -1658,6 +1936,10 @@ int main() {
     CheckHcDownSiluRejects();
     for (std::uint32_t tokens = 1; tokens <= 8; ++tokens)
       CheckBf16Gemm(tokens, kDim, kRank, "HC BF16 up");
+    for (const std::uint32_t tokens : {9U, 16U, 17U, 24U, 32U, 33U, 64U}) {
+      CheckBf16Gemm(tokens, kDim, kRank, "HC BF16 up");
+      CheckBf16UpBatches(tokens);
+    }
     CheckBf16Gemm(96, kDim, kRank, "HC BF16 up");
     CheckBf16Gemm(2049, kDim, kRank, "HC BF16 up");
     CheckBf16UpNarrow();
@@ -1666,6 +1948,15 @@ int main() {
     CheckDecodeGemv(8, kDim, kRank, "decode HC up");
     CheckDecodeGemv(8, 512, kHidden, "decode router");
     CheckDecodeGemv(3, 96, 344, "decode tail-K");
+    // The BF16 hyper-connection down projection at the wide verification
+    // widths: one grouped grid must keep every row's eight-row bytes.
+    for (const std::uint32_t tokens : {9U, 15U, 16U, 17U, 20U, 24U, 33U, 64U})
+      CheckDecodeGemv(tokens, kRank, kDim, "batched decode HC down");
+    CheckDecodeGemv(20, kRank, kDim, "batched decode HC down subnormals", true);
+    CheckDecodeGemv(17, 319, 8192, "batched decode HC down odd M");
+    CheckDecodeGemv(17, kRank, 8195, "batched decode HC down tail K");
+    CheckDecodeGemv(9, 321, 8201, "batched decode HC down odd M and tail K");
+    CheckDecodeGemvBatchedRejects();
     CheckFusedProjectionBf16(96);
     CheckFusedProjectionBf16(2049);
     CheckBf16Inject();

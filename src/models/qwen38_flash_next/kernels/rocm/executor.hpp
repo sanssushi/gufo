@@ -367,6 +367,24 @@ public:
   [[nodiscard]] bool ForwardWide(Session& session,
                                  std::span<const std::int32_t> tokens,
                                  std::string* error_msg) const;
+  /// One batched projection call, recorded only while a diagnostic hook is
+  /// installed. `rows` is the outer call width; the matrix fields describe
+  /// the weight the call projects with.
+  struct BatchCall {
+    const char* operation;
+    core::GgmlType type;
+    std::uint32_t rows;
+    std::uint32_t matrix_rows;
+    std::uint32_t matrix_cols;
+  };
+  using BatchCallHook = void (*)(void* context, const BatchCall& call);
+  /// Diagnostic shape ledger for ForwardBatch/ForwardWide: dense, shared and
+  /// routed work separately, with the width and format of each call. Only
+  /// the synthetic wide-verification fixture installs it.
+  void SetBatchCallHook(BatchCallHook hook, void* context) const noexcept {
+    batch_call_hook_ = hook;
+    batch_call_context_ = context;
+  }
   /// Moves kept trunk hidden row `row` to row 0 (the draft block caught up
   /// to it, so the rows before it are no longer needed).
   [[nodiscard]] bool KeepHiddenRow(Session& session, std::uint32_t row,
@@ -801,10 +819,14 @@ private:
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
-                  std::uint32_t rows, std::string* error_msg) const;
+                  std::uint32_t rows, std::string* error_msg,
+                  const char* role = "dense") const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                        const float* x, float* out, std::uint32_t rows,
                        std::string* error) const;
+  void RecordBatchCall(const char* operation, core::GgmlType type,
+                       std::uint32_t rows, std::uint32_t matrix_rows,
+                       std::uint32_t matrix_cols) const;
   bool QuantizeBatch(const float* x, std::uint32_t rows, std::uint32_t cols,
                      std::string* error) const;
   bool AllocateBatch(std::string* error_msg) const;
@@ -826,6 +848,8 @@ private:
   mutable GdnBatchItem* batch_gdn_host_{nullptr};
   mutable GdnBatchItem* batch_gdn_{nullptr};
   mutable std::uint32_t batch_rows_{0};
+  mutable BatchCallHook batch_call_hook_{nullptr};
+  mutable void* batch_call_context_{nullptr};
   /// Rollback rows of a wide verification's later segments. Only one wide
   /// pass is pending at a time (Forward/Rollback of the session decoding
   /// alone), so the executor owns them. Segment s >= 1 keeps the state at
@@ -959,6 +983,9 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  /// A wide batch's whole-batch Q8_1 rows (see QuantizeBatch): source, rows
+  /// and width, so Q/K/V or QKV/gate consumers share one quantization.
+  mutable ReadyRows batch_q8_ready_;
   /// A decode combine left to the next mixer's one-launch HcMixQ8Fused
   /// (see Combine): HcCombineQ8_1's operands when Combine ran.
   struct PendingCombine {

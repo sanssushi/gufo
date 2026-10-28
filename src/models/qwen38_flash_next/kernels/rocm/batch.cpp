@@ -125,6 +125,7 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
 void Executor::UseScratch(const Scratch& scratch) const {
   s_ = scratch;
   q8t_src_ = nullptr;
+  batch_q8_ready_ = {};
   half_src_ = nullptr;
   xn_half_ = false;
   xn_half_pitch_ = 0;
@@ -686,12 +687,18 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
                              std::uint32_t cols, std::string* error) const {
   // Quantize once for all independent rows. The prefill staging allocation
   // is idle during batch decoding; borrow it without adding another buffer.
+  // The rows stay live until another input replaces them, so Q/K/V or
+  // QKV/gate consumers share one pass.
+  if (batch_q8_ready_.src == x && batch_q8_ready_.n == rows &&
+      batch_q8_ready_.k == cols)
+    return true;
   const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
   const auto bytes = qfn_mmq_q8_1_bytes(padded, cols);
   if (bytes > Q8TiledBytes(options_.max_batch, model_->max_q8_cols()))
     return Fail(error, "batched projection exceeds activation scratch");
   void* quantized = s_.x_q8t;
   q8t_src_ = nullptr;
+  batch_q8_ready_ = {};
   if (padded != rows &&
       !Check(
           hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +
@@ -699,17 +706,76 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
                          0, qfn_mmq_q8_1_bytes(padded - rows, cols), stream_),
           error))
     return false;
-  return qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) == 0 ||
-         Fail(error, "batched activation quantization failed");
+  if (qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) != 0)
+    return Fail(error, "batched activation quantization failed");
+  batch_q8_ready_ = {x, quantized, rows, cols};
+  return true;
+}
+
+void Executor::RecordBatchCall(const char* operation, core::GgmlType type,
+                               std::uint32_t rows, std::uint32_t matrix_rows,
+                               std::uint32_t matrix_cols) const {
+  if (batch_call_hook_ != nullptr) {
+    batch_call_hook_(batch_call_context_,
+                     {operation, type, rows, matrix_rows, matrix_cols});
+  }
 }
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
-                          std::uint32_t rows, std::string* error) const {
+                          std::uint32_t rows, std::string* error,
+                          const char* role) const {
+  RecordBatchCall(role, w.type, rows, w.rows, w.cols);
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.type == core::GgmlType::kBF16 && w.rows == 10240 && w.cols == 320 &&
+      rows >= 17 &&
+      static_cast<std::size_t>(rows) * w.cols <=
+          static_cast<std::size_t>(options_.max_batch) *
+              model_->max_half_cols()) {
+    // The HC up projection: from 17 rows one activation narrow and one exact
+    // GEMM keep the eight-row chunks' per-output K order and measure faster.
+    NarrowActivations(x, s_.x_half, false,
+                      static_cast<std::size_t>(rows) * w.cols, stream_);
+    half_src_ = x;
+    half_rows_ = rows;
+    half_cols_ = w.cols;
+    half_bf16_ = false;
+    if (!UnquantizedF16Gemm(w.data, static_cast<const __half*>(s_.x_half), out,
+                            rows, w.rows, w.cols, stream_, WeightType::kBF16))
+      return Fail(error, "batched BF16 projection failed");
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
-    SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-              stream_);
+    // Verification and single-session decoding must agree per row: take
+    // Dense's dispatch (and its MMVQ/SmallGemm arithmetic) in decode-width
+    // chunks rather than the wide MMQ tier, which only approximates it.
+    // The adapter's dense formats keep those waves in one grouped launch
+    // over a single whole-batch activation quantization.
+    if (w.type == core::GgmlType::kBF16 &&
+        SmallGemmWideBatch(w.data, WeightType::kBF16, x, out, rows, w.rows,
+                           w.cols, stream_)) {
+      // The BF16 hyper-connection down projection: one grid over the batch's
+      // eight-row groups, so they fill the device instead of serializing
+      // 40-block launches.
+      return true;
+    }
+    if (rows > kDecodeRows &&
+        qfn_mmq_moe_gated_type(static_cast<int>(w.type)) != 0 &&
+        qfn_mmq_q8_1_bytes(static_cast<int>(rows), static_cast<int>(w.cols)) <=
+            Q8TiledBytes(options_.max_batch, model_->max_q8_cols())) {
+      return QuantizeBatch(x, rows, w.cols, error) &&
+             (qfn_mmq_dense_vec_preq(static_cast<int>(w.type), w.data, s_.x_q8t,
+                                     out, static_cast<int>(w.rows),
+                                     static_cast<int>(rows),
+                                     static_cast<int>(w.cols), stream_) == 0 ||
+              Fail(error, "batched dense projection failed"));
+    }
+    for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+      if (!Dense(w, x + static_cast<std::size_t>(r) * w.cols,
+                 out + static_cast<std::size_t>(r) * w.rows,
+                 std::min(kDecodeRows, rows - r), error))
+        return false;
+    }
     return true;
   }
   if (!QuantizeBatch(x, rows, w.cols, error))
@@ -748,6 +814,8 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
 bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                                const float* x, float* out, std::uint32_t rows,
                                std::string* error) const {
+  RecordBatchCall("shared-gate-up", gate.type, rows, gate.rows, gate.cols);
+  RecordBatchCall("shared-up", up.type, rows, up.rows, up.cols);
   const Scratch base = s_;
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
                   gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
@@ -782,18 +850,28 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return Moe(l, x, out, rows, error);
   const auto& c = config();
   const Scratch base = s_;
-  if (!DenseBatch(l.router, x, base.router, rows, error))
+  if (!DenseBatch(l.router, x, base.router, rows, error, "router"))
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, stream_);
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
                        error) ||
-      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error,
+                  "shared-down"))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
-      l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
+  if (l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+      l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
+      l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&
+      l.ffn_up_exps.experts == l.ffn_gate_exps.experts &&
+      qfn_mmq_moe_gated_batch_type(static_cast<int>(l.ffn_gate_exps.type)) !=
+          0 &&
+      c.num_experts_used <= 32 && rows <= kDecodeRows * kBatchSessions) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
+    RecordBatchCall("routed-gate-up", l.ffn_gate_exps.type, rows, c.expert_ff,
+                    c.hidden_size);
+    RecordBatchCall("routed-down", l.ffn_down_exps.type,
+                    rows * c.num_experts_used, c.hidden_size, c.expert_ff);
     if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
                               l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
                               base.ids, base.gate_e, c.expert_ff, c.hidden_size,
@@ -810,10 +888,15 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return true;
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+    const auto chunk = std::min(kDecodeRows, rows - r);
+    RecordBatchCall("routed-gate-up", l.ffn_gate_exps.type, chunk, c.expert_ff,
+                    c.hidden_size);
+    RecordBatchCall("routed-down", l.ffn_down_exps.type,
+                    chunk * c.num_experts_used, c.hidden_size, c.expert_ff);
     UseScratch(RowScratch(base, r));
-    const bool ok = MoeExperts(l, x + std::size_t{r} * c.hidden_size,
-                               out + std::size_t{r} * c.hidden_size,
-                               std::min(kDecodeRows, rows - r), error);
+    const bool ok =
+        MoeExperts(l, x + std::size_t{r} * c.hidden_size,
+                   out + std::size_t{r} * c.hidden_size, chunk, error);
     UseScratch(base);
     if (!ok)
       return false;
@@ -883,6 +966,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
   if (rows > options_.max_batch) {
     return Fail(error, "decode batch exceeds executor capacity");
   }
+  RecordBatchCall(wide ? "wide" : "batch", core::GgmlType::kF32, rows, rows, 0);
   if (!AnyActive(items))
     return true;
   for (const auto& item : items) {

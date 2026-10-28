@@ -514,7 +514,8 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
 }
 
 void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
-                         std::span<float> out) {
+                         std::span<float> out, MtpTrace* trace,
+                         const MtpTrace* stage_inputs) {
   std::vector<float> logits(c_.num_experts);
   MatVec(l.router, 0, x, logits, true);
   // Softmax over every expert, top-k of the probabilities, renormalized.
@@ -550,6 +551,13 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
     for (std::uint32_t j = 0; j < c_.expert_ff; ++j) {
       gate[j] = Silu(gate[j]) * up[j];
     }
+    if (trace && !trace->ffn_gate.empty())
+      std::copy_n(gate.begin(), gate.size(),
+                  trace->ffn_gate.begin() + std::size_t{i} * c_.expert_ff);
+    if (stage_inputs)
+      std::copy_n(
+          stage_inputs->ffn_gate.begin() + std::size_t{i} * c_.expert_ff,
+          c_.expert_ff, gate.begin());
     MatVec(l.ffn_down_exps, e, gate, down);
     for (std::uint32_t j = 0; j < c_.hidden_size; ++j) {
       out[j] += weight * down[j];
@@ -564,6 +572,11 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   for (std::uint32_t j = 0; j < c_.shared_expert_ff; ++j) {
     sgate[j] = Silu(sgate[j]) * sup[j];
   }
+  if (trace && !trace->ffn_shared.empty())
+    std::copy_n(sgate.begin(), sgate.size(), trace->ffn_shared.begin());
+  if (stage_inputs)
+    sgate.assign(stage_inputs->ffn_shared.begin(),
+                 stage_inputs->ffn_shared.end());
   MatVec(l.shexp_down, 0, sgate, down);
   std::array<float, 1> shared_gate{};
   MatVec(l.shexp_gate_inp, 0, x, shared_gate, true);
@@ -643,9 +656,14 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   if (token < 0 || static_cast<std::uint32_t>(token) >= c_.vocab_size ||
       hidden.size() != D || mtp_position_ >= max_context_ ||
       (trace && !trace->Valid(H, D)) ||
-      (stage_inputs && (stage_inputs->fused.size() != D ||
-                        stage_inputs->attention.size() != D ||
-                        stage_inputs->hidden.size() != D)) ||
+      (stage_inputs &&
+       (stage_inputs->fused.size() != D ||
+        stage_inputs->attention.size() != D ||
+        stage_inputs->ffn_input.size() != H ||
+        stage_inputs->ffn_gate.size() !=
+            std::size_t{c_.num_experts_used} * c_.expert_ff ||
+        stage_inputs->ffn_shared.size() != c_.shared_expert_ff ||
+        stage_inputs->hidden.size() != D)) ||
       (!logits.empty() && logits.size() != c_.vocab_size)) {
     if (error_msg)
       *error_msg = "invalid reference MTP input";
@@ -698,7 +716,10 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   HcMix(l.hc_ffn, res, mixed, inject);
   if (trace)
     copy(mixed, trace->ffn_input);
-  Moe(l, mixed, block);
+  if (stage_inputs)
+    mixed.assign(stage_inputs->ffn_input.begin(),
+                 stage_inputs->ffn_input.end());
+  Moe(l, mixed, block, trace, stage_inputs);
   if (trace)
     copy(block, trace->ffn_output);
   HcCombine(res, block, inject);

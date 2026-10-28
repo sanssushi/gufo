@@ -52,7 +52,8 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
 // Gate/up for 1–8 tokens, with the SwiGLU result in out.
-// Q4_K also accepts up to 64 independent rows, grouped by expert.
+// Formats with qfn_mmq_moe_gated_batch_type also accept up to 64 independent
+// rows, grouped by expert across the complete batch.
 int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,
                           const float* x, const int32_t* ids, float* out, int m,
                           int k, int tokens, int experts, int experts_used,
@@ -68,6 +69,10 @@ int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
 // Non-zero when qfn_mmq_moe_gated_vec supports this routed expert format:
 // every one except Q5_1 (down projections only).
 int qfn_mmq_moe_gated_type(int weight_type);
+
+// Non-zero when qfn_mmq_moe_gated_vec groups a batch wider than eight rows by
+// expert: Q4_K and the low-bit IQ gate/up formats.
+int qfn_mmq_moe_gated_batch_type(int weight_type);
 
 size_t qfn_mmq_q8_1_bytes(int N, int K);
 

@@ -21,6 +21,14 @@ constexpr __host__ __device__ int mmvq_moe_max_batch(ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 4 : 8;
 }
 
+// Gated formats whose grouped kernel spans the complete verification batch:
+// the compact list holds up to eight tokens per expert across all rows.
+constexpr __host__ __device__ bool mmvq_moe_grouped_gated(ggml_type type) {
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+           type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+           type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS;
+}
+
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                             const block_q8_1* input, float* output,
                             int k, int rows, int tokens, int input_stride,

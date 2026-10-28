@@ -378,7 +378,8 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
 // warp can compute them all per weight-row pair: the token sweep reuses each
 // weight fragment from cache instead of re-reading it once per token wave.
 // Rows, per-token dot products, quantized inputs and reductions are those of
-// the one-token waves above.
+// the one-token waves above. `blockIdx.y` selects a further eight-row group of
+// a wider batch; a decode-width call leaves it zero.
 template<ggml_type type, int tokens>
 __launch_bounds__(32, 1) static __global__
     void mul_mat_vec_q_dense_multi(const void* __restrict__ weights,
@@ -406,7 +407,9 @@ __launch_bounds__(32, 1) static __global__
   const bool invalid_id = id_raw < 0;
   const uint32_t channel_x = invalid_id ? 0u : (uint32_t)id_raw;
 
-  const block_q8_1* y = (const block_q8_1*)vy;
+  const block_q8_1* y =
+      (const block_q8_1*)vy + size_t(blockIdx.y) * tokens * stride_col_y;
+  float* out = dst + size_t(blockIdx.y) * tokens * stride_col_dst;
   uint32_t row_offsets[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -447,10 +450,261 @@ __launch_bounds__(32, 1) static __global__
 #pragma unroll
         for (int t = 0; t < tokens; ++t) {
             const float value = tmp[t][threadIdx.x];
-            dst[t*stride_col_dst + row0 + threadIdx.x] =
+            out[t*stride_col_dst + row0 + threadIdx.x] =
                 isfinite(value) ? value : 0.0f;
         }
     }
+}
+
+// The scalar six-bit lane map: lane `lane`, partial i, of one weight block.
+using Int4 = __attribute__((ext_vector_type(4))) int;
+using Int8 = __attribute__((ext_vector_type(8))) int;
+__device__ __forceinline__ int Q6LaneCodes(const block_q6_K* w, int lane,
+                                           int i) {
+  const int vl = get_int_b2(w->ql, lane);
+  const int vh = get_int_b2(w->qh, 8 * (lane / 16) + lane % 8) >>
+                 (2 * ((lane % 16) / 8));
+  const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+  const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+  // Codes are in [0, 63], so adding 96 cannot carry between bytes.
+  return ((uint32_t(vil | vih) + 0x60606060u) ^ 0x80808080u);
+}
+
+// The scalar five-bit lane map: its two four-byte groups of partial i.
+__device__ __forceinline__ void Q5LaneCodes(const block_q5_K* w, int lane,
+                                            int i, int& v0, int& v1) {
+  const int bq8_offset = 2 * ((lane % 16) / 4);
+  const int ql = 16 * bq8_offset + 4 * (lane % 4);
+  const int qh = 4 * (lane % 4);
+  const int* qlp = reinterpret_cast<const int*>(w->qs + ql);
+  const int* qhp = reinterpret_cast<const int*>(w->qh + qh);
+  const int vh0 = qhp[0] >> bq8_offset;
+  const int vh1 = qhp[4] >> bq8_offset;
+  v0 = ((qlp[0] >> (4 * i)) & 0x0F0F0F0F) | (((vh0 >> i) << 4) & 0x10101010);
+  v1 = ((qlp[4] >> (4 * i)) & 0x0F0F0F0F) | (((vh1 >> i) << 4) & 0x10101010);
+}
+
+// The packed scale/min pair of lane group j, in the scalar helper's byte order.
+__device__ __forceinline__ int Q5LaneScalePair(const block_q5_K* w, int j) {
+  const uint16_t* scales = reinterpret_cast<const uint16_t*>(w->scales);
+  uint16_t aux[2];
+  if (j < 2) {
+    aux[0] = scales[j + 0] & 0x3f3f;
+    aux[1] = scales[j + 2] & 0x3f3f;
+  } else {
+    aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+    aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+  }
+  return (aux[0] & 0xff) | (aux[0] & 0xff00) | ((aux[1] & 0xff) << 16) |
+         ((aux[1] & 0xff00) << 16);
+}
+
+// A wide verification batch reuses each six-bit weight row across sixteen
+// tokens in one grid: eight waves own four of the scalar wave's logical lanes
+// each, and every lane keeps its two separate four-byte dots and FP32
+// epilogue. Only the integer dot becomes a zero-padded 16x16x16 WMMA; the 32
+// lane partials then reduce in the scalar wave's 16/8/4/2/1 tree.
+// Transposed operands keep each lane's weight scales local across its tokens.
+__launch_bounds__(256) static __global__
+    void mul_mat_vec_q6_K_wmma(const block_q6_K* __restrict__ weights,
+                               const block_q8_1* __restrict__ input,
+                               const int32_t* __restrict__ ids,
+                               float* __restrict__ output, int k, int rows,
+                               int input_stride) {
+  __shared__ float partial[16 * 16 * 32];
+  const int wave = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int sub = lane % 16;
+  const int half = lane / 16;
+  const int first_row = blockIdx.x * 16;
+  const int blocks = k / QK_K;
+  const block_q8_1* xrow =
+      input + std::size_t(blockIdx.y) * 16 * input_stride + sub * input_stride;
+  const block_q6_K* wrow =
+      weights + std::size_t(min(first_row + sub, rows - 1)) * blocks;
+  // scale_base is constant across a wave's four lanes.
+  const int sb = 8 * (wave / 4) + (wave % 4);
+  const bool invalid_id = ids[0] < 0;
+  float acc[4][8] = {};
+  for (int kb = 0; kb < blocks && !invalid_id; ++kb) {
+    const block_q6_K* wb = wrow + kb;
+    const int scpair = (wb->scales[sb] & 0xff) |
+                       ((wb->scales[sb + 4] & 0xff) << 16);
+    const float down = __half2float(wb->d);
+    const float sc[2] = {float(int8_t(scpair)), float(int8_t(scpair >> 16))};
+#pragma unroll
+    for (int li = 0; li < 4; ++li) {
+      const int L = 4 * wave + li;
+      const int boff = 4 * (L / 16) + (L % 16) / 8;
+      float sumf[8] = {};
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const block_q8_1* x = xrow + kb * (QK_K / QK8_1) + boff + 2 * i;
+        const Int4 a = {Q6LaneCodes(wb, L, i), 0, 0, 0};
+        const Int4 b = {get_int_b4(x->qs, L % QI8_1), 0, 0, 0};
+        Int8 dots{};
+        dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, a,
+                                                          dots, false);
+        const float d8 = __low2float(x->ds);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          // Both integer factors and their product fit FP32 exactly. Keep
+          // that product separate from the activation-scale multiplication.
+          float scaled = float(dots[j]) * sc[i];
+          asm("" : "+v"(scaled));
+          sumf[j] += __shfl(d8, 2 * j + half) * scaled;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        acc[li][j] = __fmaf_rn(sumf[j], down, acc[li][j]);
+    }
+  }
+#pragma unroll
+  for (int li = 0; li < 4; ++li) {
+    const int part = 4 * wave + li;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int out = (2 * j + half) * 16 + sub;
+      const int swizzle = (out ^ (out >> 4)) & 31;
+      partial[out * 32 + (part ^ swizzle)] = acc[li][j];
+    }
+  }
+  __syncthreads();
+  const int out = threadIdx.x;
+  const int swizzle = (out ^ (out >> 4)) & 31;
+  float sums[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+    sums[i] = partial[out * 32 + (i ^ swizzle)];
+#pragma unroll
+  for (int delta = 16; delta; delta /= 2) {
+#pragma unroll
+    for (int i = 0; i < delta; ++i)
+      sums[i] = __fadd_rn(sums[i], sums[i + delta]);
+  }
+  const int row = first_row + out % 16;
+  const int token = blockIdx.y * 16 + out / 16;
+  if (row < rows)
+    output[token * rows + row] = isfinite(sums[0]) ? sums[0] : 0.0f;
+}
+
+// The five-bit form of the same wide verification tile. Lanes 0-15 walk even
+// weight blocks and 16-31 odd blocks, so four waves cover each parity.
+__launch_bounds__(256) static __global__
+    void mul_mat_vec_q5_K_wmma(const block_q5_K* __restrict__ weights,
+                               const block_q8_1* __restrict__ input,
+                               const int32_t* __restrict__ ids,
+                               float* __restrict__ output, int k, int rows,
+                               int input_stride) {
+  __shared__ float partial[16 * 16 * 32];
+  const int wave = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int sub = lane % 16;
+  const int half = lane / 16;
+  const int first_row = blockIdx.x * 16;
+  const int blocks = k / QK_K;
+  const block_q8_1* xrow =
+      input + std::size_t(blockIdx.y) * 16 * input_stride + sub * input_stride;
+  const block_q5_K* wrow =
+      weights + std::size_t(min(first_row + sub, rows - 1)) * blocks;
+  const int j = wave % 4;
+  const bool invalid_id = ids[0] < 0;
+  float acc[4][8] = {};
+  for (int kb = wave / 4; kb < blocks && !invalid_id; kb += 2) {
+    const block_q5_K* wb = wrow + kb;
+    const int scpair = Q5LaneScalePair(wb, j);
+    const float2 dm = __half22float2(wb->dm);
+    int sc[8][2], sm[8][2];
+    float dmx[8], dmy[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      const int s = __shfl(scpair, 2 * r + half);
+      sc[r][0] = int(uint8_t(s));
+      sc[r][1] = int(uint8_t(s >> 8));
+      sm[r][0] = int(uint8_t(s >> 16));
+      sm[r][1] = int(uint8_t(s >> 24));
+      dmx[r] = __shfl(dm.x, 2 * r + half);
+      dmy[r] = __shfl(dm.y, 2 * r + half);
+    }
+#pragma unroll
+    for (int li = 0; li < 4; ++li) {
+      const int L = 4 * wave + li;
+      float sumf_d[8] = {};
+      float sumf_m[8] = {};
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const block_q8_1* x = xrow + kb * (QK_K / QK8_1) + 2 * j + i;
+        int v0, v1;
+        Q5LaneCodes(wb, L, i, v0, v1);
+        const int* q8 = reinterpret_cast<const int*>(x->qs) + (L % 4);
+        const int u0 = q8[0], u1 = q8[4];
+        const Int4 a = {v0, v1, 0, 0};
+        const Int4 b = {u0, u1, 0, 0};
+        Int8 dots{};
+        dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b,
+                                                          dots, false);
+        const int sum8 =
+            ggml_hip_dp4a(0x01010101, u0, ggml_hip_dp4a(0x01010101, u1, 0));
+        const float d8 = __low2float(x->ds);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+          sumf_d[r] += d8 * (dots[r] * sc[r][i]);
+          sumf_m[r] += d8 * (sum8 * sm[r][i]);
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < 8; ++r)
+        // The scalar helper inlines its caller's `tmp +=` into these two dm
+        // products in this order; keep that compiled contraction.
+        acc[li][r] = __fmaf_rn(-sumf_m[r], dmy[r],
+                               __fmaf_rn(sumf_d[r], dmx[r], acc[li][r]));
+    }
+  }
+#pragma unroll
+  for (int li = 0; li < 4; ++li) {
+    const int part = 4 * wave + li;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      const int out = sub * 16 + 2 * r + half;
+      const int swizzle = (out ^ (out >> 4)) & 31;
+      partial[out * 32 + (part ^ swizzle)] = acc[li][r];
+    }
+  }
+  __syncthreads();
+  const int out = threadIdx.x;
+  const int swizzle = (out ^ (out >> 4)) & 31;
+  float sums[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+    sums[i] = partial[out * 32 + (i ^ swizzle)];
+#pragma unroll
+  for (int delta = 16; delta; delta /= 2) {
+#pragma unroll
+    for (int i = 0; i < delta; ++i)
+      sums[i] = __fadd_rn(sums[i], sums[i + delta]);
+  }
+  const int row = first_row + out % 16;
+  const int token = blockIdx.y * 16 + out / 16;
+  if (row < rows)
+    output[token * rows + row] = isfinite(sums[0]) ? sums[0] : 0.0f;
+}
+
+template<ggml_type type>
+static void launch_dense_wmma(const void* weights, const block_q8_1* input,
+                              const int32_t* ids, float* output, int k, int rows,
+                              int groups, int input_stride,
+                              hipStream_t stream) {
+  GGML_ASSERT(k % QK_K == 0 && groups > 0);
+  const dim3 grid((rows + 15) / 16, groups);
+  if constexpr (type == GGML_TYPE_Q5_K)
+    mul_mat_vec_q5_K_wmma<<<grid, 256, 0, stream>>>(
+        static_cast<const block_q5_K*>(weights), input, ids, output, k, rows,
+        input_stride);
+  else
+    mul_mat_vec_q6_K_wmma<<<grid, 256, 0, stream>>>(
+        static_cast<const block_q6_K*>(weights), input, ids, output, k, rows,
+        input_stride);
 }
 
 template<ggml_type type, int tokens = 2>
@@ -740,6 +994,153 @@ static __global__ void group_moe_batch(const int32_t* ids, int32_t* storage,
     group.token[count] = 0;
     group.slots[count] = 0;
   }
+}
+
+// The complete-batch grouped gate/up. The compact list holds groups of up to
+// eight tokens that share one expert, so each decoded weight fragment serves
+// the whole group; gate and up keep separate 32-lane halves and every token
+// keeps the single-row dot order, reduction and SwiGLU spelling.
+template<ggml_type type, bool single_request = false>
+__launch_bounds__(64) static __global__
+    void mul_mat_vec_moe_batch_groups(const void* __restrict__ gate,
+                                      const void* __restrict__ up,
+                                      const block_q8_1* __restrict__ input,
+                                      const int32_t* __restrict__ storage,
+                                      float* __restrict__ output, int k,
+                                      int rows, int experts_used,
+                                      int input_stride) {
+  constexpr int tokens = MMVQ_MAX_BATCH_SIZE;
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  constexpr auto dot = get_vec_dot_q_hip(type);
+  // The low-bit IQ formats decode each weight fragment once per row and K
+  // block, then reuse it across the group's tokens.
+  constexpr bool iq_fragment =
+      type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+      type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS ||
+      type == GGML_TYPE_IQ3_S;
+  const int count = storage[0];
+  const int32_t* groups = storage + 1;
+  const int tid = threadIdx.x;
+  const int lane = tid % 32;
+  const bool is_up = tid >= 32;
+  const int row0 = blockIdx.x * 2;
+  // Every block consumes a bounded slice of the compact device list.
+  for (int anchor = blockIdx.y; anchor < count; anchor += gridDim.y) {
+    const auto& group = reinterpret_cast<const MoeBatchGroup*>(groups)[anchor];
+    const int expert = group.expert;
+    if (expert < 0) {
+      if (!single_request && expert == -2 && tid < 2 && row0 + tid < rows)
+        output[group.anchor * rows + row0 + tid] = 0.0f;
+      continue;
+    }
+    constexpr int columns = single_request ? 1 : tokens;
+    int active = 0;
+    int token = 0;
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      if (group.slots[t] != 0) {
+        ++active;
+        token = t;
+      }
+    }
+    if (single_request ? active != 1 : active <= 1)
+      continue;
+    const void* weights = is_up ? up : gate;
+    const int blocks_per_row = k / qk;
+    uint32_t slots[columns];
+#pragma unroll
+    for (int t = 0; t < columns; ++t)
+      slots[t] = group.slots[single_request ? token : t];
+    float sum[columns][2] = {};
+    for (int kb = lane / (qi / vdr); kb < blocks_per_row; kb += blocks_per_iter) {
+      const int kqs = vdr * (lane % (qi / vdr));
+      if constexpr (iq_fragment && !single_request) {
+        const IqMoeFragment<type> w0(
+            weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+        const IqMoeFragment<type> w1(
+            weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+            kqs);
+#pragma unroll
+        for (int t = 0; t < columns; ++t) {
+          if (slots[t] == 0)
+            continue;
+          const auto* x =
+              input + group.token[t] * input_stride + kb * (qk / QK8_1);
+          sum[t][0] += w0.Dot(x, kqs);
+          sum[t][1] += w1.Dot(x, kqs);
+        }
+      } else {
+#pragma unroll
+        for (int t = 0; t < columns; ++t) {
+          if (slots[t] == 0)
+            continue;
+#pragma unroll
+          for (int r = 0; r < 2; ++r)
+            sum[t][r] += dot(
+                weights,
+                input + group.token[single_request ? token : t] * input_stride +
+                    kb * (qk / QK8_1),
+                (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
+                kqs);
+        }
+      }
+    }
+
+    // Gate and up stay in separate waves to retain the scalar projection's
+    // sum order, including the treatment of nonfinite quantization scales.
+    __shared__ float values[columns][2][2];
+#pragma unroll
+    for (int t = 0; t < columns; ++t) {
+      if (slots[t] == 0)
+        continue;
+#pragma unroll
+      for (int r = 0; r < 2; ++r)
+        sum[t][r] = warp_reduce_sum<32>(sum[t][r]);
+      if (lane < 2)
+        values[t][is_up][lane] = isfinite(sum[t][lane]) ? sum[t][lane] : 0.0f;
+    }
+    __syncthreads();
+    if (!is_up && lane < 2 && row0 + lane < rows) {
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const float g = values[t][0][lane];
+        const float u = values[t][1][lane];
+        uint32_t bits = slots[t];
+        while (bits) {
+          const int slot = __ffs(static_cast<int>(bits)) - 1;
+          output[(group.token[single_request ? token : t] * experts_used +
+                  slot) *
+                     rows +
+                 row0 + lane] =
+              (g * (1.0f / (1.0f + __expf(-g)))) * u;
+          bits &= bits - 1;
+        }
+      }
+    }
+    // The next listed group rewrites values.
+    __syncthreads();
+  }
+}
+
+template<ggml_type type>
+static void launch_moe_batch_groups(const void* gate, const void* up,
+                                    const block_q8_1* input,
+                                    const int32_t* groups, float* output,
+                                    int k, int rows, int experts_used,
+                                    int input_stride, hipStream_t stream) {
+  // Bounded slices of the compact list, then the single-token groups, which
+  // decode one token per block and never reuse a fragment.
+  constexpr int kListRows = 32;
+  const dim3 grid((rows + 1) / 2, kListRows);
+  mul_mat_vec_moe_batch_groups<type><<<grid, 64, 0, stream>>>(
+      gate, up, input, groups, output, k, rows, experts_used, input_stride);
+  mul_mat_vec_moe_batch_groups<type, true><<<grid, 64, 0, stream>>>(
+      gate, up, input, groups, output, k, rows, experts_used, input_stride);
 }
 
 
@@ -1040,6 +1441,53 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
     }
 }
 
+// A wider single-expert dense batch keeps the eight-row waves: the full
+// groups ride blockIdx.y of one launch, and the ragged tail keeps the narrower
+// specializations (one row takes the routed entry's one-token waves).
+template<ggml_type type>
+static void launch_dense_multi_grouped(const void* weights,
+                                       const block_q8_1* input,
+                                       const int32_t* ids, float* output,
+                                       int k, int rows, int tokens,
+                                       int input_stride, hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 &&
+              tokens > MMVQ_MAX_BATCH_SIZE);
+  // Q5_K/Q6_K reuse each weight block across sixteen tokens with the scalar
+  // lane partials; the ragged remainder keeps the eight-row groups.
+  if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) {
+    const int wide = tokens / 16;
+    if (wide > 0) {
+      launch_dense_wmma<type>(weights, input, ids, output, k, rows, wide,
+                              input_stride, stream);
+      const int done = wide * 16;
+      input += size_t(done) * input_stride;
+      output += size_t(done) * rows;
+      tokens -= done;
+      if (tokens == 0)
+        return;
+    }
+  }
+  const int groups = tokens / MMVQ_MAX_BATCH_SIZE;
+  const int tail = tokens - groups * MMVQ_MAX_BATCH_SIZE;
+  if (groups > 0)
+    mul_mat_vec_q_dense_multi<type, MMVQ_MAX_BATCH_SIZE>
+        <<<dim3((rows + 1) / 2, groups), 32, 0, stream>>>(
+            weights, input, ids, output, k, rows, k / ggml_blck_size(type),
+            input_stride, rows);
+  if (tail == 0)
+    return;
+  const block_q8_1* tail_input =
+      input + size_t(groups) * MMVQ_MAX_BATCH_SIZE * input_stride;
+  float* tail_output = output + size_t(groups) * MMVQ_MAX_BATCH_SIZE * rows;
+  if (tail == 1) {
+    mul_mat_vec_moe_dispatch(weights, type, tail_input, ids, tail_output, k,
+                             rows, 1, 1, input_stride, stream);
+    return;
+  }
+  launch_dense_multi<type>(weights, tail_input, ids, tail_output, k, rows,
+                           tail, input_stride, stream);
+}
+
 // The dense projection of a decode or verification batch: every token is
 // routed to the single expert, so the multi-token waves above apply. The
 // caller guarantees n_experts == n_expert_used == 1.
@@ -1048,8 +1496,15 @@ void mul_mat_vec_dense_multi(const void* weights, ggml_type type,
                              float* output, int k, int rows, int tokens,
                              int input_stride, hipStream_t stream) {
 #define LAUNCH_DENSE_MULTI(vendored_type)                                   \
-  launch_dense_multi<vendored_type>(weights, input, ids, output, k, rows,   \
-                                    tokens, input_stride, stream)
+  do {                                                                      \
+    if (tokens > MMVQ_MAX_BATCH_SIZE)                                       \
+      launch_dense_multi_grouped<vendored_type>(                             \
+          weights, input, ids, output, k, rows, tokens, input_stride,       \
+          stream);                                                          \
+    else                                                                    \
+      launch_dense_multi<vendored_type>(weights, input, ids, output, k,     \
+                                        rows, tokens, input_stride, stream); \
+  } while (0)
   switch (type) {
     case GGML_TYPE_Q4_K:
       LAUNCH_DENSE_MULTI(GGML_TYPE_Q4_K);
@@ -1125,12 +1580,48 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            hipStream_t stream) {
   GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_ROUTED_BATCH);
   if (tokens > MMVQ_MAX_BATCH_SIZE) {
-    GGML_ASSERT(type == GGML_TYPE_Q4_K && groups && experts_used <= 32);
+    GGML_ASSERT(groups && experts_used <= 32);
     group_moe_batch<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
         ids, groups, tokens, experts_used);
-    mul_mat_vec_moe_batch_wave64(gate, up, input, groups, output, k, rows,
-                                 experts_used, input_stride, stream);
-    return;
+    if (type == GGML_TYPE_Q4_K) {
+      mul_mat_vec_moe_batch_wave64(gate, up, input, groups, output, k, rows,
+                                   experts_used, input_stride, stream);
+      return;
+    }
+    switch (type) {
+      case GGML_TYPE_IQ2_XXS:
+        launch_moe_batch_groups<GGML_TYPE_IQ2_XXS>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      case GGML_TYPE_IQ2_XS:
+        launch_moe_batch_groups<GGML_TYPE_IQ2_XS>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      case GGML_TYPE_IQ2_S:
+        launch_moe_batch_groups<GGML_TYPE_IQ2_S>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      case GGML_TYPE_IQ3_XXS:
+        launch_moe_batch_groups<GGML_TYPE_IQ3_XXS>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      case GGML_TYPE_IQ3_S:
+        launch_moe_batch_groups<GGML_TYPE_IQ3_S>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      case GGML_TYPE_IQ4_XS:
+        launch_moe_batch_groups<GGML_TYPE_IQ4_XS>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride, stream);
+        return;
+      default:
+        GGML_ABORT("unsupported grouped gated weight format");
+    }
   }
   switch (type) {
     case GGML_TYPE_Q4_K:

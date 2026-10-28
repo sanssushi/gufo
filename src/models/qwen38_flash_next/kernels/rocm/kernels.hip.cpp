@@ -1622,6 +1622,103 @@ __global__ void SmallGemmWideKernel(const void* w, const float* x, float* out,
   }
 }
 
+/// The wide waves over a batch: blockIdx.y selects the eight-row token group,
+/// so a verification batch's groups run in one grid instead of serializing
+/// 40-block launches. Every group keeps SmallGemmWideKernel's two output rows
+/// per wave, eight-element lane partition, dot order and wave reduction, so a
+/// row's bytes do not depend on the group that computes it. A ragged final
+/// group clamps its invalid token rows to the group's first row and stores
+/// only its live rows.
+constexpr unsigned kWideGemmTokens = 8;
+template<WeightType type>
+__global__ void SmallGemmWideGroupedKernel(const void* w, const float* x,
+                                           float* out, std::uint32_t m,
+                                           std::uint32_t k,
+                                           std::uint32_t rows) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t wave = threadIdx.x / warpSize;
+  const std::uint32_t row0 =
+      (blockIdx.x * (blockDim.x / warpSize) + wave) * kWideGemmRows;
+  const std::uint32_t first = blockIdx.y * kWideGemmTokens;
+  const std::uint32_t live = min(kWideGemmTokens, rows - first);
+  const float* group_x = x + static_cast<std::size_t>(first) * k;
+  float* group_out = out + static_cast<std::size_t>(first) * m;
+  float acc[kWideGemmRows][kWideGemmTokens] = {};
+  for (std::uint32_t i0 = lane * 8; i0 < k; i0 += warpSize * 8) {
+    float xv[kWideGemmTokens][8];
+    if (i0 + 8 <= k) {
+#pragma unroll
+      for (unsigned j = 0; j < kWideGemmTokens; ++j) {
+        const std::uint32_t src = j < live ? j : 0;
+        __builtin_memcpy(xv[j],
+                         group_x + static_cast<std::size_t>(src) * k + i0,
+                         sizeof(xv[j]));
+      }
+    } else {
+#pragma unroll
+      for (unsigned j = 0; j < kWideGemmTokens; ++j) {
+        const std::uint32_t src = j < live ? j : 0;
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          xv[j][r] = i0 + r < k
+                         ? group_x[static_cast<std::size_t>(src) * k + i0 + r]
+                         : 0.0f;
+        }
+      }
+    }
+#pragma unroll
+    for (unsigned row = 0; row < kWideGemmRows; ++row) {
+      const std::uint32_t m_row = row0 + row;
+      if (m_row >= m) {
+        break;
+      }
+      const auto* wrow =
+          static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * m_row;
+      float wv[8];
+      if (i0 + 8 <= k) {
+        std::uint16_t packed[8];
+        __builtin_memcpy(packed, wrow + static_cast<std::size_t>(i0) * 2,
+                         sizeof(packed));
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          wv[r] = type == WeightType::kBF16
+                      ? Bf16ToF32(packed[r])
+                      : __half2float(__builtin_bit_cast(__half, packed[r]));
+        }
+      } else {
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          wv[r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
+        }
+      }
+#pragma unroll
+      for (unsigned j = 0; j < kWideGemmTokens; ++j) {
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          dot += wv[r] * xv[j][r];
+        }
+        acc[row][j] += dot;
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned row = 0; row < kWideGemmRows; ++row) {
+#pragma unroll
+    for (unsigned j = 0; j < kWideGemmTokens; ++j) {
+      acc[row][j] = WaveSum(acc[row][j]);
+    }
+  }
+  if (lane < kWideGemmRows && row0 + lane < m) {
+#pragma unroll
+    for (unsigned j = 0; j < kWideGemmTokens; ++j) {
+      if (j < live) {
+        group_out[static_cast<std::size_t>(j) * m + row0 + lane] = acc[lane][j];
+      }
+    }
+  }
+}
+
 __global__ void PleGateKernel(const float* key_n, const float* query_n,
                               const float* value, float* gated,
                               std::uint32_t hidden, std::uint32_t streams) {
@@ -9954,8 +10051,8 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true>), grid,
                        dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
                        4 * hidden, rank, xn, mixed_half, mixed_q8, nullptr,
-                       nullptr, AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0,
-                       norm_stride);
+                       nullptr, AttentionProjectionOutput{}, PassCheckpoints{},
+                       0, 0, norm_stride);
   }
   if (inject_w != nullptr) {
     const dim3 inject_grid(HcInjectPartsVec4(hidden), n_tokens);
@@ -10009,8 +10106,8 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
           (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
                               false, true, false, true>),
           wide_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
-          nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, PassCheckpoints{},
-          input_stride);
+          nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{},
+          PassCheckpoints{}, input_stride);
     } else {
       hipLaunchKernelGGL(
           (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
@@ -10076,7 +10173,8 @@ bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
                               true>),
           wide_grid, dim3(kThreads), 0, stream, w, x, half_out, batch, m, k,
           nullptr, nullptr, nullptr, nullptr, nullptr,
-          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0, 0, scale);
+          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0, 0,
+          scale);
     } else {
       hipLaunchKernelGGL(
           (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
@@ -10099,14 +10197,16 @@ bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
                                            true, core::GgmlType::kQ8_0, true>),
                        grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
                        m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0, scale);
+                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0,
+                       scale);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
                                            false, true, false, false, false,
                                            false, core::GgmlType::kQ8_0, true>),
                        grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
                        m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0, scale);
+                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0,
+                       scale);
   }
   return true;
 }
@@ -10217,8 +10317,8 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
             (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
                                 false, false, true, false, false, QType>),
             grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
-            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, PassCheckpoints{},
-            input_stride);
+            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{},
+            PassCheckpoints{}, input_stride);
       } else {
         hipLaunchKernelGGL(
             (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
@@ -10428,6 +10528,18 @@ void LaunchSmallGemmWide(const void* w, const float* x, float* out,
 }
 
 template<WeightType type>
+void LaunchSmallGemmWideGrouped(const void* w, const float* x, float* out,
+                                std::uint32_t rows, std::uint32_t m,
+                                std::uint32_t k, hipStream_t stream) {
+  hipLaunchKernelGGL((SmallGemmWideGroupedKernel<type>),
+                     dim3((m + kSmallGemmRows * kWideGemmRows - 1) /
+                              (kSmallGemmRows * kWideGemmRows),
+                          (rows + kWideGemmTokens - 1) / kWideGemmTokens),
+                     dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k,
+                     rows);
+}
+
+template<WeightType type>
 void SmallGemmForType(const void* w, const float* x, float* out,
                       std::uint32_t tokens, std::uint32_t m, std::uint32_t k,
                       hipStream_t stream) {
@@ -10507,6 +10619,18 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
     default:
       throw std::logic_error("unsupported small projection format");
   }
+}
+
+bool SmallGemmWideBatch(const void* w, WeightType type, const float* x,
+                        float* out, std::uint32_t n_tokens, std::uint32_t m,
+                        std::uint32_t k, hipStream_t stream) {
+  if (type != WeightType::kBF16 || n_tokens <= kWideGemmTokens || m > 512 ||
+      k < 8192) {
+    return false;
+  }
+  LaunchSmallGemmWideGrouped<WeightType::kBF16>(w, x, out, n_tokens, m, k,
+                                                stream);
+  return true;
 }
 
 void PleGate(const float* key_n, const float* query_n, const float* value,

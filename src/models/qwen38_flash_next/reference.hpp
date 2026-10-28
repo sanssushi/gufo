@@ -80,7 +80,8 @@ private:
                  std::span<float> out,
                  const qwen::vision::RopeLayout* rope = nullptr);
   void Moe(const LayerWeights& l, std::span<const float> x,
-           std::span<float> out);
+           std::span<float> out, MtpTrace* trace = nullptr,
+           const MtpTrace* stage_inputs = nullptr);
 
   const ModelWeights& w_;
   const Config& c_;
