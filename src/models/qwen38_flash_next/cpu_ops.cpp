@@ -1,6 +1,7 @@
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -69,6 +70,27 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
     case GgmlType::kIQ4_NL:
       gufo::quant::DequantizeIQ4_NL(src, out, k);
       break;
+    case GgmlType::kIQ4_XS:
+      gufo::quant::DequantizeIQ4_XS(src, out, k);
+      break;
+    case GgmlType::kIQ3_S:
+      gufo::quant::DequantizeIQ3_S(src, out, k);
+      break;
+    case GgmlType::kQ2_0:
+      gufo::quant::DequantizeQ2_0(src, out, k);
+      break;
+    case GgmlType::kIQ2_XXS:
+      gufo::quant::DequantizeIQ2_XXS(src, out, k);
+      break;
+    case GgmlType::kIQ2_XS:
+      gufo::quant::DequantizeIQ2_XS(src, out, k);
+      break;
+    case GgmlType::kIQ2_S:
+      gufo::quant::DequantizeIQ2_S(src, out, k);
+      break;
+    case GgmlType::kIQ3_XXS:
+      gufo::quant::DequantizeIQ3_XXS(src, out, k);
+      break;
     case GgmlType::kQ4_K:
       gufo::quant::DequantizeQ4_K(src, out, k);
       break;
@@ -79,8 +101,7 @@ void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
       gufo::quant::DequantizeQ6_K(src, out, k);
       break;
     default:
-      std::memset(out, 0, k * sizeof(float));
-      break;
+      std::abort();
   }
 }
 
