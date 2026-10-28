@@ -705,8 +705,15 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
-    SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-              stream_);
+    // Verification and single-session decoding must agree per row: take
+    // Dense's dispatch (and its MMVQ/SmallGemm arithmetic) in decode-width
+    // chunks rather than the wide MMQ tier, which only approximates it.
+    for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+      if (!Dense(w, x + static_cast<std::size_t>(r) * w.cols,
+                 out + static_cast<std::size_t>(r) * w.rows,
+                 std::min(kDecodeRows, rows - r), error))
+        return false;
+    }
     return true;
   }
   if (!QuantizeBatch(x, rows, w.cols, error))

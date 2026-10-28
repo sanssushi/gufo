@@ -162,7 +162,9 @@ float Sigmoid(float x) noexcept {
   return 1.0F / (1.0F + std::exp(-x));
 }
 float Silu(float x) noexcept {
-  return x * Sigmoid(x);
+  // One division, as the routed expert kernels (ggml_hip_op_silu_single),
+  // so the scalar oracle rounds their SwiGLU the same way.
+  return x / (1.0F + expf(-x));
 }
 float Softplus(float x) noexcept {
   return x > 20.0F ? x : std::log1p(std::exp(x));
