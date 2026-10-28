@@ -9949,12 +9949,12 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                             false, false, false, true>),
         grid, dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
         4 * hidden, rank, xn, mixed_half, mixed_q8, nullptr, nullptr,
-        AttentionProjectionOutput{}, 0, 0, 0, norm_stride);
+        AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, norm_stride);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true>), grid,
                        dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
                        4 * hidden, rank, xn, mixed_half, mixed_q8, nullptr,
-                       nullptr, AttentionProjectionOutput{}, 0, 0, 0,
+                       nullptr, AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0,
                        norm_stride);
   }
   if (inject_w != nullptr) {
@@ -10009,7 +10009,7 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
           (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
                               false, true, false, true>),
           wide_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
-          nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, 0,
+          nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, PassCheckpoints{},
           input_stride);
     } else {
       hipLaunchKernelGGL(
@@ -10076,7 +10076,7 @@ bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
                               true>),
           wide_grid, dim3(kThreads), 0, stream, w, x, half_out, batch, m, k,
           nullptr, nullptr, nullptr, nullptr, nullptr,
-          AttentionProjectionOutput{}, 0, input_stride, 0, 0, scale);
+          AttentionProjectionOutput{}, PassCheckpoints{}, input_stride, 0, 0, scale);
     } else {
       hipLaunchKernelGGL(
           (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
@@ -10084,7 +10084,7 @@ bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
                               true>),
           wide_grid, dim3(kThreads), 0, stream, w, x, half_out, batch, m, k,
           nullptr, nullptr, nullptr, nullptr, nullptr,
-          AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+          AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0, scale);
     }
     return true;
   }
@@ -10099,14 +10099,14 @@ bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
                                            true, core::GgmlType::kQ8_0, true>),
                        grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
                        m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0, scale);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
                                            false, true, false, false, false,
                                            false, core::GgmlType::kQ8_0, true>),
                        grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
                        m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+                       AttentionProjectionOutput{}, PassCheckpoints{}, 0, 0, 0, scale);
   }
   return true;
 }
@@ -10217,7 +10217,7 @@ void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
             (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
                                 false, false, true, false, false, QType>),
             grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
-            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, 0,
+            nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, PassCheckpoints{},
             input_stride);
       } else {
         hipLaunchKernelGGL(
@@ -10351,42 +10351,44 @@ bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
                           float* qkvz, float* convolved, std::uint32_t n_tokens,
                           std::uint32_t m, std::uint32_t k,
                           std::uint32_t channels, std::uint32_t kernel,
-                          hipStream_t stream, PassCheckpoints checkpoints) {
+                          hipStream_t stream, PassCheckpoints checkpoints,
+                          hipStream_t z_stream, hipEvent_t z_start) {
   if (n_tokens == 0 || (m != 16384 && m != 10240) || k != 2560 ||
       channels != 10240 || kernel != kSsmConvTaps || !KQuantWmmaType(type) ||
-      k % quant::QuantizedBlockElements(type) != 0) {
+      k % quant::QuantizedBlockElements(type) != 0 ||
+      (z_stream != nullptr && m != 16384)) {
     return false;
   }
   switch (type) {
     case core::GgmlType::kQ4_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ4_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     case core::GgmlType::kQ5_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ5_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     case core::GgmlType::kQ6_K:
       LaunchDenseF16Ssm<core::GgmlType::kQ6_K>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ4_NL:
       LaunchDenseF16Ssm<core::GgmlType::kIQ4_NL>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ4_XS:
       LaunchDenseF16Ssm<core::GgmlType::kIQ4_XS>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     case core::GgmlType::kIQ3_S:
       LaunchDenseF16Ssm<core::GgmlType::kIQ3_S>(
           w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
-          stream, checkpoints);
+          stream, checkpoints, z_stream, z_start);
       return true;
     default:
       return false;
