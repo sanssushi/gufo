@@ -320,6 +320,12 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  // A tiny prefix forces the audit's real-weight rare rows into the candidate
+  // set, independently of the model's language or draft acceptance rate.
+  if (mtp_audit && !device->SetDraftVocab(1, {}, &error)) {
+    std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
+    return 1;
+  }
   q::rocm::Executor::Options options;
   options.max_batch = batch;
   options.max_context = context;
