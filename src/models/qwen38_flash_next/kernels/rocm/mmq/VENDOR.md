@@ -18,7 +18,12 @@ upstream neighbors: `block_q2_0` plus `QK2_0`/`QI2_0`/`QR2_0` in
 `mmq.hpp`, `vec_dot_q2_0_q8_1` with `VDR_Q2_0_Q8_1_MMVQ`/`VDR_Q2_0_Q8_1_MMQ`
 in `vecdotq.hpp`, and the `ggml_hip_type_traits` case in `common.hpp`. Q2_0
 (GGUF type id 42) is not an upstream llama.cpp id; `QI2_0` counts vec-dot
-chunks, not packed int32s. The shared MMQ vec-dot accumulation is pinned
+chunks, not packed int32s. `IqMoeFragment` (one specialization per IQ2/IQ3
+routed gate/up format) with its `IqMoeScale` asm pin in `vecdotq.hpp`
+decodes each weight fragment once per row and K block for
+`mul_mat_vec_moe_grouped`'s multi-token groups; the pin fixes the
+scale-product association to the scalar routed path's. The shared MMQ
+vec-dot accumulation is pinned
 with `__fadd_rn`/`__fmaf_rn` (every typed vec-dot case in `mmq.hpp` from
 ~line 520, plus the `vecdotq.hpp` impls) so `-ffast-math` cannot reassociate
 it; chunk-width exactness depends on this (`test(qwen38-flash-next): cover
