@@ -187,16 +187,19 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
       block_bytes = 84;
       break;
     case core::GgmlType::kIQ2_XXS:
-      block_bytes = 66;
+      block_bytes = sizeof(block_iq2_xxs);
       break;
     case core::GgmlType::kIQ2_XS:
-      block_bytes = 74;
+      block_bytes = sizeof(block_iq2_xs);
       break;
     case core::GgmlType::kIQ2_S:
-      block_bytes = 82;
+      block_bytes = sizeof(block_iq2_s);
       break;
     case core::GgmlType::kIQ3_XXS:
-      block_bytes = 98;
+      block_bytes = sizeof(block_iq3_xxs);
+      break;
+    case core::GgmlType::kQ2_0:
+      block_bytes = sizeof(block_q2_0);
       break;
     case core::GgmlType::kIQ1_S:
       block_bytes = 50;
@@ -579,6 +582,8 @@ constexpr std::uint32_t kIq3sGrid[512] = {
     0x0f0d0703U, 0x0f0f0101U,
 };
 
+#include "src/core/quant/ggml_iq_grids.inc"
+
 constexpr std::uint8_t kSignMaskIq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
 float Iq4NlValue(const block_iq4_nl& block, std::size_t index) noexcept {
@@ -635,6 +640,98 @@ float Iq3sValue(const block_iq3_s& block, std::size_t index) noexcept {
   return negate ? -db * magnitude : db * magnitude;
 }
 
+float Q20Value(const block_q2_0& block, std::size_t index) noexcept {
+  const std::size_t byte_index = index / 4;
+  const std::size_t bit_offset = (index % 4) * 2;
+  const std::uint8_t quant =
+      static_cast<std::uint8_t>((block.qs[byte_index] >> bit_offset) & 0x03U);
+  return Fp16ToFloat(block.d) * static_cast<float>(static_cast<int>(quant) - 1);
+}
+
+float Iq2xxsValue(const block_iq2_xxs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;    // 0..7 sub-block
+  const std::size_t within = index % 32;  // 0..31
+  const std::size_t l = within / 8;       // 0..3 group of eight
+  const std::size_t j = within % 8;       // 0..7 element in the group
+  // Each 32-element sub-block packs four grid indices, 28 sign bits and a
+  // 4-bit scale into eight bytes.
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(block.qs);
+  const std::uint8_t grid_index = bytes[(ib32 * 8) + l];
+  std::uint32_t signs_word = 0;
+  std::memcpy(&signs_word, bytes + (ib32 * 8) + 4, sizeof(signs_word));
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2xxsGrid[grid_index]);
+  const std::uint8_t signs = kKsignsIq2xs[(signs_word >> (7 * l)) & 127U];
+  const float db = Fp16ToFloat(block.d) *
+                   (0.5F + static_cast<float>(signs_word >> 28)) * 0.25F;
+  const bool negate = (signs & kSignMaskIq2xs[j]) != 0;
+  const float magnitude = static_cast<float>(grid[j]);
+  return negate ? -db * magnitude : db * magnitude;
+}
+
+float Iq2xsValue(const block_iq2_xs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;    // 0..7 sub-block
+  const std::size_t within = index % 32;  // 0..31
+  const std::size_t l = within / 8;       // 0..3 group of eight
+  const std::size_t j = within % 8;       // 0..7 element in the group
+  const std::uint16_t code = block.qs[(ib32 * 4) + l];
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2xsGrid[code & 511U]);
+  const std::uint8_t signs = kKsignsIq2xs[code >> 9U];
+  const int scale_nibble = static_cast<int>(
+      (l / 2 == 0) ? (block.scales[ib32] & 0x0FU)
+                   : static_cast<unsigned>(block.scales[ib32] >> 4U));
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(scale_nibble)) * 0.25F;
+  const bool negate = (signs & kSignMaskIq2xs[j]) != 0;
+  const float magnitude = static_cast<float>(grid[j]);
+  return negate ? -db * magnitude : db * magnitude;
+}
+
+float Iq2sValue(const block_iq2_s& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;    // 0..7 sub-block
+  const std::size_t within = index % 32;  // 0..31
+  const std::size_t l = within / 8;       // 0..3 group of eight
+  const std::size_t j = within % 8;       // 0..7 element in the group
+  // Two high grid bits per group live in qh; sign bytes follow the 32 low
+  // grid bytes inside qs.
+  const std::uint32_t grid_index =
+      static_cast<std::uint32_t>(block.qs[(ib32 * 4) + l]) |
+      ((static_cast<std::uint32_t>(block.qh[ib32] >> (2U * l)) & 0x03U) << 8U);
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2sGrid[grid_index]);
+  const std::uint8_t signs = block.qs[32 + (ib32 * 4) + l];
+  const int scale_nibble = static_cast<int>(
+      (l / 2 == 0) ? (block.scales[ib32] & 0x0FU)
+                   : static_cast<unsigned>(block.scales[ib32] >> 4U));
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(scale_nibble)) * 0.25F;
+  const bool negate = (signs & kSignMaskIq2xs[j]) != 0;
+  const float magnitude = static_cast<float>(grid[j]);
+  return negate ? -db * magnitude : db * magnitude;
+}
+
+float Iq3xxsValue(const block_iq3_xxs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;    // 0..7 sub-block
+  const std::size_t within = index % 32;  // 0..31
+  const std::size_t l = within / 8;       // 0..3 group of eight
+  const std::size_t j = within % 8;       // 0..7 element in the group
+  // Each group of eight is two grid lookups of four magnitudes each.
+  const std::size_t half = j / 4;  // 0 -> grid1, 1 -> grid2
+  const std::size_t jj = j % 4;
+  const std::uint8_t grid_index = block.qs[(ib32 * 8) + (2 * l) + half];
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq3xxsGrid[grid_index]);
+  std::uint32_t signs_word = 0;
+  std::memcpy(&signs_word, block.qs + 64 + (ib32 * 4), sizeof(signs_word));
+  const std::uint8_t signs = kKsignsIq2xs[(signs_word >> (7 * l)) & 127U];
+  const float db = Fp16ToFloat(block.d) *
+                   (0.5F + static_cast<float>(signs_word >> 28)) * 0.5F;
+  const bool negate = (signs & kSignMaskIq2xs[j]) != 0;
+  const float magnitude = static_cast<float>(grid[jj]);
+  return negate ? -db * magnitude : db * magnitude;
+}
+
 }  // namespace
 
 const std::uint32_t* Iq3sGrid() noexcept {
@@ -667,6 +764,16 @@ void DequantizeIQ3_S(const void* src, float* dst, std::size_t k) {
   for (std::size_t b = 0; b < nb; ++b) {
     for (std::size_t i = 0; i < 256; ++i) {
       dst[(b * 256) + i] = Iq3sValue(blocks[b], i);
+    }
+  }
+}
+
+void DequantizeQ2_0(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q2_0*>(src);
+  const std::size_t nb = k / 64;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 64; ++i) {
+      dst[(b * 64) + i] = Q20Value(blocks[b], i);
     }
   }
 }
@@ -720,8 +827,6 @@ float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
 // ---------------------------------------------------------------------------
 
 namespace {
-
-#include "src/core/quant/ggml_iq_grids.inc"
 
 constexpr float kIq1Delta = 0.125F;
 
@@ -1096,6 +1201,76 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
     default:
       return false;
   }
+}
+
+float DotProductQ2_0(const void* row_data, std::span<const float> vec,
+                     std::size_t k) {
+  const auto* blocks = static_cast<const block_q2_0*>(row_data);
+  const std::size_t nb = k / 64;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 64);
+    for (std::size_t i = 0; i < 64; ++i) {
+      sum += Q20Value(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xxs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2xxsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_XS(const void* row_data, std::span<const float> vec,
+                       std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2xsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_S(const void* row_data, std::span<const float> vec,
+                      std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_s*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2sValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k) {
+  const auto* blocks = static_cast<const block_iq3_xxs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq3xxsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
 }
 
 }  // namespace gufo::quant
