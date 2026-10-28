@@ -1596,27 +1596,33 @@ std::size_t CountDiffs(const std::vector<__half>& a, std::size_t a_offset,
 
 /// Packed random blocks without the dequantized copy (model-sized shapes):
 /// every byte random, then sane F16 scales (Q4_K/Q5_K d and dmin; Q5_1 d and
-/// m; Q8_0 d).
+/// m; Q8_0 d; the GSQ formats' per-block d).
 std::vector<std::uint8_t> MakePacked(q::WeightType type, std::size_t e,
                                      std::size_t m, std::size_t k,
                                      std::uint32_t seed) {
-  const bool k_quant =
-      type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K;
-  const std::size_t block = k_quant ? 256 : 32;
+  const std::size_t block =
+      type == q::WeightType::kQ5_1 || type == q::WeightType::kQ8_0
+          ? 32
+          : QuantBlockElements(type);
   const std::size_t bytes = type == q::WeightType::kQ4_K   ? 144
                             : type == q::WeightType::kQ5_K ? 176
                             : type == q::WeightType::kQ5_1 ? 24
-                                                           : 34;
+                            : type == q::WeightType::kQ8_0
+                                ? 34
+                                : QuantBlockBytes(type);
+  const bool k_affine = type == q::WeightType::kQ4_K ||
+                        type == q::WeightType::kQ5_K ||
+                        type == q::WeightType::kQ5_1;
+  const bool k_wide = block == 256;
   std::vector<std::uint8_t> packed(e * m * (k / block) * bytes);
   for (auto& b : packed)
     b = static_cast<std::uint8_t>(NextRandom(&seed) >> 24);
   for (std::size_t b = 0; b < packed.size(); b += bytes) {
     // Model-like magnitudes: weights near 0.02 against unit activations.
-    const float d = k_quant ? 4e-4F * (1.0F + Uniform(&seed, 0.5F))
-                            : 1.5e-3F * (1.0F + Uniform(&seed, 0.5F));
+    const float d = (k_wide ? 4e-4F : 1.5e-3F) * (1.0F + Uniform(&seed, 0.5F));
     const __half dh = __float2half(d);
     std::memcpy(packed.data() + b, &dh, 2);
-    if (type != q::WeightType::kQ8_0) {
+    if (k_affine) {
       const __half mh =
           __float2half(type == q::WeightType::kQ5_1 ? -16.0F * d : 0.5F * d);
       std::memcpy(packed.data() + b + 2, &mh, 2);
@@ -1654,8 +1660,8 @@ std::vector<__half> RoutedDown(const Routing& r, const void* w,
 bool CheckPassRoutes(q::WeightType gate_type, q::WeightType down_type,
                      const std::vector<std::uint8_t>* gate_bytes = nullptr,
                      const std::vector<std::uint8_t>* up_bytes = nullptr,
-                     std::size_t experts = 128) {
-  constexpr std::size_t m = 640, k = 2560, used = 10, n_tokens = 1619;
+                     std::size_t experts = 128, std::size_t k = 2560) {
+  constexpr std::size_t m = 640, used = 10, n_tokens = 1619;
   const auto gate =
       gate_bytes ? *gate_bytes : MakePacked(gate_type, experts, m, k, 0xA11CE);
   const auto up =
@@ -1686,7 +1692,13 @@ bool CheckPassRoutes(q::WeightType gate_type, q::WeightType down_type,
   bool ok = true;
   const Routing all(ids, 0, n_tokens, used, experts);
   const auto paired = PairedSwiglu(all, d_gate, d_up, gate_type, d_x, m, k);
-  for (std::uint32_t tile : {16U, 48U}) {
+  // Q4_K/Q5_K keep the separate 64-row tile for the down view only; the GSQ
+  // formats take it for the pair too.
+  const std::vector<std::uint32_t> separate_tiles =
+      gate_type == q::WeightType::kQ4_K || gate_type == q::WeightType::kQ5_K
+          ? std::vector<std::uint32_t>{16U, 48U}
+          : std::vector<std::uint32_t>{16U, 48U, 64U};
+  for (std::uint32_t tile : separate_tiles) {
     ok = CountDiffs(
              paired, 0,
              SeparateSwiglu(all, d_gate, d_up, gate_type, d_x, m, k, tile), m,
@@ -1696,7 +1708,7 @@ bool CheckPassRoutes(q::WeightType gate_type, q::WeightType down_type,
   }
   auto* d_act = Upload(paired);
   const auto wide_down = RoutedDown(all, d_down, down_type, d_act, k, m, 128);
-  for (std::uint32_t tile : {16U, 48U}) {
+  for (std::uint32_t tile : {16U, 48U, 64U}) {
     ok = CountDiffs(wide_down, 0,
                     RoutedDown(all, d_down, down_type, d_act, k, m, tile), k,
                     name + " down 128 vs " + std::to_string(tile)) == 0 &&
@@ -1752,6 +1764,31 @@ int main() {
     for (const auto gate : {q::WeightType::kQ4_K, q::WeightType::kQ5_K})
       for (const auto down : {q::WeightType::kQ5_1, q::WeightType::kQ8_0})
         routes = CheckPassRoutes(gate, down) && routes;
+    // The GSQ-RCO routed pairs: the register-resident low-bit branch against
+    // the separate 16-, 48- and 64-row tiles and the short-pass routes. The
+    // down types follow the mixes (Q2_0 for the xxs gate/up formats, IQ4_NL
+    // for the rest); the down route itself is unchanged here.
+    for (const auto gate : {q::WeightType::kIQ2_XXS, q::WeightType::kIQ2_XS,
+                            q::WeightType::kIQ2_S, q::WeightType::kIQ3_XXS,
+                            q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS,
+                            q::WeightType::kIQ4_NL, q::WeightType::kQ2_0}) {
+      const auto down = gate == q::WeightType::kIQ2_XXS ||
+                                gate == q::WeightType::kIQ2_XS ||
+                                gate == q::WeightType::kIQ2_S ||
+                                gate == q::WeightType::kIQ3_XXS
+                            ? q::WeightType::kQ2_0
+                            : q::WeightType::kIQ4_NL;
+      routes = CheckPassRoutes(gate, down, nullptr, nullptr, 64) && routes;
+    }
+    // A short K still takes the register pair while it stays a whole number
+    // of 256-element groups.
+    routes = CheckPassRoutes(q::WeightType::kIQ2_S, q::WeightType::kQ2_0,
+                             nullptr, nullptr, 16, 512) &&
+             routes;
+    // Below that the legacy fallback keeps the same rows.
+    routes = CheckPassRoutes(q::WeightType::kQ2_0, q::WeightType::kIQ4_NL,
+                             nullptr, nullptr, 16, 320) &&
+             routes;
     if (!routes)
       throw std::runtime_error("routed expert rows depend on the pass route");
     ReportVectorAccuracy();
@@ -1807,9 +1844,16 @@ int main() {
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 201, 512, 0xDEADBEEFU)) && ok;
     // Paired waves must retain unsaturated SiLU arithmetic and protect the
     // last odd output row in short and partial token groups.
-    for (auto type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K}) {
+    const std::vector<q::WeightType> silu_types = {
+        q::WeightType::kQ4_K,   q::WeightType::kQ5_K,   q::WeightType::kIQ2_XXS,
+        q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,  q::WeightType::kIQ3_XXS,
+        q::WeightType::kIQ3_S,  q::WeightType::kIQ4_XS, q::WeightType::kIQ4_NL,
+        q::WeightType::kQ2_0};
+    for (std::size_t f = 0; f < silu_types.size(); ++f) {
       for (std::size_t rows : {1U, 8U, 9U, 32U, 33U, 65U, 129U}) {
-        ok = Ok(Run(type, rows, 1, 1, 65, 256, 0x5A1711U, 48, 0.002F)) && ok;
+        ok = Ok(Run(silu_types[f], rows, 1, 1, 65, 256,
+                    0x5A1711U + static_cast<std::uint32_t>(f), 48, 0.002F)) &&
+             ok;
       }
     }
     // The 16-row tile (small buckets) on every type.
@@ -1838,6 +1882,16 @@ int main() {
       ok = Ok(Run(type, 3000, 1, 64, 2560, 640,
                   0x2B000000U + static_cast<std::uint32_t>(type), 64)) &&
            ok;
+    }
+    // The wide prefill down view on the register-resident 128-row route:
+    // model shape, ragged rows and both short-K shapes against the 48-row
+    // tiles and the F64 reference.
+    for (q::WeightType type : {q::WeightType::kQ2_0, q::WeightType::kIQ4_NL}) {
+      const auto seed = 0x2D000000U + static_cast<std::uint32_t>(type);
+      ok = Ok(Run(type, 256, 1, 64, 2560, 640, seed, 128)) && ok;
+      ok = Ok(Run(type, 97, 1, 8, 129, 640, seed + 1, 128)) && ok;
+      ok = Ok(Run(type, 24, 1, 8, 129, 64, seed + 2, 128)) && ok;
+      ok = Ok(Run(type, 40, 1, 8, 201, 320, seed + 3, 128)) && ok;
     }
     // Ragged rows, a tiny batch and the 16-row tile on the GSQ formats;
     // Q2_0 single-block rows pin the tail indexing of the 64-block.

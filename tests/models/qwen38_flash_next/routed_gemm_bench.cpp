@@ -7,7 +7,9 @@
 // experts and FNV-1a hashes of both outputs, then the totals over all layers.
 //
 // routed_gemm_bench [reps] [tokens | counts-file] [gate type] [down type]
-//   gate type: q4_k (default) | q5_k; down type: q5_1 (default) | q8_0
+//   gate type: q4_k (default) | q5_k | q2_0 | iq2_xxs | iq2_xs | iq2_s |
+//              iq3_xxs | iq3_s | iq4_nl | iq4_xs
+//   down type: q5_1 (default) | q8_0 | q2_0 | iq4_nl
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -39,14 +41,30 @@ q::WeightType down_type = q::WeightType::kQ5_1;
 
 /// Bytes per quantized block and elements per block.
 std::size_t BlockBytes(q::WeightType type) {
-  return type == q::WeightType::kQ4_K   ? 144
-         : type == q::WeightType::kQ5_K ? 176
-         : type == q::WeightType::kQ5_1 ? 24
-                                        : 34;
+  return type == q::WeightType::kQ4_K      ? 144
+         : type == q::WeightType::kQ5_K    ? 176
+         : type == q::WeightType::kQ5_1    ? 24
+         : type == q::WeightType::kQ8_0    ? 34
+         : type == q::WeightType::kQ2_0    ? 18
+         : type == q::WeightType::kIQ2_XXS ? 66
+         : type == q::WeightType::kIQ2_XS  ? 74
+         : type == q::WeightType::kIQ2_S   ? 82
+         : type == q::WeightType::kIQ3_XXS ? 98
+         : type == q::WeightType::kIQ3_S   ? 110
+         : type == q::WeightType::kIQ4_NL  ? 18
+         : type == q::WeightType::kIQ4_XS  ? 136
+                                           : 0;
 }
 std::size_t BlockElems(q::WeightType type) {
-  return type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K ? 256
-                                                                      : 32;
+  return type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K ||
+                 type == q::WeightType::kIQ2_XXS ||
+                 type == q::WeightType::kIQ2_XS ||
+                 type == q::WeightType::kIQ2_S ||
+                 type == q::WeightType::kIQ3_XXS ||
+                 type == q::WeightType::kIQ3_S || type == q::WeightType::kIQ4_XS
+             ? 256
+         : type == q::WeightType::kQ2_0 ? 64
+                                        : 32;
 }
 q::WeightType ParseType(const std::string& name) {
   if (name == "q4_k")
@@ -57,6 +75,22 @@ q::WeightType ParseType(const std::string& name) {
     return q::WeightType::kQ5_1;
   if (name == "q8_0")
     return q::WeightType::kQ8_0;
+  if (name == "q2_0")
+    return q::WeightType::kQ2_0;
+  if (name == "iq2_xxs")
+    return q::WeightType::kIQ2_XXS;
+  if (name == "iq2_xs")
+    return q::WeightType::kIQ2_XS;
+  if (name == "iq2_s")
+    return q::WeightType::kIQ2_S;
+  if (name == "iq3_xxs")
+    return q::WeightType::kIQ3_XXS;
+  if (name == "iq3_s")
+    return q::WeightType::kIQ3_S;
+  if (name == "iq4_nl")
+    return q::WeightType::kIQ4_NL;
+  if (name == "iq4_xs")
+    return q::WeightType::kIQ4_XS;
   throw std::runtime_error("unknown weight type " + name);
 }
 
