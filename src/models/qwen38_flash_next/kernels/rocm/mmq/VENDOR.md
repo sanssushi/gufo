@@ -5,10 +5,12 @@ Adapted from `ggml-org/llama.cpp` at
 The upstream source directory is `ggml/src/ggml-cuda`; Gufo builds these
 sources with HIP for AMD Strix Halo (`gfx1151`).
 
-`qfn_mmq.h` is the public adapter. It supplies Q8_0 dense projections and
-Q4_K, Q5_K, Q5_1 and Q8_0 routed expert projections, including the paired
-Q4_K gate/up path. `qfn_ggml_stubs.*` supplies the minimal context and scratch
-pool without the ggml graph runtime. Gufo owns scheduling and HIP graphs.
+`qfn_mmq.h` is the public adapter. It supplies dense, shexpert and head
+projections for Q8_0, Q2_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S,
+IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, and routed expert projections for the
+same formats plus Q5_1, including the paired gate/up and fused SwiGLU vector
+paths. `qfn_ggml_stubs.*` supplies the minimal context and
+scratch pool without the ggml graph runtime. Gufo owns scheduling and HIP graphs.
 
 Local additions beyond the import (GSQ-RCO support) live beside their
 upstream neighbors: `block_q2_0` plus `QK2_0`/`QI2_0`/`QR2_0` in
@@ -22,8 +24,8 @@ with `__fadd_rn`/`__fmaf_rn` (every typed vec-dot case in `mmq.hpp` from
 it; chunk-width exactness depends on this (`test(qwen38-flash-next): cover
 chunk-width exactness` pins it). `mmq_args::mmq_x_request` and the host
 requested-width selection (`mmq.hpp:4085`, `4324-4329`) let the caller pick
-the column-tile width; `qfn_mmq_set_routed_tile_cols` feeds it for the routed
-tile-width path. `quantize_mmq_q8_1` takes an optional
+the column-tile width; `qfn_mmq_set_routed_tile_cols` and `dense_tile_cols`
+feed it for the routed tile-width path. `quantize_mmq_q8_1` takes an optional
 `x_up` and forms `silu(x) * x_up` in the gather-quantize (`silu_mul`, matching
 gufo's `SiluF`/`SwigluKernel` exactly); keep that when re-importing, and keep
 the arithmetic aligned with `kernels.hip.cpp`. Keep these blocks when
