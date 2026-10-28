@@ -205,17 +205,6 @@ void CheckFusedProjection(std::uint32_t tokens) {
   q::HcMixEpilogueVec4F16(d_norm.get(), d_gate.get(), d_inject_w.get(),
                           d_ref.get(), d_ref_half.get(), d_ref_q8.get(),
                           d_ref_inject.get(), tokens, kHidden, nullptr);
-  const auto exact = [](auto& reference, auto& actual, const char* name) {
-    std::vector<std::uint8_t> a(reference.bytes()), b(actual.bytes());
-    CheckHip(
-        hipMemcpy(a.data(), reference.get(), a.size(), hipMemcpyDeviceToHost),
-        "reference download");
-    CheckHip(hipMemcpy(b.data(), actual.get(), b.size(), hipMemcpyDeviceToHost),
-             "fused download");
-    if (a != b) {
-      throw std::runtime_error(std::string("HC fusion changed ") + name);
-    }
-  };
   // Small case covers all optional outputs; the large ragged case also
   // replays the full path to catch cross-block races and tail writes.
   const unsigned first = tokens == 96 ? 0 : 7;
@@ -230,20 +219,20 @@ void CheckFusedProjection(std::uint32_t tokens) {
                          kHidden, kRank, nullptr)) {
       throw std::runtime_error("HC fused projection rejected");
     }
-    exact(d_ref, d_out, "F32 mixed row");
+    Exact(d_ref, d_out, "F32 mixed row");
     if (outputs & 1)
-      exact(d_ref_half, d_out_half, "F16 mixed row");
+      Exact(d_ref_half, d_out_half, "F16 mixed row");
     if (outputs & 2)
-      exact(d_ref_q8, d_out_q8, "Q8 mixed row");
+      Exact(d_ref_q8, d_out_q8, "Q8 mixed row");
     if (outputs & 4)
-      exact(d_ref_inject, d_out_inject, "inject partials");
+      Exact(d_ref_inject, d_out_inject, "inject partials");
   }
   if (!q::HcMixF16Gemm(d_up.get(), d_low.get(), d_norm.get(), d_inject_w.get(),
                        nullptr, d_out_half.get(), nullptr, d_out_inject.get(),
                        tokens, kHidden, kRank, nullptr))
     throw std::runtime_error("HC F16-only projection rejected");
-  exact(d_ref_half, d_out_half, "F16-only mixed row");
-  exact(d_ref_inject, d_out_inject, "F16-only inject partials");
+  Exact(d_ref_half, d_out_half, "F16-only mixed row");
+  Exact(d_ref_inject, d_out_inject, "F16-only inject partials");
   std::cerr << "HC projection fusion exact at " << tokens << " tokens\n";
 }
 
@@ -373,6 +362,192 @@ void CheckBf16Gemm(std::uint32_t tokens, std::size_t rows, std::size_t cols,
   std::cerr << label << " projection exact at " << tokens << " tokens\n";
 }
 
+// Fusing the BF16 up and inject of the GSQ mixes must match the CPU
+// expansion of those weights through the separate GEMM and F32-inject
+// epilogue bit for bit.
+void CheckFusedProjectionBf16(std::uint32_t tokens) {
+  constexpr std::size_t kRank = 320;
+  constexpr std::size_t kDim = kStreams * kHidden;
+  const std::size_t mixed_count = static_cast<std::size_t>(tokens) * kHidden;
+  const std::size_t inject_count = static_cast<std::size_t>(tokens) * kStreams *
+                                   q::HcInjectPartsVec4(kHidden);
+  const std::size_t q8_bytes = q::Q8TiledBytes(tokens, kHidden);
+  const auto low =
+      MakeValues(static_cast<std::size_t>(tokens) * kRank, 0x12345678U, 1.0F);
+  const auto norm =
+      MakeValues(static_cast<std::size_t>(tokens) * kDim, 0x87654321U, 0.5F);
+  std::vector<__half> low_half(low.size()), norm_half(norm.size());
+  std::transform(low.begin(), low.end(), low_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  std::transform(norm.begin(), norm.end(), norm_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  const auto up = MakeValues(kDim * kRank, 0x23456789U, 0.02F);
+  const auto inject_w = MakeValues(kStreams * kDim, 0xDEADBEEFU, 0.1F);
+  std::vector<std::uint16_t> up_bf16(up.size()), inj_bf16(inject_w.size());
+  std::vector<__half> up_half(up.size());
+  std::vector<float> inj_f32(inject_w.size());
+  for (std::size_t i = 0; i < up.size(); ++i) {
+    up_bf16[i] = FloatToBf16(up[i]);
+    up_half[i] = __float2half_rn(Bf16ToFloat(up_bf16[i]));
+  }
+  for (std::size_t i = 0; i < inject_w.size(); ++i) {
+    inj_bf16[i] = FloatToBf16(inject_w[i]);
+    inj_f32[i] = Bf16ToFloat(inj_bf16[i]);
+  }
+  HipBuffer<__half> d_low(low_half.size()), d_norm(norm_half.size()),
+      d_up_half(up_half.size());
+  HipBuffer<std::uint16_t> d_up_bf16(up_bf16.size()),
+      d_inj_bf16(inj_bf16.size());
+  HipBuffer<float> d_inj_f32(inj_f32.size());
+  HipBuffer<float> d_gate(norm.size()), d_ref(mixed_count), d_out(mixed_count);
+  HipBuffer<__half> d_ref_half(mixed_count), d_out_half(mixed_count);
+  HipBuffer<std::uint8_t> d_ref_q8(q8_bytes), d_out_q8(q8_bytes);
+  HipBuffer<float> d_ref_inject(inject_count), d_out_inject(inject_count);
+  Upload(&d_low, low_half);
+  Upload(&d_norm, norm_half);
+  Upload(&d_up_half, up_half);
+  Upload(&d_up_bf16, up_bf16);
+  Upload(&d_inj_bf16, inj_bf16);
+  Upload(&d_inj_f32, inj_f32);
+  CheckHip(hipMemset(d_ref_q8.get(), 0, q8_bytes), "clear reference Q8");
+  CheckHip(hipMemset(d_out_q8.get(), 0, q8_bytes), "clear fused Q8");
+  if (!q::UnquantizedF16Gemm(d_up_half.get(), d_low.get(), d_gate.get(), tokens,
+                             kDim, kRank, nullptr))
+    throw std::runtime_error("HC BF16 reference projection rejected");
+  q::HcMixEpilogueVec4F16(d_norm.get(), d_gate.get(), d_inj_f32.get(),
+                          d_ref.get(), d_ref_half.get(), d_ref_q8.get(),
+                          d_ref_inject.get(), tokens, kHidden, nullptr);
+  const unsigned first = tokens == 96 ? 0 : 7;
+  const unsigned end = tokens == 96 ? 8 : 9;
+  for (unsigned iteration = first; iteration < end; ++iteration) {
+    const unsigned outputs = std::min(iteration, 7U);
+    if (!q::HcMixF16Gemm(d_up_bf16.get(), d_low.get(), d_norm.get(),
+                         outputs & 4 ? d_inj_bf16.get() : nullptr, d_out.get(),
+                         outputs & 1 ? d_out_half.get() : nullptr,
+                         outputs & 2 ? d_out_q8.get() : nullptr,
+                         outputs & 4 ? d_out_inject.get() : nullptr, tokens,
+                         kHidden, kRank, nullptr, q::WeightType::kBF16,
+                         q::WeightType::kBF16))
+      throw std::runtime_error("HC BF16 fused projection rejected");
+    Exact(d_ref, d_out, "BF16 F32 mixed row");
+    if (outputs & 1)
+      Exact(d_ref_half, d_out_half, "BF16 F16 mixed row");
+    if (outputs & 2)
+      Exact(d_ref_q8, d_out_q8, "BF16 Q8 mixed row");
+    if (outputs & 4)
+      Exact(d_ref_inject, d_out_inject, "BF16 inject partials");
+  }
+  const auto gate = Download(&d_gate, norm.size());
+  const auto mixed = Download(&d_ref, mixed_count);
+  const auto inject_ref = Download(&d_ref_inject, inject_count);
+  SpotOracle(up_half, low_half, gate, kDim, kRank, tokens, "HC BF16 up");
+  // The CPU mix reference over the reference chain's gate and the expanded
+  // weights: the mix arithmetic itself, on the tolerances an exp() allows.
+  const std::uint32_t vec_parts = q::HcInjectPartsVec4(kHidden);
+  double worst_mixed = 0.0;
+  double worst_inject = 0.0;
+  for (std::uint32_t t = 0; t < tokens; ++t) {
+    for (std::uint32_t h = 0; h < kHidden; ++h) {
+      double acc = 0.0;
+      for (std::uint32_t s = 0; s < kStreams; ++s) {
+        const std::size_t idx =
+            (static_cast<std::size_t>(t) * kStreams + s) * kHidden + h;
+        acc += static_cast<double>(__half2float(norm_half[idx])) /
+               (1.0 + std::exp(-static_cast<double>(gate[idx])));
+      }
+      acc /= kStreams;
+      worst_mixed = std::max(
+          worst_mixed,
+          std::abs(acc - mixed[static_cast<std::size_t>(t) * kHidden + h]));
+    }
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      double expected = 0.0;
+      for (std::uint32_t i = 0; i < kDim; ++i) {
+        expected +=
+            static_cast<double>(
+                inj_f32[static_cast<std::size_t>(s) * kDim + i]) *
+            __half2float(norm_half[static_cast<std::size_t>(t) * kDim + i]);
+      }
+      double candidate = 0.0;
+      for (std::uint32_t p = 0; p < vec_parts; ++p) {
+        candidate += inject_ref[(static_cast<std::size_t>(t) * kStreams + s) *
+                                    vec_parts +
+                                p];
+      }
+      const double scale = std::max(1.0, std::abs(expected));
+      worst_inject =
+          std::max(worst_inject, std::abs(expected - candidate) / scale);
+    }
+  }
+  std::cout << "HC BF16 mix vs CPU: mixed absolute error " << worst_mixed
+            << ", inject relative error " << worst_inject << '\n';
+  if (worst_mixed > 5e-5 || worst_inject > 1e-4) {
+    throw std::runtime_error("HC BF16 mix differs from the CPU mix");
+  }
+  std::cerr << "HC BF16 projection fusion exact at " << tokens << " tokens\n";
+}
+
+// The BF16 inject weights of the GSQ mixes take every epilogue path, against
+// the CPU expansion of those weights.
+void CheckBf16Inject() {
+  constexpr std::size_t kHcDim = static_cast<std::size_t>(kStreams) * kHidden;
+  const std::size_t rows = static_cast<std::size_t>(kTokens) * kHcDim;
+  const std::size_t mixed = static_cast<std::size_t>(kTokens) * kHidden;
+  const std::uint32_t scalar_parts = q::HcInjectParts(kHidden);
+  const std::uint32_t vec_parts = q::HcInjectPartsVec4(kHidden);
+  const std::size_t scalar_inject =
+      static_cast<std::size_t>(kTokens) * kStreams * scalar_parts;
+  const std::size_t vec_inject =
+      static_cast<std::size_t>(kTokens) * kStreams * vec_parts;
+  const auto xn = MakeValues(rows, 0x1234ABCDU, 0.5F);
+  const auto gate = MakeValues(rows, 0xBADC0FFEU, 2.0F);
+  const auto inject_w = MakeValues(kStreams * kHcDim, 0xDEADBEEFU, 0.1F);
+  std::vector<std::uint16_t> inj_bf16(inject_w.size());
+  std::vector<float> inj_f32(inject_w.size());
+  std::vector<__half> xn_half(rows);
+  for (std::size_t i = 0; i < inject_w.size(); ++i) {
+    inj_bf16[i] = FloatToBf16(inject_w[i]);
+    inj_f32[i] = Bf16ToFloat(inj_bf16[i]);
+  }
+  std::transform(xn.begin(), xn.end(), xn_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  HipBuffer<float> d_xn(rows), d_gate(rows), d_inj_f32(inj_f32.size());
+  HipBuffer<std::uint16_t> d_inj_bf16(inj_bf16.size());
+  HipBuffer<__half> d_xn_half(xn_half.size());
+  HipBuffer<float> d_ref_mixed(mixed), d_mixed(mixed);
+  HipBuffer<float> d_ref_scalar(scalar_inject), d_scalar(scalar_inject);
+  HipBuffer<float> d_ref_vec(vec_inject), d_vec(vec_inject);
+  Upload(&d_xn, xn);
+  Upload(&d_gate, gate);
+  Upload(&d_inj_f32, inj_f32);
+  Upload(&d_inj_bf16, inj_bf16);
+  Upload(&d_xn_half, xn_half);
+  q::HcMixEpilogue(d_xn.get(), d_gate.get(), d_inj_f32.get(), d_ref_mixed.get(),
+                   d_ref_scalar.get(), kTokens, kHidden, kStreams, nullptr);
+  q::HcMixEpilogue(d_xn.get(), d_gate.get(), d_inj_bf16.get(), d_mixed.get(),
+                   d_scalar.get(), kTokens, kHidden, kStreams, nullptr, nullptr,
+                   q::WeightType::kBF16);
+  Exact(d_ref_mixed, d_mixed, "BF16 scalar mixed row");
+  Exact(d_ref_scalar, d_scalar, "BF16 scalar inject partials");
+  q::HcMixEpilogueVec4(d_xn.get(), d_gate.get(), d_inj_f32.get(),
+                       d_ref_mixed.get(), d_ref_vec.get(), kTokens, kHidden,
+                       kStreams, nullptr);
+  q::HcMixEpilogueVec4(d_xn.get(), d_gate.get(), d_inj_bf16.get(),
+                       d_mixed.get(), d_vec.get(), kTokens, kHidden, kStreams,
+                       nullptr, q::WeightType::kBF16);
+  Exact(d_ref_mixed, d_mixed, "BF16 vec4 mixed row");
+  Exact(d_ref_vec, d_vec, "BF16 vec4 inject partials");
+  q::HcMixEpilogueVec4F16(d_xn_half.get(), d_gate.get(), d_inj_f32.get(),
+                          d_ref_mixed.get(), nullptr, nullptr, d_ref_vec.get(),
+                          kTokens, kHidden, nullptr);
+  q::HcMixEpilogueVec4F16(d_xn_half.get(), d_gate.get(), d_inj_bf16.get(),
+                          d_mixed.get(), nullptr, nullptr, d_vec.get(), kTokens,
+                          kHidden, nullptr, q::WeightType::kBF16);
+  Exact(d_ref_mixed, d_mixed, "BF16 F16 mixed row");
+  Exact(d_ref_vec, d_vec, "BF16 F16 inject partials");
+  std::cerr << "HC BF16 inject weights exact on every epilogue\n";
+}
+
 // The decode 16-bit GEMV tier (vectorized row waves over F32 activations):
 // every encoding follows the F64 oracle, and an output row must not depend
 // on the token count, which is the batched-decode contract.
@@ -460,6 +635,9 @@ int main() {
     CheckDecodeGemv(8, kDim, kRank, "decode HC up");
     CheckDecodeGemv(8, 512, kHidden, "decode router");
     CheckDecodeGemv(3, 96, 344, "decode tail-K");
+    CheckFusedProjectionBf16(96);
+    CheckFusedProjectionBf16(2049);
+    CheckBf16Inject();
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;

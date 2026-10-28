@@ -157,13 +157,18 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
   if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
     return false;
   const bool fused_inject = inject != nullptr && !m.inject.empty() &&
-                            m.inject.type == core::GgmlType::kF32;
+                            (m.inject.type == core::GgmlType::kF32 ||
+                             m.inject.type == core::GgmlType::kBF16);
+  const WeightType inject_type = m.inject.type == core::GgmlType::kBF16
+                                     ? WeightType::kBF16
+                                     : WeightType::kF32;
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   // Keep each row's scalar epilogue/reduction independently of the total
   // row count, including prompt replay and concatenated decode batches.
-  HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                mixed, inject, rows, c.hidden_size, c.hc_count, stream_);
+  HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.data : nullptr,
+                mixed, inject, rows, c.hidden_size, c.hc_count, stream_,
+                nullptr, inject_type);
   inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
   if (inject != nullptr && !m.inject.empty() && !fused_inject) {
     if (!DenseBatch(m.inject, s_.xn, inject, rows, error))

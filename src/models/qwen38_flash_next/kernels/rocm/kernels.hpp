@@ -70,8 +70,9 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
                  float eps, hipStream_t stream);
 
 /// Hyper-connection mix epilogue: mixed[t][i] = mean_s xn[t][s][i] *
-/// sigmoid(gate[t][s][i]); with `inject_w` ([streams][hc_dim] f32) also
-/// inject[t][s] = dot(inject_w[s], xn[t]).
+/// sigmoid(gate[t][s][i]); with `inject_w` ([streams][hc_dim]) also
+/// inject[t][s] = dot(inject_w[s], xn[t]). `inject_type` is the inject
+/// weight encoding: kF32 or kBF16 (the GSQ mixes).
 /// Partial sums per inject logit the fused epilogue emits; `inject` holds
 /// n_tokens * streams * HcInjectParts(hidden) floats.
 std::uint32_t HcInjectParts(std::uint32_t hidden);
@@ -79,25 +80,28 @@ std::uint32_t HcInjectPartsVec4(std::uint32_t hidden);
 /// A non-null `mixed_q8` (hidden % 32 == 0) also receives mixed as the
 /// small-batch projections' Q8_1 rows, byte-identical to
 /// qfn_mmq_quantize_q8_1.
-void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
+void HcMixEpilogue(const float* xn, const float* gate, const void* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
-                   hipStream_t stream, void* mixed_q8 = nullptr);
+                   hipStream_t stream, void* mixed_q8 = nullptr,
+                   WeightType inject_type = WeightType::kF32);
 /// Four adjacent hidden lanes per thread. The model's four-stream geometry
 /// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
-void HcMixEpilogueVec4(const float* xn, const float* gate,
-                       const float* inject_w, float* mixed, float* inject,
-                       std::uint32_t n_tokens, std::uint32_t hidden,
-                       std::uint32_t streams, hipStream_t stream);
+void HcMixEpilogueVec4(const float* xn, const float* gate, const void* inject_w,
+                       float* mixed, float* inject, std::uint32_t n_tokens,
+                       std::uint32_t hidden, std::uint32_t streams,
+                       hipStream_t stream,
+                       WeightType inject_type = WeightType::kF32);
 /// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
 /// four-stream geometry is the caller's contract. Non-null `mixed_half` /
 /// `mixed_q8` also receive the mixed rows as F16 and in the W8A8 tiled Q8
 /// layout (K = hidden).
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
-                          const float* inject_w, float* mixed,
+                          const void* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
-                          hipStream_t stream);
+                          hipStream_t stream,
+                          WeightType inject_type = WeightType::kF32);
 
 /// res[t][s][i] += block_out[t][i] * 2*sigmoid(inject[t][s] / streams), and
 /// when `gamma` is non-null also the next mixer's grouped RMSNorm of the
@@ -260,13 +264,17 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       const YarnRope& yarn = {});
 
-/// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
-/// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
+/// Exact Q8_0 or BF16 HC up projection and F16-input mixer for the Flash
+/// Next 2560-hidden, rank-320 geometry. `up_type` is kQ8_0 or kBF16 (the
+/// GSQ mixes, staged as F16 weights); `inject_type` follows
+/// HcMixEpilogueVec4F16. Returns false below 96 tokens or for other
 /// shapes. low_rank must not overlap mixed_half; side outputs are optional.
 bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
-                  const float* inject_w, float* mixed, __half* mixed_half,
+                  const void* inject_w, float* mixed, __half* mixed_half,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
-                  std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
+                  std::uint32_t hidden, std::uint32_t rank, hipStream_t stream,
+                  WeightType up_type = WeightType::kQ8_0,
+                  WeightType inject_type = WeightType::kF32);
 
 /// F16 activation rows [batch][k], F16 or BF16 (staged as F16) weight rows,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
