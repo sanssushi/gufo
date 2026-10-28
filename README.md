@@ -1,4 +1,13 @@
-# Gufo: The ***Open Source*** Strix Halo AI engine 
+This gufo fork adds support for **[GSQ-RCO weights](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**
+on **Qwen3.8-Flash-Next** (IQ3_XXS and IQ3_S, including
+the [Swift 1.5 variant](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)).
+
+Branch `feat/gsq-rco` is kept rebased onto upstream `main` — every sync rewrites the branch's history!
+
+The solution is informed by [GSQHalo.cpp](https://github.com/Aristo94/GSQHalo.cpp).
+For details see [docs/models/qwen3.8-flash-next/GSQ-RCO.md](docs/models/qwen3.8-flash-next/GSQ-RCO.md).
+
+# Gufo: The ***Open Source*** Strix Halo AI engine
 
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">

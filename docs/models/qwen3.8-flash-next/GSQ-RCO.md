@@ -1,0 +1,995 @@
+# GSQ-RCO support in gufo — state of the solution
+
+Branch: `feat/gsq-rco` (based on `main`).
+
+This reference documents the fork's GSQ-RCO support: the quantization types,
+the loader rules, the GPU paths, the exactness contracts those paths
+preserve, how the result is verified, its measured performance, and the
+files involved.
+
+The support is fork-only. `feat/gsq-rco` is a long-lived series of patches
+rebased onto upstream `main`.
+
+## Summary
+
+gufo runs the ISTA-DASLab GSQ-RCO GGUFs of Qwen3.8-Flash-Next: IQ3_XXS
+("xxs", 3.00 bits per weight) and IQ3_S ("s", 3.50 bits per weight). The
+two variants, called mixes below, support the same features as the unsloth
+UD-Q4_K_XL target: AR and MTP generation (with the shared Q8_0 MTP sidecar),
+image input (BF16 mmproj sidecar), the chat template, graph capture, batched
+sessions and serving modes. All in-repo quality checks pass on both mixes,
+and the UD-Q4_K_XL control shows no regression relative to `main`.
+
+Speed (details in "Performance state"):
+
+- AR token generation is within about 3% of the control on both mixes; xxs
+  is slightly above the control at depth 32768.
+- MTP token generation at a 32768-token context measures the multi-row
+  verification forward pass. For greedy runs, upstream's prompt-lookup
+  draft copies bypass the neural draft head and chains end at the first
+  unconfident draft (the two mixes and the control all take the same 16
+  cycles and accept 112 draft tokens), so this measurement is dominated by
+  verifying eight rows at a time. The difference is -0.4% for xxs and
+  -5.4% for s. The forward includes low-bit weight decoding and BF16
+  hyper-connection projections; the shared expert's decoded weight fragments
+  are reused across the tokens in a group.
+- MTP token generation with no preceding context follows the draft
+  acceptance rate rather than kernel speed, so the result varies with the
+  draft trajectory and between runs at the same trajectory.
+- Prefill throughput at depth 32768 is about 5.1-6.4% lower. The residual is
+  the quantization format: the BF16 hyper-connection down projection runs an
+  exact F16 WMMA path against the control's Q8_0 int8 path, the routed
+  gate/up pair runs exact low-bit grid decode, mixed-type SSM and attention
+  layers decode each projection in its own format, and the PLE is BF16. The
+  mixes win on routed down, SSM QKV+conv, output projections and
+  hyper-connection up/combine. Depth-0 prefill cells are advisory; their
+  spread follows run noise and the control's own depth-0 rate. The
+  deep-prefill residual is the accepted format floor.
+
+On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
+signed bytes directly from the quantization grid words, using packed sign
+masks. Mixed-type SSM layers fuse the four-tap convolution into their
+standalone QKV projection; the gate keeps its own projection type. Same-type
+attention QKV stacks run the head normalization, RoPE and KV stores in the
+projection epilogue for the Q8_0 and K-quant/IQ formats; the executor
+dispatches that fused pass on the quantized stack instead of a separate
+projection and preparation pass. Mixed-type attention layers run the same
+epilogue separately for the query/gate, key and value matrices, each in its
+own quantization type: the query/gate matrix carries projection heads 0-47,
+and the key and value matrices carry heads 48-49 and 50-51. The GDN
+output epilogue writes F16 rows with a padded pitch for the wide quantized
+SSM output projection. The wide WMMA causal-attention kernel writes its
+gated F16 result directly at a 32-half row pitch for the Q4_K, Q5_K and
+Q6_K attention-output projections; the executor dispatches those
+projections on the half rows instead of the F32 context and a separate
+narrow pass. Shorter, other-format and last-tile calls keep the F32 route.
+The shared-expert SwiGLU writes its F16 rows directly for the quantized dense
+projections.
+Decode dense projections share one Q8_1 activation row set across the
+quantized formats that read it, including the producer-written
+hyper-connection, attention-output gate and GDN epilogue rows. The decode
+combine writes the next mixer's norm Q8_1 rows only when that mixer's down
+projection reads them; a BF16 or F32 down projection takes the plain
+combine and no rows are written. The shared expert's gate/up pair fuses
+both projections and SwiGLU into one gated vector launch when the two weights
+share a format; Q6_K, Q2_0 and IQ4_NL keep their separate dense waves at the
+widths where those are faster. Ordinary short-K F16/BF16 small projections
+use a four-element lane partition with a multi-step preload, exact 16-bit
+loads and a pinned FMA chain, while the long-K BF16 hyper-connection down
+projection keeps its eight-element wide GEMV. The BF16 hyper-connection
+down projection at wide prefill uses a 128-row x 128-token tile and
+reads F16 norm rows with a 32-half pad that the previous
+combine writes directly; the fused up epilogue reads the same pitch. The
+BF16 hyper-connection up projection at decode uses a 256-row x 16-token
+tile; the wide fused mixer keeps its 128-row tile. The BF16 PLE, indexer
+and non-fused mixer-up projections take the 128-row × 128-token tile at
+512 or more tokens and the 64-row tile below.
+Routed Q2_0 down projections use four weight rows per wave for multi-row
+decode and verification batches. The wide mixers omit their F32 mixed row in
+layers whose consumers read only the producer-written F16 rows: the GSQ
+attention, SSM, shared-expert and routed projections.
+
+Prefill runs the DeltaNet recurrence in row-split blocks, with the gated
+output norm fused into the epilogue. The stacked SSM projection puts its Z
+rows on a second stream after the QKV tiles, and at wide prefill the shared
+expert runs on a second stream beside the routed experts; the epilogue waits
+for the Z rows before it reads them.
+
+## Targets and artifacts
+
+| Item | Description |
+| --- | --- |
+| GSQ-RCO GGUFs | [ISTA-DASLab GSQ-RCO releases](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) of Qwen3.8-Flash-Next: IQ3_XXS ("xxs", 3.00 bits per weight) and IQ3_S ("s", 3.50 bits per weight), each with the shared MTP Q8_0 sidecar and the BF16 mmproj sidecar |
+| Control | unsloth UD-Q4_K_XL (4 shards): the speed and quality baseline for this feature |
+| Reference implementation | GSQHalo.cpp (a llama.cpp fork): read-only reference for the formats and kernel ideas |
+
+Facts that shape the implementation:
+
+- Shard 2 of a GSQ mix contains a single tensor, the per-layer token-embedding
+  (PLE) table (`per_layer_token_embd.weight`, IQ4_NL); shard discovery
+  handles this unbalanced layout.
+- Images and MTP use the shared Q8_0 and BF16 sidecars. These attach by
+  identity keys, not by weight type, so they work with GSQ targets.
+- Each mix stores these types per role:
+
+| Role | Types |
+| --- | --- |
+| dense attention and SSM projections | IQ4_XS, IQ3_S, Q6_K, Q5_K, Q4_K |
+| shared-expert projections | Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ4_NL, Q2_0, Q8_0 |
+| routed experts | Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS |
+| PLE key/value | BF16 |
+| hyper-connection mixers (`hc_*`) | BF16 |
+| `token_embd` | IQ3_S (xxs) or IQ4_XS (s) |
+| `output` | Q5_K (xxs) or Q6_K (s) |
+| `ple_conv1d` | F16 |
+| router, `ffn_gate_inp_shexp` and GDN alpha/beta | BF16 |
+
+- Only 4 of 12 attention layers in xxs and 5 of 12 in s, plus 9 of 36 SSM
+  layers in xxs and 12 of 36 in s, have all their projections in one
+  quantization type. Attention and SSM stacking therefore merges only those
+  groups (see "Stacked attention and SSM projections").
+
+## Type layer (`src/core`)
+
+- `gguf_reader.hpp` `GgmlType` includes `kIQ2_XS = 17`, `kIQ3_XXS = 18`,
+  `kIQ2_S = 22` and `kQ2_0 = 42`. The numbers are GGUF type ids; all other
+  ids keep their values (never renumber). Q2_0 has no upstream id and follows
+  GSQHalo's `block_q2_0` layout: an fp16 scale, 16 code bytes and 64 weights
+  per block. Keep it isolated in the quant layer.
+- `quant/ggml_dequant.{hpp,cpp}` defines the block structs, row sizes, CPU
+  dequantization and f32 dot products for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ3_S, IQ4_NL, IQ4_XS and Q2_0. Its grid and sign tables match GSQHalo's
+  `ggml-common.h`. The CPU entry points (`quant::Dequantize`/`quant::Dot`,
+  `cpu::DequantizeRow`) handle all of these types; unknown types abort
+  instead of silently filling with zeroes.
+- `DescribeQwenGemmFormat` lists these types and sets `block_elements`
+  for the quantized-only group, so enabling a format directly cannot hit
+  `kMisalignedQuantK` through a missing block size.
+- `tests/core/ggml_dequant_test.cpp` covers hand-built blocks, row-size
+  rules and test vectors that distinguish correct decoding from plausible
+  mistakes (IQ2_S high grid bits in `qh`, the two IQ3_XXS grid halves, sign
+  indices beyond 0 and 1). With `GUFO_GSQ_MODEL` set, it also checks rows
+  from the real shards against frozen per-type samples; the results are
+  bit-exact against an independent port of GSQHalo's `ggml-quants.c`.
+
+## Loader and upload checks
+
+`src/models/qwen38_flash_next/weights.cpp`:
+
+- `FormatOf` maps each type to its block geometry (elements and bytes):
+  Q2_0 {64,18}, IQ2_XXS {256,66}, IQ2_XS {256,74}, IQ2_S {256,82},
+  IQ3_XXS {256,98}, IQ3_S {256,110}, IQ4_XS {256,136}. The values duplicate
+  `quant::QuantizedBlockElements`/`QuantizedRowBytes`; the two definitions
+  agree.
+- Per-role allowed-type lists. Each list is exactly the union of the types
+  used in the two mixes' per-tensor allocation maps plus the types accepted
+  for UD-Q4_K_XL, and no wider. The GSQ types by role are:
+
+| Role | Types |
+| --- | --- |
+| dense (attn_*, ssm_qkv/gate/out, indexer, PLE key/value, nextn.eh_proj) | Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S |
+| shared expert (ffn_*_shexp) | Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ4_NL, Q2_0 |
+| experts (ffn_*_exps) | IQ4_NL, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS |
+| embd (token_embd) | IQ3_S, IQ4_XS |
+| output | Q5_K (xxs), Q6_K (s) |
+| router, ffn_gate_inp_shexp, GDN alpha/beta | BF16 |
+| ple_conv1d | F16 |
+| hc_*, ssm_alpha/beta | BF16 |
+
+`device_model.cpp`:
+
+- `Stack` accepts BF16 stacked weights; the router and GDN alpha/beta
+  weights run through the generic BF16 BLAS path in their stored layout.
+- The Q6_K type check allows the LM head (Q6_K head kernels exist) and
+  deliberately rejects Q6_K `token_embd` and routed experts: no supported
+  mix stores Q6_K there, and the expert paths are untested. Keep this check
+  strict.
+- `ple_conv1d` is F16 in GSQ. Both consumers read it according to its
+  encoding; reading it as `float*` would use half the bytes, read out of
+  bounds and produce NaN logits.
+- Weight uploads include a zeroed `kTailMargin` tail. The wide MMQ path
+  reads whole 256-element k-iterations past the end of short rows; an
+  uninitialized tail can poison the accumulator (0 × inf) and make
+  `qfn_mmq_sanitize_f32` zero whole rows. Test uploads must include the
+  zeroed tail too.
+- `qwen38_flash_next.weights` checks each role's accepted types and that
+  disallowed types are rejected.
+
+## GPU execution paths
+
+Kernel sources are under `src/models/qwen38_flash_next/kernels/rocm/`:
+`mmq/` holds the vendored llama.cpp MMQ code and the gufo-owned adapter;
+`kernels.hip.cpp` holds shared GEMV/GEMM kernels. Vendored policy:
+`mmq.hpp`, `ggml-common.h` and the other vendored files stay at or near
+zero diff; gufo owns `qfn_mmq.h`/`qfn_mmq.hip.cpp`, `executor.cpp`,
+`weights.cpp` and `core/quant`. Every local addition to a vendored file is
+recorded in `kernels/rocm/mmq/VENDOR.md` as something to re-apply when the
+vendored code is re-imported (see "Vendored-code obligations").
+
+### Routed experts (MoE): the main compute path
+
+- Gate/up projections use IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS
+  or Q2_0 (plus Q4_K, Q5_K, Q5_1 and Q8_0). Down projections
+  use IQ4_NL or Q2_0 (plus Q5_K, Q5_1 and Q8_0).
+- Small batches (up to 8 rows) use MMVQ. `moe_vector_projection` covers every
+  routed format; its supported set is the set defined by
+  `qfn_mmq_moe_gated_type`, plus Q5_1. The fused SwiGLU gated vector path in
+  `mmvq.hip.cpp` supports every routed format except Q5_1, and the vector
+  paths handle up to 8 rows except Q4_K. For a group's shared expert, the
+  grouped gated kernel decodes a weight fragment once per row and K block,
+  then reuses it for every token in the group. `Q4MoeFragment` handles Q4_K;
+  `IqMoeFragment` handles IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S
+  (`vecdotq.hpp`). `qfn_mmq_moe_gated_type`
+  is the single definition of the gated-format set (in the adapter, exported
+  through `qfn_mmq.h`); the executor's `GatedMoeType` delegates to it, so the
+  two sets cannot differ.
+- The routed Q2_0 down projection at the expert shape (K 640) uses four
+  weight rows per wave when a multi-row slot batch routes one expert per
+  row. Each row keeps the two-row wave's dot-product order, warp reduction
+  and inactive-slot zero write; other formats and shapes keep their existing
+  row tiles.
+- Wide batches also use MMQ: `mul_mat_q_case` instantiations plus the
+  type-generic `qfn_mmq_moe_raw` and `qfn_mmq_moe_pair_unique` in
+  `qfn_mmq.hip.cpp`. The routed tile width comes from
+  `qfn_mmq_routed_tile_cols_for_counts`; `kPanel 32` is the measured
+  optimum. A smaller width costs more than a larger one, because each column
+  tile streams and re-decodes a full slice of a weight row.
+- For the low-bit expert formats, the main prefill path is the F16-tile WMMA
+  route. `RoutedF16GEMMKernel` uses `kLowBit` sub-block staging to dequantize
+  rows of the eight low-bit expert formats into F16 tiles with the shared
+  `DecodeQuantSub16` decoders (`src/models/qwen/hip/quant_ops.hpp`). The
+  paired gate/up SwiGLU fusion runs in the same pass. The IQ2/IQ3 sub-block
+  decoders build four signed-byte words from the grid entries one group at
+  a time (two 64-bit IQ2 words or four 32-bit IQ3 words per 16-element
+  sub-block). They keep
+  the sign bytes in registers and negate per byte; Q2_0 expands a packed
+  code word. Magnitudes and signs are decoded per group, not per element.
+  Q5_1 rows stage their 24-byte blocks as stored in shared memory (LDS);
+  the scale, high word and codes are read per K block. K-quant and IQ rows
+  stage codes plus their per-block affine. The paired gate/up path uses one
+  design throughout: cached headers, `cndmask`-based code-group selection,
+  the F16 LDS pair epilogue and its `HeaderByte` header decoder.
+- Within the MMQ path, wide batches use the 64-token down-projection map and
+  the 128-token paired gate/up map (`routed_64_tiles_` / `routed_pair_*`).
+  `WmmaExperts` selects the path; its condition includes the `RoutedF16Type`
+  check. (`WmmaExperts` is upstream's helper shape.)
+- The id-map bounds scan reads the per-expert counts without modifying them
+  and writes each expert's block base next to its count. The MoE epilogue
+  folds into the combine through the `moe_pending_` deferral: the residual
+  (`kPrior`) and the fused inject (`kInject`) are carried until
+  `HcApplyDeferred` applies them. The routed SwiGLU is computed during the
+  down-projection activation quantization (`quantize_mmq_q8_1` with `x_up`),
+  which avoids an extra F32 round trip. The combine's square-sum uses one
+  pinned `__fmaf_rn` chain in both the deferred and separate paths.
+- Q2_0 is wired end to end inside the vendored layer (recorded in
+  `VENDOR.md`): `block_q2_0` and `QK2_0`/`QI2_0`/`QR2_0` in
+  `ggml-common.h`; `vec_dot_q2_0_q8_1`, which decodes 2-bit groups per lane
+  with `__builtin_amdgcn_perm`; `load_tiles_q2_0`, which unpacks blocks into
+  a Q8_0 tile so the Q8_0 vector dot products apply; and the
+  `mmq_type_traits` and tile/DS-layout cases in
+  `mmq.hpp`/`common.hpp`/`vecdotq.hpp`.
+- `moe_wave64.hip.cpp` needs no changes: it is a Q4_K-only batch kernel with
+  no type check.
+
+### Dense projections, heads and embeddings
+
+- `qfn_mmq_dense(weight_type, …)` handles the dense and shared-expert set:
+  Q8_0, Q2_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+  IQ4_NL and IQ4_XS. `qfn_mmq_dense_vec(M, N, K)` (same argument order as
+  its siblings) routes through `moe_vector_projection` with
+  `n_experts = n_expert_used = 1` and a pool-allocated zeroed ids buffer. It
+  accepts the same formats as the gated path; Q5_1 is rejected by both, so
+  decode and prefill cannot disagree.
+- `Executor::Dense` keeps the Q8_0 fast path and sends every other
+  non-F32/BF16/F16 matrix through the adapter (MMVQ below `MatrixRows`,
+  MMQ above). The generic fallback rejects other types with an error, and the
+  error path distinguishes an unsupported format (probed through
+  `qfn_mmq_moe_gated_type`) from a launch failure. `DenseBatch` sends
+  quantized rows through one `qfn_mmq_dense` call.
+- Decode projections share one Q8_1 activation row set across the formats
+  that read it. The attention Q/K/V, SSM QKV/gate and PLE key/value groups
+  quantize once when at least two members are quantized, and the
+  shared-expert gate/up pair does the same; a single quantized projection
+  quantizes in its own entry, and F16/BF16/F32 consumers trigger no pass.
+  Every adapter format consumes the same rows:
+  `qfn_mmq_dense_vec_preq` passes them to the routed vector kernel with a
+  zeroed single-expert id, so a K-quant/IQ projection reads the producer's
+  codes, half `d` and `d*sum(q)` instead of re-quantizing the F32 rows. The
+  MMVQ quantizer ignores the weight type, so rows written by
+  `qfn_mmq_quantize_q8_1`, the hyper-connection combine and the mix
+  epilogue are interchangeable. A projection whose source already has
+  producer-written rows consumes them directly.
+  The decode GDN and attention-output producers write Q8_1 rows for every
+  quantized output format; their projections consume the rows directly.
+- MMQ scratch allocations come from the calling stream's arena. The executor
+  releases its arena with its stream, so concurrent streams (the target and
+  the MTP drafter) never share live quantized activations.
+- Q6_K is fully supported by the adapter (`WeightType::kQ6_K = 14`; the
+  MMVQ, MMQ and gated cases exist).
+- Wide dense GEMMs (prefill): `DenseF16GEMMKernel` decodes the k-quant/IQ
+  weights into F16 and feeds the shared LDS/WMMA path used by Q8_0
+  (`DenseQuantF16Gemm`). A producer that already holds the activation writes
+  its F16 rows directly: the GDN output epilogue for a wide K-quant/IQ
+  `ssm_out`, and the shared-expert SwiGLU for a wide K-quant/IQ
+  `shexp_down`. Their bytes equal the F32 producer output followed by the
+  activation narrow. For the wide [2560,6144] `ssm_out`, the GDN epilogue
+  writes `cols + 32` halves per row and `DenseQuantF16Gemm` reads that
+  pitch on its five-row-group launch plan; the padded rows stay inside the
+  F32-sized output scratch. Every other caller keeps the contiguous pitch.
+  The wide WMMA causal-attention kernel writes its gated F16 result directly
+  at a 32-half row pitch for the Q4_K, Q5_K and Q6_K attention-output
+  projections; the executor dispatches those projections on the half rows
+  instead of the F32 context and a separate narrow pass. Shorter,
+  other-format and last-tile calls keep the F32 route.
+  Other wide inputs are narrowed from F32 through `PrepareHalfInput`. The
+  int8 WMMA route
+  (`KQuantWmmaGemm`/`Q8ActFillSums`) is not used. Rebuilding it over the
+  per-lane decoder family at the 256-row stack geometry measures slower:
+  the per-accumulator-element fixups cost more than the 2x int8 WMMA rate
+  gains (see "Performance state").
+- The shared expert's decode gate/up pair takes one gated vector launch when
+  both projections share a format. The single-expert launch uses a stable
+  zero id and reads the shared Q8_1 rows; it reproduces the dense
+  prequantized pair plus SwiGLU byte for byte. Q6_K, Q2_0 and IQ4_NL keep
+  the separate dense pair at four, six and seven rows respectively, where
+  those measure faster; other formats fuse at every decode width up to eight
+  rows. Mixed-format pairs keep the separate projections, and wide prefill
+  keeps the dense F16-tile plan for both projections.
+- The shared expert's F16 handoff applies to its Q8_0 and K-quant/IQ down
+  formats (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, IQ3_S). Q2_0 and the
+  other adapter-MMQ consumers keep the F32 SwiGLU. Routed experts read the
+  router's F16 token rows in `s_.x_half`; the shared expert's SwiGLU rows use
+  a separate F16 buffer.
+- Wide prefill SSM projections fuse the four-tap convolution into the
+  quantized projection (`DenseQuantF16SsmGemm`, with `kSsmConv` epilogue
+  instantiations for the K-quant/IQ `ssm_in` types) behind the executor
+  check `KQuantWmmaType(ssm_in.type) && cols <= max_half_cols`, alongside
+  `DenseF16Route`. Mixed-type layers keep QKV and gate separate; their
+  standalone [10240][2560] QKV projection takes the same fused epilogue in
+  wide prefill behind the check on `ssm_qkv.type`, and the independently
+  typed gate keeps its own projection. The epilogue reads only the
+  accumulated tile, `conv_w` and the history, so it does not depend on the
+  weight format. The
+  Q8_0 route keeps each wave's decoded weight rows in registers; the GSQ
+  stacks stage their decoded fragments in shared memory (`LDS`), because
+  the register variant is slower for them (see "Performance state").
+  The stacked [QKV; gate] projection, Q8_0 or K-quant/IQ, splits its Z rows
+  into a second launch on the side stream after the QKV tiles; the epilogue
+  waits for them before it reads z.
+- `UnquantizedF16Gemm` handles F16 weights or BF16 weights treated as F16,
+  with F16 activation rows, in 64-row × 128-token tiles (the narrow shape
+  also used by W8A8Gemm). BF16 rows over the small-K group (the PLE
+  key/value, indexer and non-fused mixer up projections) take a 128-row ×
+  128-token tile at 512 or more tokens and the 64-row tile below; both
+  stage BF16 to F16 and keep the same K order per output. The BF16
+  [320,10240] mixer down projection at
+  1,024 or more tokens uses a 128-row × 128-token tile and an optional
+  32-half activation pitch; its third row block masks the 64 rows past
+  m=320. A padded pitch is rejected for other shapes and below 1,024
+  tokens. The accumulation order along K is fixed per output, so results
+  stay bit-exact across every prefill chunk width, between the two plans
+  and between packed and padded activation rows. The BF16 [10240,320] mixer
+  up projection at 1-8 tokens uses a 256-row × 16-token tile with the same
+  staged BF16 rounding and two K16 accumulator chains. It serves the HC down
+  fusion, the BF16 indexer/alpha-beta
+  projections and the tuned F16 blaslt shapes.
+- Embeddings: `EmbeddingType`/`SmallType` and the gather (`RowElement`/
+  `RowBytes` via `gufo::hip::QuantBlockElement`) accept the GSQ `token_embd`
+  types. Unmapped types trap on the device (`__builtin_trap()`) and throw on
+  the host. The LM head (Q5_K/Q6_K) runs through the same dense dispatch.
+- Decode with few rows: `mul_mat_vec_q_dense_multi` (`mmvq.hip.cpp`) shares
+  weight rows across the token batch. For dense projections at 2-8 tokens,
+  one warp computes all tokens for its two weight rows; the per-row and
+  per-token dot products match the one-token waves. Routed calls never use
+  this path; it is enabled only when `n_experts == n_expert_used == 1`.
+- Short-K F16/BF16 small projections (router, GDN alpha/beta and indexer;
+  k=2560): `SmallGemmKernel` keeps one wave per weight row, maps four
+  consecutive weights and activations per lane, preloads the weight and
+  activation groups for every step, reads whole-pass F16/BF16 weights with
+  exact `ushort4` loads and activations with `float4` loads, and accumulates
+  through one pinned per-output FMA chain.
+- 16-bit few-row long-K GEMVs (the BF16 `hc` down projection at [320,
+  10240]): `SmallGemmWideKernel` computes two weight rows per wave (m ≤ 512,
+  k ≥ 8192, 1-8 tokens) with its own eight-element lane partition. With four
+  rows per wave, the 320-row shape leaves too few resident waves; two rows
+  raise cold-cache throughput from 82 to 116 GB/s. The control's Q8_0 `hc`
+  down projection keeps its specialized `qfn_q8_hc_down` path.
+
+### Stacked attention and SSM projections
+
+The `stackable` check in `device_model.cpp` accepts the same quantized dense
+formats as the executor's dense dispatch, so the two cannot disagree. `Stack`
+concatenates those formats the same way as Q8_0: the same zeroed
+`kTailMargin` tail; `max_q8_cols` stays unchanged for Q8_0; and the K-quant
+stacks also register `max_half_cols`, from which the F16-tile route sizes
+activation rows. Same-type `attn_q`/`attn_k`/`attn_v` triplets merge into one
+[13312][2560] GEMM. The executor dispatches that stack through
+`AttentionF16Gemm` when it is Q8_0 or one of the K-quant/IQ formats, fusing
+the projection, Q/K normalization, RoPE and KV stores in one launch. Its
+Q/gate rows and K/V cache bytes equal the separate projection followed by
+`PrepareAttention`. Same-type `ssm_qkv`/`ssm_gate` pairs merge over the
+`ssm_in` layout. Mixed-type groups are not stacked: the exactness
+requirement that operator outputs match a CPU reference forbids requantizing
+weights, so each tensor keeps its own rows and type; the attention ones take
+the per-projection fused chain below.
+
+Mixed-type attention layers keep Q, K and V as separate matrices. The same
+fused epilogue runs three launches under one projection-head numbering: the
+query/gate matrix [12288,2560] carries heads 0-47 and retains the four-tile
+launch grouping, while the independently typed key and value matrices
+[512,2560] carry heads 48-49 and 50-51 with one tile per group. Each launch
+uses its local row to address its own matrix; only the global projection
+head selects the epilogue destination. Query and gate rows stay F32; K and
+V round to F16 at exactly the existing cache boundary. The executor
+dispatches this chain at wide prefill only, under the same max-batch, shape
+and `projections_ready` conditions as the same-type fusion; decode and
+verification keep the separate path.
+
+### Hyper-connection (BF16 mixers)
+
+Three fused paths accept BF16 weights, where UD-Q4_K_XL stores Q8_0:
+
+- Inject fusion: the mix epilogues (`HcMixEpilogue`/`Vec4`/`Vec4F16` and
+  `HcMixF16Gemm`'s inject launch) and the deferred wide combines
+  (`HcCombineF16`/`HcCombineMoeF16`) take `WeightType inject_type`
+  (kF32/kBF16) and read BF16 through the exact `Bf16ToF32` expansion
+  (`InjectElement`/`InjectLoad4`). `HcInjectPart` writes the deferred
+  combine's next-mixer partials for both encodings. `fused_inject` accepts
+  kBF16 in `HcMix` and `HcMixBatch`.
+- Wide route and gate-mix: `wide_mixer_` accepts a BF16 down projection; the
+  normalization output is staged as F16 (W8A8 uses the tiled-Q8 norm path).
+  `fused_projection` accepts BF16 down and up projections. The down
+  projection reads the F16 norm through `UnquantizedF16Gemm` with
+  `kStageBf16` on `DenseF16GEMMKernel`, using the 128-row × 128-token tile
+  at 1,024 or more tokens; BF16 rows are rounded to F16 when written to
+  shared memory, which is exact for every BF16 value in F16's range, and
+  the route keeps the same two-chain K order as the F16 path.
+  `HcMixF16Gemm` runs the up projection as `kHalfWeights + kStageBf16` on
+  the 128-row `kHcMix` tile (32 hidden channels per tile across the four
+  streams, with the same two K16 chains and 128-token width as the Q8_0
+  256-row specialization). The SiLU'd rank rows reach the gate buffer as
+  F16 through SiluScale + NarrowActivations. F32 down projections
+  re-normalize into the F32 scratch buffer on the wide route.
+- Two pinned caveats: the mixed row's tiled-Q8 copy is taken only when a
+  following Q8_0 dense projection consumes it and `hidden <= max_q8_cols`.
+  A GSQ upload without the Q8_0 MTP sidecar has `max_q8_cols == 0`, which
+  is how the probe runs; chat attaches the sidecar automatically. The
+  epilogue's mix and inject FMAs are pinned with `__fmaf_rn`, because the
+  build uses `-ffast-math` and reassociation would break the
+  byte-exactness contracts.
+- The wide combine writes the next mixer's F16 norm for every consumer and
+  its tiled Q8 copy only when that mixer's down projection is Q8_0; the GSQ
+  BF16 down projections read the F16 norm. The decode combine writes the
+  next mixer's Q8_1 rows only when that mixer's down projection is a
+  quantized dense format; a BF16 down projection takes the same combine
+  without the Q8_1 write. A wide BF16 down projection
+  reserves 32 halves of padding after each norm row, and the combine writes
+  the row at that pitch; the mix and inject epilogues read the same pitch.
+  The mix epilogue likewise writes the mixed row's tiled Q8 copy only when
+  a following dense projection is Q8_0 (an attention or SSM stack, the
+  router, or the shared expert). The fused MoE combine has a no-Q8 form,
+  selected when the next mixer's down projection reads only the F16 norm:
+  the tiled-Q8 quantizer and its branch are compiled out, while its
+  residual, normalization, deferred-update and inject paths are unchanged.
+  The Q8_0 form keeps the tiled Q8 codes.
+- Wide BF16 mixer norms use a 10240-half row. On the wide BF16 down route
+  the row occupies 10272 halves, with the last 32 halves unwritten padding.
+  For a next mixer that needs a norm, the scalar decode combine writes an
+  F32 norm. A quantized dense down projection also receives its Q8_1 copy;
+  the BF16 down projection reads the F32 norm without a Q8_1 write.
+- In layers whose consumers all read the producer-written F16 rows, the
+  wide mixer omits its F32 mixed row. The K-quant/IQ attention and SSM
+  projections decode into F16 tiles, the router, alpha/beta and the indexer
+  are 16-bit, so those layers read the F16 rows. The FFN mixer likewise
+  omits the F32 row when the router is 16-bit and the shared-expert gate/up
+  projections take the F16 route (K-quant/IQ or Q8_0). The F16 rows are
+  written in every eligible layer and `half_src_` records their source; a
+  Q8_0 consumer's tiled Q8 copy is written when it exists.
+- The BF16 hyper-connection weights are within |w| ≤ 8.56, so F16 staging
+  cannot overflow. 823 of 640 million values are below 6.1e-8 and flush to
+  zero in F16 staging, contributing less than 5e-5; this is accepted.
+
+### MTP catch-up (Q8_0 catch-up branch)
+
+The shared-Q8_0 MTP sidecar makes every mix use `Moe`'s Q8_0 catch-up
+branch. Its pinned behaviors:
+
+- The branch sets both routed id maps to -1 first; otherwise stale
+  prompt-batch histograms scatter garbage rows into live output slots.
+- The one-token down-projection GEMM writes into the caller's F16-stride
+  view. `RowScratch` advances by whole floats (the adapter's F32 layout),
+  which is twice the F16 row stride, and it cannot know the route.
+- `moe_pending_` and the deferred-epilogue flags are restored when
+  `UseScratch` is restored.
+
+### Multi-session batched decode (more than 8 rows)
+
+Non-Q8_0 dense projections are split into chunks of 8 rows on the serial
+MMVQ path (`MMVQ_MAX_BATCH_SIZE = kDecodeRows = 8`), so each weight matrix
+is swept ceil(rows/8) times. Verification must match single-session decode
+row by row, and the wide MMQ path only approximates that result
+(|MMVQ − MMQ| < 2e-2 · scale, pinned). Single-user AR and MTP stay at 8
+rows or fewer. If batch throughput is ever pursued, the workable design is
+a single serial-path launch for all rows (`qfn_mmq_dense_vec` tiles
+arbitrary token counts through `grid.z`; per-row equality across token
+counts is pinned), not a fixed-width MMQ path.
+
+## Exactness and determinism contracts
+
+These are the contracts that keep results reproducible. *Pinned* means
+enforced by a test or by an arithmetic form that must not change.
+Breaking any of them silently breaks session or audit replay.
+
+- Operator tests compare each type and role (dense, routed, paired, gated,
+  head, embedding) exactly against F64 references computed by CPU
+  dequantization. The 23 `qwen38_flash_next.*` ctest suites are 14 HIP
+  operator suites (`mtp_ops`, `blaslt_ops`, `hc_mix_ops`, `hc_route_ops`,
+  `gdn_ops`, `attention_ops`, `moe_epilogue_ops`, `moe_ids_ops`, `ple_ops`,
+  `projection_ops`, `routed_wmma_ops`, `select_ops`, `snapshot_copy`,
+  `verification_sampling`) plus the CPU suites (`config`,
+  `continuation_layout`, `draft_vocab`, `ngram`, `mtp_sampling`,
+  `prompt_lookup`, `rope_scaling`, `rope_scaling_oracle`, `weights`).
+- FMA and accumulation: every shared MMQ vector-dot accumulation is pinned
+  with `__fadd_rn`/`__fmaf_rn` (`mmq.hpp` typed cases and `vecdotq.hpp`).
+  Tests pin chunk-width exactness and the dense MMQ tile width. The reason
+  is that `-ffast-math` reassociation (one to eight units in the last place)
+  breaks downstream byte-exactness assumptions (HC epilogues, batch
+  invariance).
+- Invariance checks: routed batch-width exactness (a 224-row batch vs a 96-row
+  final chunk), MMQ tile-width invariance (`CheckMoeWidthExact`),
+  dense-vector rows bit-identical across 1-8 tokens (`CheckDenseVecTokens`),
+  stacked results bit-exact against separate projections per row for every
+  consuming path (`CheckDenseStackExact`), paired gate/up bit-exact against
+  separate projections per type, and decode 16-bit GEMVs bit-exact against
+  the CPU-expanded reference (`CheckDecodeGemv`).
+- Prefill route independence: a row's bytes do not depend on the pass that
+  computes it. `hc_route_ops` pins a wide reference pass against 1-, 7-,
+  9- and 95-row passes (and a second 96-row wide pass) at the head, middle
+  and tail for the HC combines and mixers, the SSM convolution, the W8A8
+  GEMMs and the routed experts. `projection_ops` pins W8A8 rows at the head,
+  middle and tail of 1,549- and 1,619-row passes; `gdn_ops` pins a 99-row
+  prefill split into a prefix and a 1-40-row tail; `blaslt_ops` pins the
+  F16/BF16 k = 2560 short tails; `routed_wmma_ops` pins wide-pass routed
+  rows against 7-, 1- and 33-token passes.
+- Small projections: `CheckSmallProjection` pins F16/BF16/F32 scalar calls
+  against independent FP64 references on the production [513,2560],
+  [96,2560], [128,2560] and [512,2560] shapes plus ragged [7,131]. Widths
+  1-8 and grouped widths 9, 16, 31, 32, 33 and 64 replay the scalar result
+  bit-for-bit, and poison guards bound every write.
+- Quantized fused SSM convolution: `CheckSsmProjectionQuant` pins the fused
+  `DenseQuantF16SsmGemm` pass bit-exact against the separate
+  `DenseQuantF16Gemm` projection for each stacked K-quant/IQ format (same
+  decode, same K order per output), through its GatedDeltaNet consumer, at
+  a full and a partial final token tile. A replay with the Z tiles on a
+  second stream produces the same bytes. The standalone QKV case uses an
+  independently typed gate and covers 9-, 33-, 470-, 1,024-, 1,025- and
+  2,049-token batches, a nonzero rolling history and mid-tile checkpoint
+  prefixes; projection, convolution, recurrent state, history and
+  checkpoint bytes match the separate chain. Fixtures verify rejection of
+  unsupported shapes.
+- F16 producer handoffs: `gdn_ops` pins the GDN epilogue's direct F16 rows
+  against the F32 epilogue rounded to F16 (`__float2half_rn`), including
+  padded output strides and guard bytes, without changing the recurrent
+  state. `projection_ops` pins `SwigluHalf` against `Swiglu` followed by the
+  activation narrow, including unsaturated products and F16 ties, so the
+  shared expert's handoff keeps the exact bytes the F32 path produced.
+  `attention_ops` pins the wide WMMA causal-attention kernel's padded F16
+  rows against the F32 gated result narrowed by `NarrowActivations`,
+  including row padding and output guards, and keeps the rows bit-identical
+  across a full and a chunk-split prefill. The half form is rejected with
+  `last_only` and for a pitch below the live width or not a multiple of 8.
+  The padded producer and `DenseQuantF16Gemm` consumer run for wide Q4_K,
+  Q5_K and Q6_K attention-output projections; their complete chain is
+  byte-identical to the F32 producer, narrow and packed projection for the
+  real matrices in dense and sparse attention.
+- Fused attention projection: `projection_ops` pins the fused Q/gate rows
+  and K/V cache bytes against `DenseQuantF16Gemm` followed by
+  `PrepareAttention` for the Q8_0 stack and every stacked K-quant/IQ format
+  in both YaRN modes, at partial and full prefill chunk widths and through
+  graph replay, including cache guards.
+- Mixed attention projection: `projection_ops` pins the fused mixed chain
+  against three separate `DenseQuantF16Gemm` projections followed by
+  `UnpackQGate`, both row norms, both RoPE passes and both KV stores for
+  independently typed Q/K/V roles covering IQ4_XS, Q4_K, Q5_K and Q6_K, at
+  9, 33, 1,024, 1,025 and 2,049 tokens, both YaRN modes, nonzero cache
+  positions, poisoned guards and graph replay. Sampled projected rows are
+  bounded by an independent double-precision dot product of the dequantized
+  weights and narrowed activations.
+- Padded norm handoff: `hc_mix_ops` pins the wide BF16 HC chain (combine,
+  [320,10240] down projection, SiLU/narrow, fused up/mix epilogue and the
+  optional F16, Q8 and inject outputs) byte-identical between packed and
+  32-half-padded norm rows at 1,024, 1,025 and 2,049 tokens, including
+  untouched padding, chunk-split views and deferred stream weights; the
+  padded down route is rejected below 1,024 tokens. `moe_epilogue_ops` pins
+  the F16- and F32-expert MoE combines' padded norms against their packed
+  form at 1,024 and 2,049 tokens.
+- Shared decode Q8_1 rows: `projection_ops` pins the prequantized dense
+  entry byte-identical to the F32 entry for every adapter format at widths
+  1-8, with output guards and the padded row stride. The attention output
+  gate and the GDN epilogue write those rows for every quantized output
+  format; `projection_ops` and `gdn_ops` pin the fused producers' rows
+  against the separate sigmoid multiply or epilogue output followed by
+  quantization, including round-half ties, zero rows and a nonfinite weight
+  scale. `routed_wmma_ops` pins the prequantized gated vector path
+  byte-identical to the F32 gated path for every routed format, including
+  duplicate experts, inactive slots and nonfinite scales.
+- Decode HC norm demand: `hc_mix_ops` pins the plain and Q8-producing
+  combines byte-identical on the residual and F32 norm at widths 1-8, with
+  one and multiple inject parts. The Q8 rows equal
+  `qfn_mmq_quantize_q8_1` over the stored norm and no byte past the width's
+  rows is written; a following BF16 down projection produces identical
+  bytes from either norm. A null gamma rejects the Q8 entry without
+  launching and leaves the residual, norm and Q8 outputs untouched.
+- Fused shared-expert pair: `routed_wmma_ops` pins the single-expert gated
+  vector launch byte-identical to the dense prequantized gate/up pair plus
+  SwiGLU for every gated format at widths 1-8, with one nonfinite scale in
+  each projection and poisoned output guards.
+- Padded quantized projection: `projection_ops` pins the padded and packed
+  [2560,6144] projections byte-identical at 1,023, 1,024, 1,025 and 2,049
+  tokens, leaves the activation padding and output guards untouched, and
+  rejects pitches outside the wide shape. The 1,023-token call stays on the
+  contiguous route.
+- The `UnquantizedF16Gemm` route keeps one K order per output:
+  `CheckBf16Gemm` pins the BF16 route bit-exact against the F16-staged route
+  across a prefill chunk split and at widths 1-8 on the [10240,320] up
+  shape, with poisoned output guards and BF16 values across F16's subnormal
+  range and round-to-nearest ties; its 2,049-token call takes the 128-row
+  BF16 tile. `blaslt_ops_test` pins the F16 route
+  across chunk boundaries.
+- HC BF16 byte-exactness: `CheckBf16Down`, `CheckFusedProjectionBf16`,
+  `CheckBf16Inject` and `CheckCombineBf16Inject` compare against
+  CPU-expanded F16/F32 references; the double-precision CPU mix reference
+  stays within 5e-5/1e-4. The deferred combine's fused BF16 inject partials
+  are byte-exact against the separate BF16 epilogue over the same F16 norm,
+  and the fused residual and norm bytes are unchanged.
+- Optional HC side outputs: the norm's tiled Q8 copy, the mixed row's tiled
+  Q8 copy and the F32 mixed row are written only for consumers that read
+  them. A requested output keeps its exact bytes; an omitted output is left
+  untouched while the residual, F16 norm, F16 mixed rows and inject partials
+  stay bit-identical. The fused projection's F16-only form (`mixed` null) is
+  byte-exact against the separate epilogue over the same F16 rows. The fused
+  MoE combine covers the gamma-null case and the deferred and separate paths
+  at one-row, 96-row and 2,049-row batches.
+- MoE: the fused epilogue residual is byte-exact against
+  `MoeEpilogueVec4 + HcCombine`. The combine's square-sum and gamma-scale
+  multiplies use the same pinned `__fmaf_rn`/`__fmul_rn` form in the
+  deferred (`kPrior`) and separate paths; a split form diverges at Q8
+  rounding boundaries in this compilation context. The
+  routed SwiGLU-in-down-quantize codes are bit-identical to `SwigluKernel`
+  followed by the plain entry for all thirteen routed formats
+  (`CheckSiluDownMmq`). The grouped gated vector's IQ2/IQ3 fragment reuse
+  keeps each format's integer scale formula, `dp4a` order and float scale
+  product. The float scale product uses the same multiplication order as the
+  scalar routed path, enforced by an inline-assembly barrier (`IqMoeScale`),
+  so the output is byte-exact against the separate projections plus SwiGLU
+  at every width, including duplicate and invalid slots and nonfinite scales
+  (`routed_wmma_ops`). The four-row Q2_0 down waves produce byte-identical
+  rows to the two-row waves at widths 2-640, including ragged rows, repeated
+  and invalid ids and poisoned output guards (`routed_wmma_ops`). The fused
+  MoE combine's inject logits and inject partials may share one buffer, as
+  the executor passes `s_.inject` for both; its residual, F16 norm, inject
+  partials and tiled Q8 bytes equal the separate-buffer result, for the
+  Q8-producing and no-Q8 forms. The no-Q8 form writes no tiled Q8 bytes.
+- Type-id checks: every `WeightType` value is pinned against both
+  `core::GgmlType` and the adapter's `ggml_type` in enum order (the raw-cast
+  check in `routed_wmma_ops_test`); GGUF type ids are pinned in
+  `ggml_dequant_test`. A moved id fails to compile instead of silently
+  misrouting.
+- Whole-block rules: MMQ entry points require whole weight blocks
+  (`K % block_elements == 0`); Q2_0's 64-weight block with K ≡ 32 mod 64
+  must fail, not truncate. Q2_0 tail cases at k=64 and k=320, and dense
+  tight-K cases, carry zeroed weight tails. Tests verify that Q5_1 and Q4_0
+  are rejected at the executor probe and at both dense entry points.
+- MTP audit: `--mtp-audit` pins the reference check's down-projection inputs
+  to the GPU's SwiGLU outputs (`stage_inputs`), with loose stage comparisons
+  (2e-3) and a tight `ffn-experts` comparison (5e-5). Without this,
+  ulp-level GPU-vs-F64 noise flips one Q8_1 code and amplifies to 5e-4
+  divergence. This is a property of the probe only; production runs on the
+  GPU alone and is deterministic.
+- Draft-vocabulary checks compare the small-head greedy continuation and
+  final logits byte-exactly with full-head AR. The MTP audit compares real
+  table-row scores and remapped rare-token IDs with an independent full-head
+  projection, including empty-slot masking, table replacement, scalar heads,
+  all-small-head batches and mixed full/small-head batches. Its one-row
+  prefix guarantees rare-token candidate coverage independently of generated
+  language or neural-draft acceptance rate.
+- Determinism: greedy traces are deterministic per binary. The depth-32768
+  128-token benchmark completion is bit-identical (sha `d856f78e…`) across
+  all three models, AR and MTP. Depth-0 traces diverge per model and binary
+  in the known borderline-argmax case (not a correctness or speed issue).
+  MTP cycle counts are deterministic per binary.
+- Quality checks: `gpu_probe --reference` argmax matches the F32 reference on
+  both mixes; KL divergence is 4e-4 to 2e-2 per mix, with a few
+  deterministic borderline argmax flips in the known case.
+
+## Verification
+
+From a clone with the GSQ-RCO GGUFs (and, for control comparisons, the
+unsloth UD-Q4_K_XL GGUFs):
+
+```sh
+# Tests (RelWithDebInfo + assertions)
+cmake --preset gpu-test && cmake --build --preset gpu-test
+ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 23 suites
+ctest --preset gpu-full -R 'ggml_dequant_test|ggml_gemm_parity_test|qwen_gemm_route_test'
+
+# Measurement binary
+cmake --preset release && cmake --build --preset release   # -> build/release/gufo
+```
+
+- Session replay: `qwen38_flash_next_session_test` runs with a model path:
+  `session_test --model FIRST.gguf --mtp-model MTP.gguf` on xxs/s/q4. It
+  covers prefill chunking, image prefill, graph capture/replay, batched
+  sessions and serving modes; focused flags exist for each area.
+- MTP audit: `gpu_probe --model FIRST_SHARD.gguf --prompt TEXT --mtp-model
+  MTP.gguf --mtp-audit` on xxs/s/q4.
+- Reference probe: `gpu_probe --model … --prompt … --reference`.
+- Functional API baselines: `tests/functional/run.py --record-baseline`
+  then compare; suites `discovery responses conversation batch
+  sampling-defaults state-edges`, modes `off` and `mtp` (`off` = zero
+  drafts, `mtp` = real draft execution).
+
+## Performance state
+
+Measured with the release binary on an AMD Strix Halo (`gfx1151`).
+
+Benchmark setup: `gufo bench`, greedy, `-p 2048 -n 128 -d 0,32768 -r 1 -v`,
+single user. Depth (`d`) is the number of context tokens before generation;
+`tg128` is 128 generated tokens and `pp2048` is a 2048-token prompt.
+The shared Q8_0 MTP sidecar is attached in MTP mode for the MTP measurements
+and detached (`--speculative off`) for the AR measurements. One binary runs
+all three models. Each cell uses the better of the two same-round matched
+deltas (the mix against that round's control). Depth-0 cells follow run noise
+and, for MTP, the draft acceptance rate; the depth-32768 cells compare the
+stable long-context path. Negative values mean the GSQ mix is slower than
+the control.
+
+Δ vs UD-Q4_K_XL control:
+
+| Measurement | xxs | s |
+| --- | ---: | ---: |
+| AR tg128 at d0 | +2.9% | -2.9% |
+| AR tg128 at d32768 | +2.4% | -2.6% |
+| MTP tg128 at d0 (acceptance-rate dependent) | +1.5% | -20.6% |
+| MTP tg128 at d32768 | -0.4% | -5.4% |
+| pp2048 at d32768, AR (speculation off) | -5.2% | -5.1% |
+| pp2048 at d32768, MTP | -5.1% | -6.4% |
+| pp2048 at d0, AR (speculation off) | -6.8% | -5.3% |
+| pp2048 at d0, MTP | -9.3% | -13.8% |
+
+### Decode
+
+- Decode results: AR token generation is within about 3% of the control;
+  xxs is slightly above it at depth 32768. Depth-32768 measurements are
+  +2.4% (xxs) and -2.6% (s). Depth-0 AR cells are advisory: the two rounds
+  read 25.58/28.25 t/s (xxs) and 26.77/23.07 t/s (s) against a control at
+  27.58/27.46 t/s. MTP depth-0 measurements follow the draft acceptance
+  rate rather than kernel speed (the control reads 51.57/51.66 t/s over 41
+  cycles with 86 of 128 drafts accepted; the xxs runs take 46 cycles with
+  81 of 104 accepted at 52.34/52.03 t/s; the s runs take 60 cycles with 67
+  of 104 accepted at 40.94/40.88 t/s). The chain length follows the draft
+  head's confidence; the policy's cost table only prices the AR backoff.
+  Measured small-head costs do not change the conclusion that the depth-0
+  gap follows acceptance rather than cost-model fit.
+  At depth 32768, upstream's prompt-lookup draft copies bypass the neural
+  draft head for greedy runs and chains end at the first unconfident draft
+  (the two mixes and the control take the same 16 cycles and accept 112
+  draft tokens), so this measurement reflects the multi-row verification
+  forward pass. The -0.4% (xxs) and -5.4% (s) gaps measure the complete
+  verification forward, including the BF16 mixers and quantized
+  dense/routed projections. Shared-expert weight fragments are reused
+  across the group's tokens.
+- Decode limits: standalone saturation measurements per format, using the
+  true GGUF block layouts and a CPU dot-product check for each measurement,
+  give a practical DRAM read peak of 216.2 GB/s. The Q6_K head MMVQ reaches
+  98-100% of it, leaving little bandwidth headroom in that measured shape
+  (the control's Q8_0 head moves more bytes per token at the same peak).
+  The low-bit expert MMVQs reach 85-95%
+  of the maximum measured bandwidth of that format (512 experts in
+  use, paired gate/up: Q2_0 214, IQ4_NL 211, Q4_K 211, Q5_K 211, Q6_K 213,
+  IQ4_XS 208, IQ3_S 153, IQ3_XXS 138, IQ2_S 118, IQ2_XS 110, IQ2_XXS
+  102 GB/s; down: IQ4_NL 212, Q2_0 185). Q2_0 and IQ4_NL reach the DRAM
+  peak. The IQ2/IQ3 family stays below it because its vector dot products
+  decode through a per-lane grid lookup table. Those rates characterize the
+  measured decoders, not a lower bound on every exact implementation or on
+  multi-row verification. Another costly decode shape is the BF16 `hc`-down
+  16-bit GEMV (629 MB at 84 GB/s, against the control's Q8_0 320 MB at
+  182 GB/s). Its two-rows-per-wave form reaches 116 GB/s with a cold cache;
+  the faster double-tile variant is not worth the extra code.
+
+### Prefill
+
+- Prefill throughput at depth 32768 is about 5.1-6.4% below the control.
+  The residual is the quantization format. The BF16 hyper-connection down
+  projection runs an exact F16 WMMA path against the control's Q8_0 int8
+  path; the routed gate/up pair runs exact low-bit grid decode; mixed-type
+  SSM and attention layers decode each projection in its own format; and
+  the PLE is BF16. The mixes win on routed down, SSM QKV+conv, output
+  projections and hyper-connection up/combine. Exact structural alternatives
+  measure flat or negative, and the approximate int8 route loses; the
+  residual is the accepted format floor.
+  Kernel-family differences are not additive role penalties: the control's
+  HC down belongs to its int8 family, and fused SSM projections include
+  convolution work.
+  The BF16 hyper-connection down projection uses 128-row × 128-token tiles
+  at 1,024 or more tokens and 64-row × 128-token tiles below that, with
+  F16-staged weights, a 32-half activation pad and two K16 accumulator
+  chains. The wide tile is dispatched only at 1,024 or more tokens; smaller
+  widths keep the 64-row plan and packed activation rows. The BF16 up
+  projection uses the spill-free 128-row fused mixer tile for wide inputs
+  and the 256-row × 16-token unquantized tile at 1-8 tokens. The BF16
+  small-K projections (PLE, indexer and the non-fused mixer up) use the
+  128-row tile at 512 or more tokens. Quantized dense
+  projections decode into F16 tiles, while the GDN producer supplies
+  contiguous F16 activation rows at widths below 1,024 and rows with the
+  padded pitch at 1,024 or more tokens. The wide WMMA attention kernel
+  supplies the Q4_K, Q5_K and Q6_K attention-output projections the same
+  way. The same padded norm rows feed the hyper-connection down and up
+  epilogues. Depth-0 throughput differences are advisory; their spread
+  follows run noise and the control's own depth-0 rate and does not
+  indicate a different dispatch path.
+
+### Rejected options
+
+- Options that measure slower (not built, and why): the HC up conversion is
+  not limited by conversion throughput (`v_cvt` is 2.8% of the kernel body;
+  an F16-weights variant of the same shape runs 3.2x faster on 1.9x the
+  bytes, so the remaining cost is the staging structure at k=320 plus the
+  format's bytes). There is no bit-field conversion path. The dense
+  compact-Q8 int8 WMMA route (per-lane decoders, 256-row stack geometry)
+  loses its first A/B comparison: IQ4_XS stacks run at 26.0 TF against the
+  F16 route's 30.0, Q6_K at 20.1 against 28.3, and Q4_K at 21.4 against 28.3
+  (a BM=128 variant measured 856 against 1108 tokens/s). The
+  per-accumulator-element fixups cost more than the 2x int8 WMMA rate gains.
+  The routed compact-Q8 path depends on this route and is not built. The
+  BF16 hyper-connection down projection [320, 10240] keeps the 64×128 tile
+  with 64-element K stages below 1,024 tokens and the 128-row tile at 1,024
+  or more tokens. A 32-token/256-element-stage variant measures
+  about 180 ms and a 128-token/128-element-stage variant about 160 ms,
+  against 158 ms in the warmed pp2048 forward pass. The smaller token tile
+  multiplies BF16-to-F16 weight staging per token, and at 128 tokens the
+  halved barrier count does not offset the larger stage. The register-held
+  weight path for SSM projections is Q8_0-only. The register variant
+  measures 53.9-54.3 ms (xxs) and 70.2 ms (s) on the warmed pp2048 forward
+  pass, against 48.7-49.2 and 66.2 ms with LDS staging. The half-wave
+  exchange costs sixteen lane permutes per K32 block, where the staged path
+  costs twelve LDS instructions, and the low-bit decode itself requires the
+  LDS round trip.
+- A GEMM-local Q6_K decoder that keeps the six-bit codes unsigned and uses
+  a 1056 F16 magic removes 6.2% of the `[2560,6144]` kernel's VALU
+  instructions but leaves the complete projection and whole-model prefill
+  unchanged: the 28-call padded SSM output stays flat within run noise, the
+  11 contiguous attention output calls do not improve, and the dense family
+  is not the s-mix residual. The signed-byte decoder stays.
+- The 64-row narrow tile and the BK=2/WM=8/WN=1 plan are slower for the
+  K-quant/IQ dense route. At 2048 tokens the narrow tile reads 4.6-4.7 ms
+  against 3.8 ms for the 512-row K/V and indexer projections and is flat at
+  640 rows (24.5 against 24.7 ms). The BK=2 plan is flat at the 13312-row
+  attention stacks (18.3 against 18.1 ms) and 2-13.6% slower on the separate
+  6144-, 10240- and 12288-row projections, worst for IQ4_XS at 12288 rows
+  (16.9 against 14.9 ms). The 256×128 tile with one K block per stage and
+  four-by-two wave groups keeps every quantized dense shape.
+- Transient F16 staging for the BF16 hyper-connection down projection is
+  slower: converting each [320, 10240] matrix into one reusable F16 scratch
+  per call adds a 6.25 MiB read and write per mixer, and the full 96-mixer
+  chain at pp2048 measures 6.5% slower than the direct BF16 route (16 token
+  tiles amortize one conversion); at 2,049 tokens it measures 9.7% slower.
+  The direct route rounds BF16 rows to F16 as each tile is staged and keeps
+  the matrix read once per tile.
+- Q8_0 hyper-connection down re-quantization: converting the BF16
+  hyper-connection down matrices to Q8_0 would save about 28 ms of deep
+  prefill (1.8%) and 0.54 GiB, but it is incompatible with the pinned BF16
+  hyper-connection bytes and the exactness contract. The exact BF16 F16 path
+  stays.
+- Expert-ordered quantization and scatter for the routed IQ4_NL down
+  projection (39 of 48 s layers) measures a 2.5% shorter down stage (186.4
+  to 181.7 ms over the 32K verification) and no whole-request gain
+  (control-corrected -0.58% and -0.12% in alternating rounds). About 25% of
+  the width-8 slot rows repeat an expert, but those weight rows are already
+  cache-served: the unique-expert traffic alone runs near the measured
+  216 GB/s DRAM peak. The plain two-row token-order waves remain.
+- Dense multi-token fragment reuse: the compiler already hoists each weight
+  fragment's decode out of the token loop. The main loop is a constant
+  decode base plus a per-token dot cost (Q4_K 84 + 53 per token, IQ3_S
+  851 + 41 per token at the [640,2560] shape). An explicit fragment form
+  leaves Q4_K's kernel within one instruction; on IQ3_S the eight-row loop
+  has 22 fewer instructions at 83 VGPRs instead of 60. The plain token loop
+  stays.
+- Packed IQ2/IQ3 grid alphabets: 2-bit IQ2 codes and 4-bit IQ3 codes
+  expanded with multiply/mask spreads and `V_PERM_B32` gathers decode
+  exactly, but standalone decode stays at 0.05-0.07 ns/sub16 (the
+  byte-grid form reads 0.05) and the real IQ2_S/IQ3_XXS/IQ3_S routed
+  gate/up pair runs 0 to 12.5% slower at 32, 64 and 128 rows. The constant
+  cache already serves the byte-grid loads, so the added expansion costs
+  more than the narrower entries save. The byte-grid decoders stay, and the
+  routed low-bit gate/up stage is format-bound.
+- Mixed-type SSM and attention launch fusion: one block-uniform launch over
+  the 16384-row SSM stack or the 13312-row attention stack does not pay for
+  itself. With one type on both sides, so only the launch structure differs,
+  the SSM form gains 0.12-0.23 ms per layer for Q4_K/Q5_K/Q6_K and about
+  zero for IQ4_XS; the attention form gains 0.7-0.9 ms per layer for
+  Q4_K/Q5_K/Q6_K but loses 1.2-1.7 ms for IQ4_XS/IQ3_S. Weighted by the
+  mixed layers, the SSM gain is 3.5 ms (xxs) / 3.7 ms (s) and the attention
+  change is -5.8 ms (xxs) / -1.5 ms (s). The separate launches stay.
+- F32 expansion and F16 pre-conversion of the BF16 small projections:
+  storing the BF16 small-K weights as F32 is exact, but the SGEMM route
+  measures 41.8 ms on [10240,2560] at 2,048 tokens against 5.2 ms for the
+  BF16 tile, and the other group shapes scale the same way. An F16 upload
+  copy is byte-identical only where the wide route already stages to F16;
+  the decode-width `SmallGemm` path widens BF16 exactly, so an F16 copy
+  changes subnormal-weight results. The wide copy measures under 2 ms of
+  whole-request gain. The 64x256 BF16 tile is slower than the 128x128 form
+  at 2,048 tokens (4.0-4.1 against 3.3-3.4 ms on [10240,2560]); the
+  256x128 tile spills 380 B of scratch with more than 200 spilled VGPRs.
+  The 128x128 BF16 tile stays for the small-K group at 512 or more tokens.
+
+### Control
+
+- Control health: UD-Q4_K_XL shows no regression relative to `main`.
+  MTP tg128 at depth 32768 reads 94.96/94.92 t/s against main's
+  95.06/94.99 t/s (within 0.2%), with the same 16 cycles / 112 accepted /
+  102 lookup trajectory and completion sha `d856f78e…`. AR reads
+  26.83/26.82 against 26.87/26.81 t/s (within 0.2%). AR prefill reads
+  1427.16/1430.27 against 1445.51/1442.45 t/s (within 1.3%); MTP prefill
+  reads 1378.43/1383.38 against 1389.30/1388.78 t/s (within 0.8%).
+
+## Vendored-code obligations
+
+`kernels/rocm/mmq/VENDOR.md` records everything that must be re-applied
+when the vendored code is updated:
+
+- Q2_0 additions to `ggml-common.h`, `mmq.hpp`, `vecdotq.hpp` and
+  `common.hpp`.
+- The `__fadd_rn`/`__fmaf_rn` pinning of every shared MMQ vector-dot
+  accumulation, for chunk-width exactness.
+- `mmq_args::mmq_x_request` with the host-side
+  `dense_tile_cols`/requested-width selection; the routed tile-width path
+  uses it.
+- `quantize_mmq_q8_1`'s `x_up`, which forms the routed SwiGLU during
+  down-projection quantization.
+
+Policy: keep edits to vendored `mmq.hpp`/`ggml-common.h` at or near zero;
+re-imports must re-apply the recorded blocks.
+
+## Known quirks and accepted limitations
+
+- `weights.cpp` `FormatOf` block geometry duplicates
+  `quant::QuantizedBlockElements`/`QuantizedRowBytes`; this is an intentional
+  duplicate and the values agree.
+- Q2_0 is a non-upstream type id (42); keep it isolated in the quant layer.
+- Multi-session batched decode sweeps non-Q8_0 dense projections again for
+  every 8 rows (by design; see above).
+- `GdnRowSplitKernel`'s 112 B of scratch belongs to upstream code, not this
+  feature.
+- `DenseBatch`/`GatedDenseBatch` executor-level coverage comes from session
+  replay, not direct operator tests: these are private `Executor` members
+  behind a full `DeviceModel`, and a synthetic test hook would add
+  scaffolding that the fork's minimal-diff policy rules out.
+- MTP depth-0 greedy traces are deterministic per binary but not stable
+  across binaries (the borderline-argmax case; accepted).
+- Prefill chunk splits are bit-exact against an unsplit pass at every
+  boundary.
+- The full test suites have a known seeded-sampling borderline case: the
+  session-replay cache, lookup-batch and `--mtp-audit` candidate checks can
+  flip between process runs. They pass on rerun; within a prompt build and
+  path the logits are bit-identical, so this is sampling-boundary noise, not
+  a numerics problem.
+
+## File map
+
+| Area | Files |
+| --- | --- |
+| Type layer | `src/core/gguf_reader.hpp`, `src/core/quant/ggml_dequant.{hpp,cpp}` |
+| Loader | `src/models/qwen38_flash_next/weights.cpp` (`FormatOf`, role allowlists), `kernels/rocm/device_model.cpp` (upload checks, `Stack`, `kTailMargin`) |
+| Adapter (gufo-owned) | `kernels/rocm/mmq/qfn_mmq.h`, `qfn_mmq.hip.cpp`, `mmvq.hip.cpp`, `quantize.hip.cpp` |
+| Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
+| Shared decoders | `src/models/qwen/hip/quant_ops.hpp` (`DecodeQuantSub16`, IQ2/IQ3 grid-group decode) |
+| Executor / dispatch | `src/models/qwen38_flash_next/kernels/rocm/executor.cpp`, `batch.cpp` |
+| Other kernels | `kernels.hip.cpp` (`DenseF16GEMMKernel`/`UnquantizedF16Gemm`, `HcDownF16SiluGemm`, `AttentionF16Gemm`/`AttentionMixedF16Gemm`, `DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmKernel`, `SmallGemmWideKernel`), `w8a8_wave64.hip` (`KQuantWmmaType`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/models/qwen/hip/kernels/` |
+| Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |
+| Core quant tests | `tests/core/ggml_dequant_test.cpp` |
+| Benchmark and profiling tools | `tools/bench/`, `tools/prof/prof.py`, `tools/prof/isa_mix.py` |
+
+## AI assistance
+
+The GSQ-RCO weights support was implemented primarily by AI coding agents.
