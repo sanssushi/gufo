@@ -5788,7 +5788,7 @@ __launch_bounds__(256) __global__
     for (int u = 0; u < (kQ5 ? 0 : kWaveRowTiles); ++u) {
       const int row = (tid >> 1) + (u * 128);
       std::uint32_t scale_bias = 0;
-      if constexpr (kQ8) {
+      if constexpr (kQ8 || kLowBit) {
         s_codes[swizzle(row, 2 * f_c)] = f_codes[u];
         s_codes[swizzle(row, (2 * f_c) + 1)] = f_codes_hi[u];
         scale_bias = f_live[u] ? f_dm[u] : 0U;  // half2 (d, 0) / (scale, -off)
@@ -6086,10 +6086,10 @@ __launch_bounds__(256) __global__
   }
 }
 
-// Wide routed down projection (Q5_1 / Q8_0 weights, F16 rows in
-// and out) over 128-token tiles: RoutedF16GEMMKernel's arithmetic, laid out
-// like the paired gate/up waves. Each wave owns sixteen rows and keeps their
-// codes in registers; activations are the only LDS stage.
+// Wide routed down projection (Q5_1 / Q8_0 / Q2_0 / IQ4_NL weights, F16 rows
+// in and out) over 128-token tiles: RoutedF16GEMMKernel's arithmetic, laid
+// out like the paired gate/up waves. Each wave owns sixteen rows and keeps
+// their codes in registers; activations are the only LDS stage.
 //
 // A gfx1151 WMMA reads the A operand of row r from one lane only: lane r for
 // even rows, lane r + 16 for odd ones (the other copy is ignored). So each
@@ -6101,8 +6101,11 @@ __launch_bounds__(256) __global__
 // Every output keeps RoutedF16GEMMKernel's values exactly: the same F16
 // weights (code + magic, then one packed FMA with the same scale and bias),
 // the same F16 activations, the same chain of two K16 WMMAs per K32 block in
-// K order from zero, and one round-to-nearest F16 store. Rows therefore do
-// not depend on the tile height or on the other rows in the pass.
+// K order from zero, and one round-to-nearest F16 store. The low-bit formats
+// decode each lane's own sub-block through the low-bit grid decoders and take
+// that sub-block's (scale, -offset) pair instead of a shared block scale, so
+// the partner's halves carry the partner's affine. Rows therefore do not
+// depend on the tile height or on the other rows in the pass.
 //
 // grid (ceil(m / 128), tiles): `tiles[y]` is expert | (128-token tile << 16).
 template<WeightType kType>
@@ -6119,6 +6122,10 @@ __launch_bounds__(256) __global__
   constexpr int BK = 2;  // K32 blocks per stage
   constexpr int kTokTiles = BN / 16;
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
+  // The GSQ-RCO down formats: one (scale, -offset) pair per 16-element
+  // sub-block, decoded from the family grid decoders in registers.
+  constexpr bool kLowBit =
+      kType == WeightType::kQ2_0 || kType == WeightType::kIQ4_NL;
   constexpr int kBlockBytes = kQ5 ? 24 : 34;
   // Activation stage: [kb][16-element quarter][token][16 B], as in
   // RoutedF16GEMMKernel, one padding slot per quarter plane.
@@ -6142,7 +6149,7 @@ __launch_bounds__(256) __global__
       std::min(kTokTiles, (bucket_rows - t_local + 15) / 16);
   const int num_kb = static_cast<int>(k / 32);
   const int m_i = static_cast<int>(m);
-  const std::size_t row_bytes = (k / 32) * kBlockBytes;
+  const std::size_t row_bytes = RoutedF16RowBytes<kType>(k);
 
   const int tid = static_cast<int>(threadIdx.x);
   const int wave_id = tid >> 5;
@@ -6194,13 +6201,30 @@ __launch_bounds__(256) __global__
   const auto fetch_stage = [&]<int S>(int kb0) {
 #pragma unroll
     for (int b = 0; b < BK; ++b) {
-      const std::uint8_t* blk = w_row + ((kb0 + b) * kBlockBytes);
-      if constexpr (kQ5) {
+      if constexpr (kLowBit) {
+        // This lane's own 16-element sub-block of the K32 block, with its
+        // half-rounded (scale, -offset) pair.
+        gufo::hip::QuantSub16 sub;
+        const int kb = kb0 + b;
+        if (kb < num_kb) {
+          gufo::hip::DecodeQuantSub16(static_cast<core::GgmlType>(kType), w_row,
+                                      (2 * kb) + f_c, sub);
+        } else {
+          sub = {};
+        }
+        w_codes[S][b] = make_uint4(sub.w[0], sub.w[1], sub.w[2], sub.w[3]);
+        w_head[S][b] = row_live ? __builtin_bit_cast(
+                                      std::uint32_t,
+                                      __floats2half2_rn(sub.scale, -sub.offset))
+                                : 0U;
+      } else if constexpr (kQ5) {
+        const std::uint8_t* blk = w_row + ((kb0 + b) * kBlockBytes);
         const uint2 head = *reinterpret_cast<const uint2*>(blk);
         w_head[S][b] = head.x;
         w_high[S][b] = head.y;
         w_codes[S][b] = *reinterpret_cast<const uint4*>(blk + 8);
       } else {
+        const std::uint8_t* blk = w_row + ((kb0 + b) * kBlockBytes);
         w_head[S][b] = *reinterpret_cast<const std::uint16_t*>(blk);
         __builtin_memcpy(&w_codes[S][b], blk + 2 + (16 * f_c), 16);
       }
@@ -6223,7 +6247,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int kb = 0; kb < BK; ++kb) {
       // This lane's K16 half of the row's block, as RoutedF16GEMMKernel
-      // forms it: (scale, bias) = (d, 0) for Q8_0, (d, m) for Q5_1.
+      // forms it: (scale, bias) = (d, 0) for Q8_0, (d, m) for Q5_1, and the
+      // sub-block's (scale, -offset) for the low-bit formats.
       const std::uint32_t scale_bias =
           kQ5 ? w_head[S][kb] : (row_live ? w_head[S][kb] : 0U);
       const __half2 sb = __builtin_bit_cast(__half2, scale_bias);
@@ -6352,10 +6377,18 @@ __launch_bounds__(256) __global__
 // chain of two K16 WMMAs per K32 block from zero in K order, and the same
 // SwiGLU rounding, so a row matches the separate gate and up projections at
 // every tile height.
+//
+// The GSQ-RCO low-bit formats take the same structure with one change: a
+// stage's codes come from the family decoder for this lane's 16-element
+// sub-block of each K32 block, and that sub-block carries its own
+// (scale, -offset) pair. The partner lane's fragments therefore carry the
+// partner's affine, and the swap after the conversion keeps both parities
+// exact.
 // Fork-owned fallback for the GSQ low-bit routed gate/up pairs. Upstream's
-// register-resident RoutedPairF16Kernel covers Q4_K and Q5_K only; the GSQ
-// mixes' IQ2/IQ3/Q2_0/IQ4 formats keep the LDS-staged pair kernel below.
-// Retire it when the low-bit decode lands in RoutedPairF16Kernel.
+// register-resident RoutedPairF16Kernel covers Q4_K and Q5_K, and the
+// low-bit formats whose K is a whole number of 256-element groups; the
+// remaining GSQ pairs keep the LDS-staged kernel below. Retire it when
+// every low-bit pair route lands in RoutedPairF16Kernel.
 template<WeightType kType, int BM, int BN, int BK, bool kPair = false>
 __launch_bounds__(256) __global__
     void RoutedLegacyF16GEMMKernel(const void* __restrict__ w,
@@ -7020,6 +7053,13 @@ __launch_bounds__(256) __global__
   constexpr int kTokTiles = BN / 16;
   constexpr int kRows = 64;  // output rows (gate/up pairs) per block
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
+  // The GSQ-RCO mixes: one (scale, -offset) pair per 16-element sub-block,
+  // decoded through the family grid decoders instead of nibble extraction.
+  constexpr bool kLowBit =
+      kType == WeightType::kQ2_0 || kType == WeightType::kIQ2_XXS ||
+      kType == WeightType::kIQ2_XS || kType == WeightType::kIQ2_S ||
+      kType == WeightType::kIQ3_XXS || kType == WeightType::kIQ3_S ||
+      kType == WeightType::kIQ4_NL || kType == WeightType::kIQ4_XS;
   constexpr std::size_t kBlockBytes = kQ5K ? kQ5KBlockBytes : sizeof(Q4KBlock);
   constexpr int kActStride = BN + 1;
   constexpr int kActBytes = BK * 4 * kActStride * 16;
@@ -7039,7 +7079,7 @@ __launch_bounds__(256) __global__
       std::min(kTokTiles, (bucket_rows - t_local + 15) / 16);
   const int num_sb = static_cast<int>(k / 256);
   const int m_i = static_cast<int>(m);
-  const std::size_t row_bytes = (k / 256) * kBlockBytes;
+  const std::size_t row_bytes = RoutedF16RowBytes<kType>(k);
 
   const int tid = static_cast<int>(threadIdx.x);
   const int wave_id = tid >> 5;
@@ -7078,28 +7118,50 @@ __launch_bounds__(256) __global__
   uint4 raw_header;
   uint4 raw_codes[4];  ///< chunk f_c of groups 0-3
   uint4 raw_qh[2];     ///< Q5_K: the 32 high-bit bytes
+  // Low-bit formats decode this lane's own 16-element sub-block of the
+  // stage's two K32 blocks, with its (scale, -offset) pair.
+  uint4 raw_own[BK];
+  std::uint32_t raw_own_scale[BK];
   // The committed superblock: header, nibble-packed codes per group.
   uint4 header = make_uint4(0u, 0u, 0u, 0u);
   uint4 codes[4];
   uint4 qh[2];
+  uint4 own[BK];
+  std::uint32_t own_scale_pair[BK];
   uint4 a_data[kActFetch];
 #pragma unroll
   for (int i = 0; i < kActFetch; ++i)
     a_data[i] = make_uint4(0u, 0u, 0u, 0u);
 
   const auto fetch_stage = [&]<int G>(int sb) {
-    if constexpr (G == 0) {
-      const std::uint8_t* blk = w_row + (sb * kBlockBytes);
-      const auto* chunks = reinterpret_cast<const uint4*>(blk);
-      constexpr int kCodeChunk = kQ5K ? 3 : 1;
-      raw_header = chunks[0];
-      if constexpr (kQ5K) {
-        raw_qh[0] = chunks[1];
-        raw_qh[1] = chunks[2];
-      }
+    if constexpr (!kLowBit) {
+      if constexpr (G == 0) {
+        const std::uint8_t* blk = w_row + (sb * kBlockBytes);
+        const auto* chunks = reinterpret_cast<const uint4*>(blk);
+        constexpr int kCodeChunk = kQ5K ? 3 : 1;
+        raw_header = chunks[0];
+        if constexpr (kQ5K) {
+          raw_qh[0] = chunks[1];
+          raw_qh[1] = chunks[2];
+        }
 #pragma unroll
-      for (int g = 0; g < 4; ++g)
-        raw_codes[g] = chunks[kCodeChunk + (g * 2) + f_c];
+        for (int g = 0; g < 4; ++g)
+          raw_codes[g] = chunks[kCodeChunk + (g * 2) + f_c];
+      }
+    } else {
+      const auto ggml = static_cast<core::GgmlType>(kType);
+#pragma unroll
+      for (int kb = 0; kb < BK; ++kb) {
+        gufo::hip::QuantSub16 sub;
+        gufo::hip::DecodeQuantSub16(ggml, w_row,
+                                    2 * ((sb * 8) + (G * 2) + kb) + f_c, sub);
+        raw_own[kb] = make_uint4(sub.w[0], sub.w[1], sub.w[2], sub.w[3]);
+        raw_own_scale[kb] =
+            row_live
+                ? __builtin_bit_cast(std::uint32_t,
+                                     __floats2half2_rn(sub.scale, -sub.offset))
+                : 0U;
+      }
     }
     const int kb0 = (sb * 8) + (G * 2);
 #pragma unroll
@@ -7114,48 +7176,56 @@ __launch_bounds__(256) __global__
   std::uint32_t own_scale = 0;  ///< block 2G + f_c
   std::uint32_t own_high = 0;   ///< Q5_K: block 2G + f_c
   const auto commit_stage = [&]<int G>() {
-    if constexpr (G == 0) {
-      header = raw_header;
+    if constexpr (!kLowBit) {
+      if constexpr (G == 0) {
+        header = raw_header;
 #pragma unroll
-      for (int g = 0; g < 4; ++g)
-        codes[g] = raw_codes[g];
-      if constexpr (kQ5K) {
-        qh[0] = raw_qh[0];
-        qh[1] = raw_qh[1];
+        for (int g = 0; g < 4; ++g)
+          codes[g] = raw_codes[g];
+        if constexpr (kQ5K) {
+          qh[0] = raw_qh[0];
+          qh[1] = raw_qh[1];
+        }
       }
-    }
-    const int sb32 = (2 * G) + f_c;
-    // The first four scale/min bytes live in y/z; the others' low nibbles
-    // share w, their high two bits reuse those y/z bytes.
-    const unsigned shift = 8U * (static_cast<unsigned>(sb32) & 3U);
-    const std::uint32_t scale_byte = header.y >> shift;
-    const std::uint32_t min_byte = header.z >> shift;
-    std::uint32_t sc;
-    std::uint32_t mn;
-    if (sb32 < 4) {
-      sc = scale_byte & 0x3FU;
-      mn = min_byte & 0x3FU;
-    } else {
-      const std::uint32_t packed = header.w >> shift;
-      sc = (packed & 0x0FU) | ((scale_byte & 0xC0U) >> 2U);
-      mn = ((packed >> 4U) & 0x0FU) | ((min_byte & 0xC0U) >> 2U);
-    }
-    const __half2 dm = __builtin_bit_cast(__half2, header.x);
-    const float scale =
-        row_live ? __low2float(dm) * static_cast<float>(sc) : 0.0F;
-    const float offset =
-        row_live ? __high2float(dm) * static_cast<float>(mn) : 0.0F;
-    own_scale =
-        __builtin_bit_cast(std::uint32_t, __floats2half2_rn(scale, -offset));
-    if constexpr (kQ5K) {
-      // Bit sb32 of the 32 high-bit bytes, packed as the Q5_1 word.
-      const std::uint32_t q[8] = {qh[0].x, qh[0].y, qh[0].z, qh[0].w,
-                                  qh[1].x, qh[1].y, qh[1].z, qh[1].w};
-      std::uint32_t high = 0;
+      const int sb32 = (2 * G) + f_c;
+      // The first four scale/min bytes live in y/z; the others' low nibbles
+      // share w, their high two bits reuse those y/z bytes.
+      const unsigned shift = 8U * (static_cast<unsigned>(sb32) & 3U);
+      const std::uint32_t scale_byte = header.y >> shift;
+      const std::uint32_t min_byte = header.z >> shift;
+      std::uint32_t sc;
+      std::uint32_t mn;
+      if (sb32 < 4) {
+        sc = scale_byte & 0x3FU;
+        mn = min_byte & 0x3FU;
+      } else {
+        const std::uint32_t packed = header.w >> shift;
+        sc = (packed & 0x0FU) | ((scale_byte & 0xC0U) >> 2U);
+        mn = ((packed >> 4U) & 0x0FU) | ((min_byte & 0xC0U) >> 2U);
+      }
+      const __half2 dm = __builtin_bit_cast(__half2, header.x);
+      const float scale =
+          row_live ? __low2float(dm) * static_cast<float>(sc) : 0.0F;
+      const float offset =
+          row_live ? __high2float(dm) * static_cast<float>(mn) : 0.0F;
+      own_scale =
+          __builtin_bit_cast(std::uint32_t, __floats2half2_rn(scale, -offset));
+      if constexpr (kQ5K) {
+        // Bit sb32 of the 32 high-bit bytes, packed as the Q5_1 word.
+        const std::uint32_t q[8] = {qh[0].x, qh[0].y, qh[0].z, qh[0].w,
+                                    qh[1].x, qh[1].y, qh[1].z, qh[1].w};
+        std::uint32_t high = 0;
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        high |= GatherBit(q[i], sb32) << (4 * i);
-      own_high = high;
+        for (int i = 0; i < 8; ++i)
+          high |= GatherBit(q[i], sb32) << (4 * i);
+        own_high = high;
+      }
+    } else {
+#pragma unroll
+      for (int kb = 0; kb < BK; ++kb) {
+        own[kb] = raw_own[kb];
+        own_scale_pair[kb] = raw_own_scale[kb];
+      }
     }
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i)
@@ -7167,36 +7237,59 @@ __launch_bounds__(256) __global__
   for (int j = 0; j < kTokTiles; ++j)
     acc[j] = v8f{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
 
-  const __half2 magic = __floats2half2_rn(-1024.0F, -1024.0F);
+  const __half2 magic = __floats2half2_rn(kLowBit ? -1152.0F : -1024.0F,
+                                          kLowBit ? -1152.0F : -1024.0F);
   const auto compute_stage = [&]<int G>() {
-    const uint4 c = codes[G];
-    const std::uint32_t words[4] = {c.x, c.y, c.z, c.w};
-    const std::uint32_t peer_scale = SwapHalves(own_scale);
-    const std::uint32_t peer_high = kQ5K ? SwapHalves(own_high) : 0U;
+    std::uint32_t words[4] = {0U, 0U, 0U, 0U};
+    std::uint32_t peer_scale = 0;
+    std::uint32_t peer_high = 0;
+    if constexpr (!kLowBit) {
+      const uint4 c = codes[G];
+      words[0] = c.x;
+      words[1] = c.y;
+      words[2] = c.z;
+      words[3] = c.w;
+      peer_scale = SwapHalves(own_scale);
+      peer_high = kQ5K ? SwapHalves(own_high) : 0U;
+    }
 #pragma unroll
     for (int kb = 0; kb < BK; ++kb) {
-      const __half2 sb =
-          __builtin_bit_cast(__half2, f_c == kb ? own_scale : peer_scale);
-      const __half2 scale2 = __low2half2(sb);
-      const __half2 bias2 = __high2half2(sb);
-      const std::uint32_t high =
-          kQ5K ? ((f_c == kb ? own_high : peer_high) >> (16U * f_c)) : 0U;
       __half2 h[8];
+      if constexpr (kLowBit) {
+        // The staged sub-block is this lane's own parity of block kb with
+        // its own affine; the signed bytes take the Q8-style 1152 magic.
+        const __half2 sb = __builtin_bit_cast(__half2, own_scale_pair[kb]);
+        const std::uint32_t own_words[4] = {
+            own[kb].x ^ 0x80808080U, own[kb].y ^ 0x80808080U,
+            own[kb].z ^ 0x80808080U, own[kb].w ^ 0x80808080U};
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        std::uint32_t nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
-        if constexpr (kQ5K)
-          nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
-        CodesToHalves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+        for (int i = 0; i < 4; ++i) {
+          CodesToHalves(own_words[i], magic, __low2half2(sb), __high2half2(sb),
+                        h[2 * i], h[2 * i + 1]);
+        }
+      } else {
+        const __half2 sb =
+            __builtin_bit_cast(__half2, f_c == kb ? own_scale : peer_scale);
+        const __half2 scale2 = __low2half2(sb);
+        const __half2 bias2 = __high2half2(sb);
+        const std::uint32_t high =
+            kQ5K ? ((f_c == kb ? own_high : peer_high) >> (16U * f_c)) : 0U;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          std::uint32_t nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
+          if constexpr (kQ5K)
+            nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+          CodesToHalves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+        }
       }
       using v8u = __attribute__((__vector_size__(32))) std::uint32_t;
-      v8u own;
-      __builtin_memcpy(&own, &h[0], 32);
+      v8u own_h;
+      __builtin_memcpy(&own_h, &h[0], 32);
       v8u peer;
 #pragma unroll
       for (int i = 0; i < 8; ++i)
-        peer[i] = SwapHalves(own[i]);
-      const v16h a_lo = __builtin_bit_cast(v16h, own);
+        peer[i] = SwapHalves(own_h[i]);
+      const v16h a_lo = __builtin_bit_cast(v16h, own_h);
       const v16h a_hi = __builtin_bit_cast(v16h, peer);
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
@@ -8350,81 +8443,6 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                      static_cast<std::uint32_t>(slots), k);
 }
 
-/// True for the GSQ-RCO low-bit routed formats: the fork-owned
-/// RoutedLegacyF16GEMMKernel serves them on every tile height.
-static bool LowBitRoutedType(WeightType type) {
-  return type == WeightType::kQ2_0 || type == WeightType::kIQ2_XXS ||
-         type == WeightType::kIQ2_XS || type == WeightType::kIQ2_S ||
-         type == WeightType::kIQ3_XXS || type == WeightType::kIQ3_S ||
-         type == WeightType::kIQ4_NL || type == WeightType::kIQ4_XS;
-}
-
-template<int BN>
-bool LaunchLegacyRoutedF16(const void* w, WeightType type, const __half* x,
-                           const std::int32_t* tiles, std::uint32_t n_tiles,
-                           const std::int32_t* pad_bounds,
-                           const std::int32_t* rows_in,
-                           const std::int32_t* rows_out,
-                           const float* swiglu_gate, float* out,
-                           __half* out_half, std::size_t m, std::size_t k,
-                           hipStream_t stream) {
-  constexpr int kBM = 128;
-  constexpr int kBK = 2;
-  const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
-  switch (type) {
-    case WeightType::kQ2_0:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kQ2_0, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ2_XXS:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ2_XXS, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ2_XS:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ2_XS, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ2_S:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ2_S, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ3_XXS:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ3_XXS, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ3_S:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ3_S, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ4_NL:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ4_NL, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    case WeightType::kIQ4_XS:
-      hipLaunchKernelGGL(
-          (RoutedLegacyF16GEMMKernel<WeightType::kIQ4_XS, kBM, BN, kBK>), grid,
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
-    default:
-      return false;
-  }
-}
-
 template<int BN>
 bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                      const std::int32_t* tiles, std::uint32_t n_tiles,
@@ -8469,37 +8487,53 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
         return true;
       }
     case WeightType::kQ2_0:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ2_0, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k);
+      return true;
     case WeightType::kIQ2_XXS:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ2_XXS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ2_XS:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ2_XS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ2_S:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ2_S, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ3_XXS:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ3_XXS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ3_S:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ4_NL:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_NL, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     case WeightType::kIQ4_XS:
-      return LaunchLegacyRoutedF16<BN>(w, type, x, tiles, n_tiles, pad_bounds,
-                                       rows_in, rows_out, swiglu_gate, out,
-                                       out_half, m, k, stream);
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, BN, kBK>), grid,
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k);
+      return true;
     default:
       return false;
   }
@@ -8572,21 +8606,18 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       const auto kernel =
           type == WeightType::kQ5_1   ? RoutedDownF16Kernel<WeightType::kQ5_1>
           : type == WeightType::kQ8_0 ? RoutedDownF16Kernel<WeightType::kQ8_0>
-                                      : nullptr;
+          : type == WeightType::kQ2_0 ? RoutedDownF16Kernel<WeightType::kQ2_0>
+          : type == WeightType::kIQ4_NL
+              ? RoutedDownF16Kernel<WeightType::kIQ4_NL>
+              : nullptr;
       if (kernel != nullptr) {
         hipLaunchKernelGGL(kernel, grid, dim3(kThreads), 0, stream, w, x, tiles,
                            pad_bounds, rows_in, rows_out, out_half, m, k);
         return true;
       }
-      // GSQ low-bit down projections keep the 128-token map on the legacy
-      // per-format kernel (IQ4_NL, Q2_0, IQ2/IQ3/IQ4_XS).
+      // The remaining GSQ low-bit down projections keep the 128-token map on
+      // the legacy per-format kernel (IQ2/IQ3/IQ4_XS).
       switch (type) {
-        case WeightType::kQ2_0:
-          hipLaunchKernelGGL(
-              (RoutedLegacyF16GEMMKernel<WeightType::kQ2_0, 128, 128, 2>), grid,
-              dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-              rows_out, nullptr, nullptr, out_half, m, k, nullptr);
-          return true;
         case WeightType::kIQ2_XXS:
           hipLaunchKernelGGL(
               (RoutedLegacyF16GEMMKernel<WeightType::kIQ2_XXS, 128, 128, 2>),
@@ -8614,12 +8645,6 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
         case WeightType::kIQ3_S:
           hipLaunchKernelGGL(
               (RoutedLegacyF16GEMMKernel<WeightType::kIQ3_S, 128, 128, 2>),
-              grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-              rows_out, nullptr, nullptr, out_half, m, k, nullptr);
-          return true;
-        case WeightType::kIQ4_NL:
-          hipLaunchKernelGGL(
-              (RoutedLegacyF16GEMMKernel<WeightType::kIQ4_NL, 128, 128, 2>),
               grid, dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
               rows_out, nullptr, nullptr, out_half, m, k, nullptr);
           return true;
@@ -8660,7 +8685,57 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                        tiles, pad_bounds, rows_in, rows_out, out, m, k);
     return true;
   }
-  // GSQ low-bit pairs keep the fork-owned 128-token LDS-staged kernel.
+  // The low-bit pairs decode each lane's sub-block from registers instead of
+  // staging codes in LDS once K is a whole number of 256-element groups.
+  if (k % 256 == 0 && RoutedF16Type(static_cast<core::GgmlType>(type), k)) {
+    const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
+    switch (type) {
+      case WeightType::kQ2_0:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kQ2_0>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ2_XXS:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ2_XXS>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ2_XS:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ2_XS>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ2_S:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ2_S>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ3_XXS:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ3_XXS>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ3_S:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ3_S>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ4_NL:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ4_NL>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      case WeightType::kIQ4_XS:
+        hipLaunchKernelGGL((RoutedPairF16Kernel<WeightType::kIQ4_XS>), grid,
+                           dim3(kThreads), 0, stream, gate, up, x, tiles,
+                           pad_bounds, rows_in, rows_out, out, m, k);
+        return true;
+      default:
+        break;
+    }
+  }
+  // GSQ low-bit pairs whose K is not a whole 256-element group count keep the
+  // fork-owned 128-token LDS-staged kernel.
   return LaunchRoutedLegacyGatedF16<128>(gate, up, type, x, tiles, n_tiles,
                                          pad_bounds, rows_in, rows_out, out, m,
                                          k, stream);
@@ -8765,15 +8840,9 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream) {
-  if (type == WeightType::kQ4_K || type == WeightType::kQ5_K) {
-    return tile_rows == 128 &&
-           RoutedGatedF16Gemm(gate, up, type, x, tiles, n_tiles, pad_bounds,
-                              rows_in, rows_out, out, m, k, stream);
-  }
   if (tile_rows == 128) {
-    return LaunchRoutedLegacyGatedF16<128>(gate, up, type, x, tiles, n_tiles,
-                                           pad_bounds, rows_in, rows_out, out,
-                                           m, k, stream);
+    return RoutedGatedF16Gemm(gate, up, type, x, tiles, n_tiles, pad_bounds,
+                              rows_in, rows_out, out, m, k, stream);
   }
   return tile_rows == 64 && LaunchRoutedLegacyGatedF16<64>(
                                 gate, up, type, x, tiles, n_tiles, pad_bounds,
@@ -8843,18 +8912,39 @@ struct AttentionProjectionOutput {
   YarnRope yarn;
 };
 
-/// Dense F16 WMMA GEMM over Q8_0 or F16 weights: block = BM rows x BN tokens,
-/// BK 32-element K blocks per LDS stage, waves = WM row groups x WN token
-/// groups. The codes are dequantized to F16 once per stage as they are
-/// committed to LDS (magic-number F16 construction, exact for a Q8_0 code),
-/// and the activations are F16 rows [batch][k], so the matrix cores
-/// accumulate in F32 with no per-block scaling. SSM waves retain their
-/// decoded weight rows in registers instead of staging them in LDS. F16 weights
-/// skip decoding and use the same ordered K16 products. y is [batch][m].
+/// Eight BF16 weight lanes (one uint4 fragment) rounded to F16 lanes as
+/// they are staged to LDS. Every BF16 value inside F16's normal range is
+/// exact; below it the lanes round to F16 subnormals or zero.
+__device__ __forceinline__ uint4 Bf16ToHalf8(uint4 v) {
+  const auto lane = [](std::uint32_t packed) {
+    const auto half_bits = [&](std::uint16_t b) {
+      return static_cast<std::uint32_t>(__builtin_bit_cast(
+          std::uint16_t, __float2half_rn(__uint_as_float(
+                             static_cast<std::uint32_t>(b) << 16))));
+    };
+    return half_bits(static_cast<std::uint16_t>(packed)) |
+           (half_bits(static_cast<std::uint16_t>(packed >> 16)) << 16);
+  };
+  return uint4{lane(v.x), lane(v.y), lane(v.z), lane(v.w)};
+}
+
+/// Dense F16 WMMA GEMM over Q8_0, K-quant/IQ, F16 or BF16 weights: block =
+/// BM rows x BN tokens, BK 32-element K blocks per LDS stage, waves = WM row
+/// groups x WN token groups. The codes are dequantized to F16 once per stage
+/// as they are committed to LDS (magic-number F16 construction, exact for a
+/// Q8_0 code; the K-quant/IQ formats decode through DecodeQuantSub16 and
+/// carry one (scale, -offset) pair per 16-element sub-block), and the
+/// activations are F16 rows [batch][k], so the matrix cores accumulate in
+/// F32 with no per-block scaling. F16 weights skip decoding
+/// and use the same ordered K16 products; BF16 weight rows (the GSQ mixes)
+/// round to F16 as they are staged, exact for every in-range BF16 value.
+/// Q8_0 SSM waves retain their decoded weight rows in registers instead of
+/// staging them in LDS. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
          bool kHalfWeights = false, bool kBf16 = false, bool kStrided = false,
-         bool kYarn = false>
+         bool kYarn = false, bool kStageBf16 = false,
+         core::GgmlType kQType = core::GgmlType::kQ8_0>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -8866,12 +8956,20 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
+  static_assert(!(kStageBf16 && !kHalfWeights),
+                "BF16 source rows ride the raw F16 staging path");
   // 16-bit weight rows staged as they are: F16, or BF16 with BF16
   // activations.
   constexpr bool kRawWeights = kHalfWeights || kBf16;
-  constexpr bool kRegisterWeights = kSsmConv;
+  constexpr bool kRegisterWeights = kSsmConv && kQType == core::GgmlType::kQ8_0;
   static_assert(!kRegisterWeights ||
                 (BM == 256 && BK == 2 && WM == 8 && WN == 1));
+  // The GSQ-RCO K-quant/IQ formats: packed codes staged as int8 (the
+  // QuantSub16 codes) with one (scale, -offset) pair per 16-element
+  // sub-block, dequantized to F16 at the LDS commit like Q8_0's codes.
+  constexpr bool kLowBit = kQType != core::GgmlType::kQ8_0 && !kRawWeights;
+  static_assert(!(kQType != core::GgmlType::kQ8_0 && kRawWeights),
+                "quantized tiles take the staged-code path");
   constexpr int kRowTiles = BM / 16;
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = kRowTiles / WM;
@@ -8934,9 +9032,13 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     // Interleave the four gate streams within the tile, without repacking
     // weights. Each group of four rows produces one mixed hidden element.
     const int weight_row = kHcMix ? (r % 4) * (m_i / 4) + r / 4 : r;
-    a_ptr[p] = w_bytes +
-               static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
-                   static_cast<std::size_t>(num_kb) * (kRawWeights ? 64 : 34);
+    const std::size_t row_bytes =
+        kRawWeights ? static_cast<std::size_t>(num_kb) * 64
+        : kLowBit   ? gufo::hip::QuantRowBytes(kQType, k)
+                    : static_cast<std::size_t>(num_kb) * 34;
+    a_ptr[p] =
+        w_bytes + static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
+                      row_bytes;
   }
   const __half* b_ptr[kBPer];
 #pragma unroll
@@ -8951,6 +9053,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   uint4 a_codes[kAPer][2];
   uint4 a_half[kRawWeights ? kAPer : 1][4];
   std::uint32_t a_d[kAPer];
+  std::uint32_t a_d2[kLowBit ? kAPer : 1];
   uint4 b_data[kBPer][4];
 
   const auto fetch_stage = [&](int kb0) {
@@ -8964,6 +9067,26 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           a_half[p][c] = live ? src[c] : make_uint4(0u, 0u, 0u, 0u);
+      } else if constexpr (kLowBit) {
+        // The family decoder expands the packed codes of the two
+        // 16-element sub-blocks of this K block; the staged codes stay int8
+        // (the Q8_0 fragment path takes them back out) and each sub-block
+        // carries its own (scale, -offset) pair.
+        gufo::hip::QuantSub16 lo;
+        gufo::hip::QuantSub16 hi;
+        if (live) {
+          gufo::hip::DecodeQuantSub16(kQType, a_ptr[p], 2 * kb, lo);
+          gufo::hip::DecodeQuantSub16(kQType, a_ptr[p], (2 * kb) + 1, hi);
+        } else {
+          lo = {};
+          hi = {};
+        }
+        __builtin_memcpy(&a_codes[p][0], lo.w, 16);
+        __builtin_memcpy(&a_codes[p][1], hi.w, 16);
+        a_d[p] = __builtin_bit_cast(std::uint32_t,
+                                    __floats2half2_rn(lo.scale, -lo.offset));
+        a_d2[p] = __builtin_bit_cast(std::uint32_t,
+                                     __floats2half2_rn(hi.scale, -hi.offset));
       } else {
         const std::uint8_t* blk =
             a_ptr[p] +
@@ -9009,19 +9132,42 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       if constexpr (kRawWeights) {
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-          s_a[kk][row][swizzle(row, c)] = a_half[p][c];
+          s_a[kk][row][swizzle(row, c)] =
+              kStageBf16 ? Bf16ToHalf8(a_half[p][c]) : a_half[p][c];
       } else {
-        // Q8_0 codes are signed; flipping the sign bit carries q + 128, which
-        // the 1152 magic takes back out.
+        // The signed bytes flip their sign bit, carrying q + 128, which the
+        // 1152 magic takes back out. Q8_0 scales one 32-code block; the
+        // low-bit formats carry one (scale, -offset) pair per 16-element
+        // sub-block, so each half of the K block takes its own pair.
         const std::uint32_t words[8] = {
             a_codes[p][0].x, a_codes[p][0].y, a_codes[p][0].z, a_codes[p][0].w,
             a_codes[p][1].x, a_codes[p][1].y, a_codes[p][1].z, a_codes[p][1].w};
-        const __half2 scale2 = __half2half2(
-            __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
+        __half2 scale2;
+        __half2 bias2;
+        __half2 scale2_hi;
+        __half2 bias2_hi;
+        if constexpr (kLowBit) {
+          // One (scale, -offset) pair per 16-element sub-block: the first
+          // half of the K block and the second.
+          const __half2 sb0 = __builtin_bit_cast(__half2, a_d[p]);
+          const __half2 sb1 = __builtin_bit_cast(__half2, a_d2[p]);
+          scale2 = __low2half2(sb0);
+          bias2 = __high2half2(sb0);
+          scale2_hi = __low2half2(sb1);
+          bias2_hi = __high2half2(sb1);
+        } else {
+          scale2 = __half2half2(
+              __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
+          bias2 = zero2;
+          scale2_hi = scale2;
+          bias2_hi = bias2;
+        }
         __half2 h[16];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          CodesToHalves(words[i] ^ 0x80808080U, magic, scale2, zero2, h[2 * i],
+          CodesToHalves(words[i] ^ 0x80808080U, magic,
+                        kLowBit && i >= 4 ? scale2_hi : scale2,
+                        kLowBit && i >= 4 ? bias2_hi : bias2, h[2 * i],
                         h[2 * i + 1]);
         }
         if constexpr (kRegisterWeights) {
@@ -9523,23 +9669,26 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream) {
-  if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
+                        hipStream_t stream, WeightType wtype) {
+  if (m == 0 || batch == 0 || k == 0 || k % 32 != 0 ||
+      (wtype != WeightType::kF16 && wtype != WeightType::kBF16))
     return false;
-  // Wide batches reuse each staged fragment across twice the rows and
-  // tokens (router 0.61 to 0.52 ms, GDN alpha/beta 0.14 to 0.09 ms at 4,096
-  // tokens). Every output keeps its two K16 chains in K order.
-  if (batch >= 1024) {
+  // 64-row x 128-token tiles (the W8A8 narrow geometry): half the weight
+  // re-reads per token tile of the 64 x 64 plan. The K order per output is
+  // unchanged, so the results stay bit-exact across the plan and every
+  // prefill chunk width.
+  const dim3 grid(static_cast<unsigned int>((batch + 127) / 128),
+                  static_cast<unsigned int>((m + 63) / 64));
+  if (wtype == WeightType::kBF16) {
     hipLaunchKernelGGL(
-        (DenseF16GEMMKernel<128, 128, 2, 2, 4, 1, false, false, false, true>),
-        dim3((batch + 127) / 128, (m + 127) / 128), dim3(kThreads), 0, stream,
-        w, x, out, batch, m, k);
+        (DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false, false, true,
+                            false, false, false, true>),
+        grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
     return true;
   }
   hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
-      dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
-      out, batch, m, k);
+      (DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false, false, true>),
+      grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
   return true;
 }
 
@@ -9624,6 +9773,127 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
   return true;
 }
 
+/// Tile plan for the K-quant/IQ F16-staged route: the DenseF16Gemm shapes
+/// the quantized dense roles run (the HC and stacked shapes have no
+/// quantized tiles), with the same K16 accumulation order in every
+/// configuration so chunked prefill stays exact.
+template<core::GgmlType QType>
+void LaunchDenseQuantF16(const void* w, const __half* x, float* out,
+                         std::size_t batch, std::size_t m, std::size_t k,
+                         hipStream_t stream) {
+  if (batch >= 96) {
+    constexpr int kWideBM = 256;
+    constexpr int kBN = 128;
+    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                    static_cast<unsigned int>((m + kWideBM - 1) / kWideBM));
+    if (batch >= 1024 && m == 2560 && k == 6144) {
+      // The output projection's activation is 50 MB at 4,096 tokens. In
+      // grid order the resident blocks each walk a different token tile of
+      // it; walking five row tiles of a token tile first shares each
+      // activation tile between them. Only the launch order changes.
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5, false, false, false,
+                              false, false, false, false, false, QType>),
+          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (batch >= 1024 && m == 2560) {
+      // Shared-expert down: pairs of row tiles per token tile (-11 %).
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 2, false, false, false,
+                              false, false, false, false, false, QType>),
+          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else {
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 1, false, false, false,
+                              false, false, false, false, false, QType>),
+          grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    }
+    return;
+  }
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<128, 64, 4, 4, 2, 1, false, false, false, false,
+                          false, false, false, false, QType>),
+      dim3(static_cast<unsigned int>((batch + 63) / 64),
+           static_cast<unsigned int>((m + 127) / 128)),
+      dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+}
+
+bool DenseQuantF16Gemm(core::GgmlType type, const void* w, const __half* x,
+                       float* out, std::size_t batch, std::size_t m,
+                       std::size_t k, hipStream_t stream) {
+  if (w == nullptr || x == nullptr || out == nullptr || batch == 0 || m == 0 ||
+      !KQuantWmmaType(type) || k == 0 ||
+      k % quant::QuantizedBlockElements(type) != 0) {
+    return false;
+  }
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+      LaunchDenseQuantF16<core::GgmlType::kQ4_K>(w, x, out, batch, m, k,
+                                                 stream);
+      return true;
+    case core::GgmlType::kQ5_K:
+      LaunchDenseQuantF16<core::GgmlType::kQ5_K>(w, x, out, batch, m, k,
+                                                 stream);
+      return true;
+    case core::GgmlType::kQ6_K:
+      LaunchDenseQuantF16<core::GgmlType::kQ6_K>(w, x, out, batch, m, k,
+                                                 stream);
+      return true;
+    case core::GgmlType::kIQ4_NL:
+      LaunchDenseQuantF16<core::GgmlType::kIQ4_NL>(w, x, out, batch, m, k,
+                                                   stream);
+      return true;
+    case core::GgmlType::kIQ4_XS:
+      LaunchDenseQuantF16<core::GgmlType::kIQ4_XS>(w, x, out, batch, m, k,
+                                                   stream);
+      return true;
+    case core::GgmlType::kIQ3_S:
+      LaunchDenseQuantF16<core::GgmlType::kIQ3_S>(w, x, out, batch, m, k,
+                                                  stream);
+      return true;
+    default:
+      return false;
+  }
+}
+
+template<core::GgmlType QType>
+void LaunchDenseF16Ssm(const void* w, const __half* x, const float* conv_w,
+                       const float* history, float* qkvz, float* convolved,
+                       std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                       std::uint32_t channels, hipStream_t stream,
+                       PassCheckpoints checkpoints,
+                       hipStream_t z_stream = nullptr,
+                       hipEvent_t z_start = nullptr) {
+  // Row-tile pairs per token tile in launch order (-0.9 %).
+  const unsigned token_tiles = (n_tokens + 127) / 128;
+  const unsigned qkv_tiles = z_stream != nullptr ? channels / 256 : m / 256;
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true, false, false,
+                          false, false, false, false, QType>),
+      dim3(token_tiles, qkv_tiles), dim3(kThreads), 0, stream, w, x, qkvz,
+      n_tokens, m, k, nullptr, nullptr, nullptr, conv_w, convolved,
+      AttentionProjectionOutput{}, checkpoints);
+  if (z_stream != nullptr) {
+    // Start after the QKV tiles: both GEMMs are compute bound, the
+    // recurrence that follows them is not. If the fork cannot be ordered,
+    // the Z tiles stay on `stream`.
+    if (hipEventRecord(z_start, stream) != hipSuccess ||
+        hipStreamWaitEvent(z_stream, z_start, 0) != hipSuccess)
+      z_stream = stream;
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true, false, false,
+                            false, false, false, false, QType>),
+        dim3(token_tiles, m / 256 - qkv_tiles), dim3(kThreads), 0, z_stream, w,
+        x, qkvz, n_tokens, m, k, nullptr, nullptr, nullptr, conv_w, convolved,
+        AttentionProjectionOutput{}, checkpoints, 0, qkv_tiles);
+  }
+  hipLaunchKernelGGL(
+      SsmConvBoundaryKernel,
+      dim3(Blocks(channels / 4), (n_tokens + kSsmProjectionTileTokens - 1) /
+                                     kSsmProjectionTileTokens),
+      dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
+      channels, m);
+}
+
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
@@ -9634,33 +9904,57 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
       kernel != kSsmConvTaps) {
     return false;
   }
-  // Row-tile pairs per token tile in launch order (-0.9 %).
-  const unsigned token_tiles = (n_tokens + 127) / 128;
-  const unsigned qkv_tiles = z_stream != nullptr ? channels / 256 : m / 256;
-  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true>),
-                     dim3(token_tiles, qkv_tiles), dim3(kThreads), 0, stream, w,
-                     x, qkvz, n_tokens, m, k, nullptr, nullptr, nullptr, conv_w,
-                     convolved, AttentionProjectionOutput{}, checkpoints);
-  if (z_stream != nullptr) {
-    // Start after the QKV tiles: both GEMMs are compute bound, the
-    // recurrence that follows them is not. If the fork cannot be ordered,
-    // the Z tiles stay on `stream`.
-    if (hipEventRecord(z_start, stream) != hipSuccess ||
-        hipStreamWaitEvent(z_stream, z_start, 0) != hipSuccess)
-      z_stream = stream;
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true>),
-                       dim3(token_tiles, m / 256 - qkv_tiles), dim3(kThreads),
-                       0, z_stream, w, x, qkvz, n_tokens, m, k, nullptr,
-                       nullptr, nullptr, conv_w, convolved,
-                       AttentionProjectionOutput{}, checkpoints, 0, qkv_tiles);
-  }
-  hipLaunchKernelGGL(
-      SsmConvBoundaryKernel,
-      dim3(Blocks(channels / 4), (n_tokens + kSsmProjectionTileTokens - 1) /
-                                     kSsmProjectionTileTokens),
-      dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
-      channels, m);
+  LaunchDenseF16Ssm<core::GgmlType::kQ8_0>(
+      w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels, stream,
+      checkpoints, z_stream, z_start);
   return true;
+}
+
+bool DenseQuantF16SsmGemm(core::GgmlType type, const void* w, const __half* x,
+                          const float* conv_w, const float* history,
+                          float* qkvz, float* convolved, std::uint32_t n_tokens,
+                          std::uint32_t m, std::uint32_t k,
+                          std::uint32_t channels, std::uint32_t kernel,
+                          hipStream_t stream, PassCheckpoints checkpoints) {
+  if (n_tokens == 0 || (m != 16384 && m != 10240) || k != 2560 ||
+      channels != 10240 || kernel != kSsmConvTaps || !KQuantWmmaType(type) ||
+      k % quant::QuantizedBlockElements(type) != 0) {
+    return false;
+  }
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+      LaunchDenseF16Ssm<core::GgmlType::kQ4_K>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    case core::GgmlType::kQ5_K:
+      LaunchDenseF16Ssm<core::GgmlType::kQ5_K>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    case core::GgmlType::kQ6_K:
+      LaunchDenseF16Ssm<core::GgmlType::kQ6_K>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    case core::GgmlType::kIQ4_NL:
+      LaunchDenseF16Ssm<core::GgmlType::kIQ4_NL>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    case core::GgmlType::kIQ4_XS:
+      LaunchDenseF16Ssm<core::GgmlType::kIQ4_XS>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    case core::GgmlType::kIQ3_S:
+      LaunchDenseF16Ssm<core::GgmlType::kIQ3_S>(
+          w, x, conv_w, history, qkvz, convolved, n_tokens, m, k, channels,
+          stream, checkpoints);
+      return true;
+    default:
+      return false;
+  }
 }
 
 template<WeightType type, unsigned tokens>
