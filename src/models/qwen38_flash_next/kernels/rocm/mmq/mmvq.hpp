@@ -36,6 +36,10 @@ constexpr int mmvq_moe_group_ints(int tokens, int experts_used) {
   return tokens * experts_used * (tokens + 1) + 2 * (tokens * experts_used + 1);
 }
 
+void mul_mat_vec_dense_multi(const void* weights, ggml_type type,
+                             const block_q8_1* input, const int32_t* ids,
+                             float* output, int k, int rows, int tokens,
+                             int input_stride, hipStream_t stream);
 void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
