@@ -481,20 +481,6 @@ __device__ inline constexpr std::uint32_t kDeviceIq3sGrid[512] = {
     0x0f0d0703U, 0x0f0f0101U,
 };
 
-// 8-bit sign masks for the IQ2/IQ3 7-bit sign indices. Mirrors
-// quant::kSignsIq2xs (verbatim from ggml-common.h).
-__device__ inline constexpr std::uint8_t kDeviceSignsIq2xs[128] = {
-    0,   129, 130, 3,   132, 5,   6,   135, 136, 9,   10,  139, 12,  141, 142,
-    15,  144, 17,  18,  147, 20,  149, 150, 23,  24,  153, 154, 27,  156, 29,
-    30,  159, 160, 33,  34,  163, 36,  165, 166, 39,  40,  169, 170, 43,  172,
-    45,  46,  175, 48,  177, 178, 51,  180, 53,  54,  183, 184, 57,  58,  187,
-    60,  189, 190, 63,  192, 65,  66,  195, 68,  197, 198, 71,  72,  201, 202,
-    75,  204, 77,  78,  207, 80,  209, 210, 83,  212, 85,  86,  215, 216, 89,
-    90,  219, 92,  221, 222, 95,  96,  225, 226, 99,  228, 101, 102, 231, 232,
-    105, 106, 235, 108, 237, 238, 111, 240, 113, 114, 243, 116, 245, 246, 119,
-    120, 249, 250, 123, 252, 125, 126, 255,
-};
-
 // 256-entry IQ2_XXS grid, eight magnitudes per byte. Mirrors quant::kIq2xxsGrid
 // (verbatim from ggml-common.h).
 __device__ inline constexpr std::uint64_t kDeviceIq2xxsGrid[256] = {
@@ -1208,6 +1194,37 @@ __device__ inline std::uint32_t Iq4NlLookup4(std::uint32_t nibbles) noexcept {
   return (lower & ~select) | (upper & select);
 }
 
+/// Expands the low four bits of `nibble` to four 0x00/0xFF byte masks.
+/// 0x00204081 places bit j in the low bit of byte j; V_PERM_B32 then picks
+/// 0x00 or 0xFF from the constant pair in its second source (entries 0..3).
+__device__ inline std::uint32_t SignByteMask4(std::uint32_t nibble) noexcept {
+  const std::uint32_t select = (nibble * 0x00204081U) & 0x01010101U;
+  return __builtin_amdgcn_perm(0U, 0xFFFFFF00U, select);
+}
+
+/// The IQ2/IQ3 7-bit sign index as a sign byte: seven bits plus even parity.
+__device__ inline std::uint32_t SignsIq2xs(std::uint32_t index) noexcept {
+  return index | ((__popc(index) & 1U) << 7U);
+}
+
+/// Applies a sign byte (bit j negates element j) to two groups of four
+/// magnitude bytes. Grid magnitudes are below 0x80, so SubBytes(0, ...) is
+/// the per-byte two's complement.
+__device__ inline void ApplyGridSigns(std::uint32_t& lo, std::uint32_t& hi,
+                                      std::uint32_t signs) noexcept {
+  const std::uint32_t lo_mask = SignByteMask4(signs & 0x0FU);
+  const std::uint32_t hi_mask = SignByteMask4((signs >> 4U) & 0x0FU);
+  lo ^= (lo ^ SubBytes(0U, lo)) & lo_mask;
+  hi ^= (hi ^ SubBytes(0U, hi)) & hi_mask;
+}
+
+/// Expands four 2-bit Q2_0 codes to four bytes with the code in each byte's
+/// low bits (the pair-select from the Q2_0 vec dot).
+__device__ inline std::uint32_t ExpandQ2Codes4(std::uint32_t codes) noexcept {
+  const std::uint32_t t = (codes | (codes << 12U)) & 0x000F000FU;
+  return (t | (t << 6U)) & 0x03030303U;
+}
+
 // opt-q4kxl: one 16-element sub-block decoded into int8 codes plus an affine
 // pair, so that
 //
@@ -1390,27 +1407,24 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
     case core::GgmlType::kIQ3_S: {
       const auto& blk = static_cast<const IQ3SBlock*>(row)[sub16 / 16];
       const std::size_t sb32 = (sub16 / 2) % 8;
-      const std::size_t within0 = (sub16 % 2) * 16;
+      const std::size_t l0 = 2 * (sub16 % 2);
       const std::uint8_t qh_byte = blk.qh[sb32];
-      // Irregular by construction: every group of four elements is a separate
-      // 512-entry grid lookup, so this one stays element-wise. IQ3_S is a
-      // single tensor in the shard.
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t within = within0 + static_cast<std::size_t>(j);
-        const std::size_t l = within / 8;
-        const std::size_t jj = within % 8;
-        const std::size_t grid_half = jj / 4;
-        const int shift = static_cast<int>(8 - (2 * l) - grid_half);
-        const std::uint32_t grid_index =
-            static_cast<std::uint32_t>(
-                blk.qs[(sb32 * 8) + (2 * l) + grid_half]) |
-            ((static_cast<std::uint32_t>(qh_byte) << shift) & 256U);
-        const auto* grid =
-            reinterpret_cast<const std::uint8_t*>(&kDeviceIq3sGrid[grid_index]);
-        const int magnitude = static_cast<int>(grid[jj % 4]);
-        const bool negate = (blk.signs[(sb32 * 4) + l] & (1U << jj)) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = l0 + static_cast<std::size_t>(g);
+        // Four magnitudes per 512-entry grid word; each of the group's two
+        // four-element halves has its own word and the high index bit.
+        const std::uint32_t index0 =
+            static_cast<std::uint32_t>(blk.qs[(sb32 * 8) + (2 * l)]) |
+            ((static_cast<std::uint32_t>(qh_byte) << (8 - 2 * l)) & 256U);
+        const std::uint32_t index1 =
+            static_cast<std::uint32_t>(blk.qs[(sb32 * 8) + (2 * l) + 1]) |
+            ((static_cast<std::uint32_t>(qh_byte) << (7 - 2 * l)) & 256U);
+        std::uint32_t lo = kDeviceIq3sGrid[index0];
+        std::uint32_t hi = kDeviceIq3sGrid[index1];
+        ApplyGridSigns(lo, hi, blk.signs[(sb32 * 4) + l]);
+        out.w[2 * g] = lo;
+        out.w[2 * g + 1] = hi;
       }
       const std::uint8_t scale_byte = blk.scales[sb32 / 2];
       const int nibble =
@@ -1421,11 +1435,12 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
     case core::GgmlType::kQ2_0: {
       const auto& blk = static_cast<const Q20Block*>(row)[sub16 / 4];
       const std::size_t base = (sub16 % 4) * 4;
+      std::uint32_t codes = 0;
+      __builtin_memcpy(&codes, blk.qs + base, sizeof(codes));
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const unsigned code =
-            (blk.qs[base + (j / 4)] >> (2U * (j % 4))) & 0x03U;
-        out.q[j] = static_cast<std::int8_t>(static_cast<int>(code) - 1);
+      for (int i = 0; i < 4; ++i) {
+        out.w[i] =
+            SubBytes(ExpandQ2Codes4((codes >> (8 * i)) & 0xFFU), 0x01010101U);
       }
       out.scale = __half2float(blk.d);
       out.offset = 0.0F;
@@ -1441,15 +1456,14 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const float db = __half2float(blk.d) *
                        (0.5F + static_cast<float>(signs_word >> 28)) * 0.25F;
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t l = l0 + (j / 8);
-        const auto* grid = reinterpret_cast<const std::uint8_t*>(
-            &kDeviceIq2xxsGrid[bytes[(sb32 * 8) + l]]);
-        const std::uint8_t signs =
-            kDeviceSignsIq2xs[(signs_word >> (7 * l)) & 127U];
-        const int magnitude = static_cast<int>(grid[j % 8]);
-        const bool negate = (signs & (1U << (j % 8))) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = l0 + static_cast<std::size_t>(g);
+        const std::uint64_t grid = kDeviceIq2xxsGrid[bytes[(sb32 * 8) + l]];
+        std::uint32_t lo = static_cast<std::uint32_t>(grid);
+        std::uint32_t hi = static_cast<std::uint32_t>(grid >> 32);
+        ApplyGridSigns(lo, hi, SignsIq2xs((signs_word >> (7 * l)) & 127U));
+        out.w[2 * g] = lo;
+        out.w[2 * g + 1] = hi;
       }
       out.scale = db;
       out.offset = 0.0F;
@@ -1464,15 +1478,15 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const float db =
           __half2float(blk.d) * (0.5F + static_cast<float>(nibble)) * 0.25F;
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t l = l0 + (j / 8);
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = l0 + static_cast<std::size_t>(g);
         const std::uint16_t code = blk.qs[(sb32 * 4) + l];
-        const auto* grid = reinterpret_cast<const std::uint8_t*>(
-            &kDeviceIq2xsGrid[code & 511U]);
-        const std::uint8_t signs = kDeviceSignsIq2xs[code >> 9U];
-        const int magnitude = static_cast<int>(grid[j % 8]);
-        const bool negate = (signs & (1U << (j % 8))) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+        const std::uint64_t grid = kDeviceIq2xsGrid[code & 511U];
+        std::uint32_t lo = static_cast<std::uint32_t>(grid);
+        std::uint32_t hi = static_cast<std::uint32_t>(grid >> 32);
+        ApplyGridSigns(lo, hi, SignsIq2xs(code >> 9U));
+        out.w[2 * g] = lo;
+        out.w[2 * g + 1] = hi;
       }
       out.scale = db;
       out.offset = 0.0F;
@@ -1487,18 +1501,18 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const float db =
           __half2float(blk.d) * (0.5F + static_cast<float>(nibble)) * 0.25F;
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t l = l0 + (j / 8);
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = l0 + static_cast<std::size_t>(g);
         const std::uint32_t grid_index =
             static_cast<std::uint32_t>(blk.qs[(sb32 * 4) + l]) |
             ((static_cast<std::uint32_t>(blk.qh[sb32] >> (2U * l)) & 0x03U)
              << 8U);
-        const auto* grid =
-            reinterpret_cast<const std::uint8_t*>(&kDeviceIq2sGrid[grid_index]);
-        const std::uint8_t signs = blk.qs[32 + (sb32 * 4) + l];
-        const int magnitude = static_cast<int>(grid[j % 8]);
-        const bool negate = (signs & (1U << (j % 8))) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+        const std::uint64_t grid = kDeviceIq2sGrid[grid_index];
+        std::uint32_t lo = static_cast<std::uint32_t>(grid);
+        std::uint32_t hi = static_cast<std::uint32_t>(grid >> 32);
+        ApplyGridSigns(lo, hi, blk.qs[32 + (sb32 * 4) + l]);
+        out.w[2 * g] = lo;
+        out.w[2 * g + 1] = hi;
       }
       out.scale = db;
       out.offset = 0.0F;
@@ -1514,17 +1528,13 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const float db = __half2float(blk.d) *
                        (0.5F + static_cast<float>(signs_word >> 28)) * 0.5F;
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t l = l0 + (j / 8);
-        const std::uint8_t grid_index =
-            blk.qs[(sb32 * 8) + (2 * l) + ((j % 8) / 4)];
-        const auto* grid = reinterpret_cast<const std::uint8_t*>(
-            &kDeviceIq3xxsGrid[grid_index]);
-        const std::uint8_t signs =
-            kDeviceSignsIq2xs[(signs_word >> (7 * l)) & 127U];
-        const int magnitude = static_cast<int>(grid[j % 4]);
-        const bool negate = (signs & (1U << (j % 8))) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+      for (int g = 0; g < 2; ++g) {
+        const std::size_t l = l0 + static_cast<std::size_t>(g);
+        std::uint32_t lo = kDeviceIq3xxsGrid[blk.qs[(sb32 * 8) + (2 * l)]];
+        std::uint32_t hi = kDeviceIq3xxsGrid[blk.qs[(sb32 * 8) + (2 * l) + 1]];
+        ApplyGridSigns(lo, hi, SignsIq2xs((signs_word >> (7 * l)) & 127U));
+        out.w[2 * g] = lo;
+        out.w[2 * g + 1] = hi;
       }
       out.scale = db;
       out.offset = 0.0F;

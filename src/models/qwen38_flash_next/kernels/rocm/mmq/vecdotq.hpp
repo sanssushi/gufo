@@ -1353,3 +1353,252 @@ struct Q4MoeFragment {
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc + 2, dm, d8);
   }
 };
+
+// The same fragment split for the low-bit IQ formats: the grid lookups and
+// sign expansion run once per row and K block, and Dot keeps each format's
+// original integer and floating sum order. The scale product is pinned so
+// fast-math cannot reassociate (d * ds) * sumi into (sumi * d) * ds and
+// change rounding against the scalar routed path.
+template <ggml_type type>
+struct IqMoeFragment;
+
+static __device__ __forceinline__ float IqMoeScale(float v) {
+  asm volatile("" : "+v"(v));
+  return v;
+}
+
+template <>
+struct IqMoeFragment<GGML_TYPE_IQ2_XXS> {
+  int v[8];
+  int ls;
+  half dh;
+
+  __device__ __forceinline__ IqMoeFragment(const void* weights, int block,
+                                           int iqs) {
+    const auto* b = static_cast<const block_iq2_xxs*>(weights) + block;
+    const int q2 = get_int_b2(b->qs, iqs);
+    const uint8_t* aux8 = (const uint8_t*)&q2;
+    const uint32_t aux32 = get_int_b2(b->qs, iqs + 1);
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+      const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0 / 2]];
+      const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+      const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+      v[k0] = __vsub4(grid_pos.x ^ signs0, signs0);
+      const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+      v[k0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    ls = aux32 >> 27 | 1;
+    dh = b->d;
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+      const int u0 = get_int_b4(x[iqs / 2].qs, k0 + 0);
+      sumi = ggml_hip_dp4a(v[k0], u0, sumi);
+      const int u1 = get_int_b4(x[iqs / 2].qs, k0 + 1);
+      sumi = ggml_hip_dp4a(v[k0 + 1], u1, sumi);
+    }
+    sumi = sumi * ls / 8;
+    const float d = __half2float(dh) * __low2float(x[iqs / 2].ds);
+    return IqMoeScale(d) * sumi;
+  }
+};
+
+template <>
+struct IqMoeFragment<GGML_TYPE_IQ2_XS> {
+  int v[8];
+  int ls0;
+  int ls1;
+  half dh;
+
+  __device__ __forceinline__ IqMoeFragment(const void* weights, int block,
+                                           int iqs) {
+    const auto* b = static_cast<const block_iq2_xs*>(weights) + block;
+    const int2 q2_packed = make_int2(get_int_b2(b->qs, iqs + 0),
+                                     get_int_b2(b->qs, iqs + 1));
+    const uint16_t* q2 = (const uint16_t*)&q2_packed;
+    ls0 = b->scales[iqs / 2] & 0x0F;
+    ls1 = b->scales[iqs / 2] >> 4;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0 / 2] & 0x1FF];
+      const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+      const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+      v[l0] = __vsub4(grid_pos.x ^ signs0, signs0);
+      const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+      v[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    dh = b->d;
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int u0 = get_int_b4(x[iqs / 2].qs, l0 + 0);
+      const int u1 = get_int_b4(x[iqs / 2].qs, l0 + 1);
+      if (l0 < 4) {
+        sumi0 = ggml_hip_dp4a(v[l0], u0, sumi0);
+        sumi0 = ggml_hip_dp4a(v[l0 + 1], u1, sumi0);
+      } else {
+        sumi1 = ggml_hip_dp4a(v[l0], u0, sumi1);
+        sumi1 = ggml_hip_dp4a(v[l0 + 1], u1, sumi1);
+      }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const float d = __half2float(dh) * __low2float(x[iqs / 2].ds);
+    return IqMoeScale(d) * sumi;
+  }
+};
+
+template <>
+struct IqMoeFragment<GGML_TYPE_IQ2_S> {
+  int v[8];
+  int ls0;
+  int ls1;
+  half dh;
+
+  __device__ __forceinline__ IqMoeFragment(const void* weights, int block,
+                                           int iqs) {
+    const auto* b = static_cast<const block_iq2_s*>(weights) + block;
+    const int qs_packed = get_int_b2(b->qs, iqs / 2);
+    const uint8_t* qs = (const uint8_t*)&qs_packed;
+    const int qh = b->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2(b->qs, QK_K / 32 + iqs / 2);
+    const uint8_t* signs_packed_8 = (const uint8_t*)&signs_packed_32;
+    ls0 = b->scales[iqs / 2] & 0x0F;
+    ls1 = b->scales[iqs / 2] >> 4;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int* grid_pos =
+          (const int*)(iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+      const int signs0 = __vcmpne4(
+          ((signs_packed_8[l0 / 2] & 0x03) << 7) |
+              ((signs_packed_8[l0 / 2] & 0x0C) << 21),
+          0x00000000);
+      const int signs1 = __vcmpne4(
+          ((signs_packed_8[l0 / 2] & 0x30) << 3) |
+              ((signs_packed_8[l0 / 2] & 0xC0) << 17),
+          0x00000000);
+      v[l0] = __vsub4(grid_pos[0] ^ signs0, signs0);
+      v[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
+    }
+    dh = b->d;
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int u0 = get_int_b4(x[iqs / 2].qs, l0 + 0);
+      const int u1 = get_int_b4(x[iqs / 2].qs, l0 + 1);
+      if (l0 < 4) {
+        sumi0 = ggml_hip_dp4a(v[l0], u0, sumi0);
+        sumi0 = ggml_hip_dp4a(v[l0 + 1], u1, sumi0);
+      } else {
+        sumi1 = ggml_hip_dp4a(v[l0], u0, sumi1);
+        sumi1 = ggml_hip_dp4a(v[l0 + 1], u1, sumi1);
+      }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const float d = __half2float(dh) * __low2float(x[iqs / 2].ds);
+    return IqMoeScale(d) * sumi;
+  }
+};
+
+template <>
+struct IqMoeFragment<GGML_TYPE_IQ3_XXS> {
+  int v[8];
+  int ls;
+  half dh;
+
+  __device__ __forceinline__ IqMoeFragment(const void* weights, int block,
+                                           int iqs) {
+    const auto* b = static_cast<const block_iq3_xxs*>(weights) + block;
+    const int2 q3_packed =
+        make_int2(get_int_b2(b->qs, iqs), get_int_b2(b->qs, iqs + 1));
+    const uint8_t* q3 = (const uint8_t*)&q3_packed;
+    const uint32_t aux32 = get_int_b2(b->qs, QK_K / 16 + iqs / 2);
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int2 grid_pos =
+          make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+      const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
+      const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+      v[l0] = __vsub4(grid_pos.x ^ signs0, signs0);
+      const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+      v[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    ls = aux32 >> 28;
+    dh = b->d;
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int u0 = get_int_b4(x[iqs / 2].qs, l0 + 0);
+      sumi = ggml_hip_dp4a(v[l0], u0, sumi);
+      const int u1 = get_int_b4(x[iqs / 2].qs, l0 + 1);
+      sumi = ggml_hip_dp4a(v[l0 + 1], u1, sumi);
+    }
+    sumi = (ls * sumi + sumi / 2) / 2;
+    const float d = __half2float(dh) * __low2float(x[iqs / 2].ds);
+    return IqMoeScale(d) * sumi;
+  }
+};
+
+template <>
+struct IqMoeFragment<GGML_TYPE_IQ3_S> {
+  int v[8];
+  int sc;
+  half dh;
+
+  __device__ __forceinline__ IqMoeFragment(const void* weights, int block,
+                                           int iqs) {
+    const auto* b = static_cast<const block_iq3_s*>(weights) + block;
+    const int2 qs_packed =
+        make_int2(get_int_b2(b->qs, iqs + 0), get_int_b2(b->qs, iqs + 1));
+    const uint8_t* qs = (const uint8_t*)&qs_packed;
+    const int qh = b->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2(b->signs, iqs / 2);
+    const uint8_t* signs_packed_8 = (const uint8_t*)&signs_packed_32;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int2 grid_pos = make_int2(
+          iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+          iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+      const int signs0 = __vcmpne4(
+          ((signs_packed_8[l0 / 2] & 0x03) << 7) |
+              ((signs_packed_8[l0 / 2] & 0x0C) << 21),
+          0x00000000);
+      const int signs1 = __vcmpne4(
+          ((signs_packed_8[l0 / 2] & 0x30) << 3) |
+              ((signs_packed_8[l0 / 2] & 0xC0) << 17),
+          0x00000000);
+      v[l0] = __vsub4(grid_pos.x ^ signs0, signs0);
+      v[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+    }
+    sc = 1 + 2 * ((b->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    dh = b->d;
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+      const int u0 = get_int_b4(x[iqs / 2].qs, l0 + 0);
+      sumi = ggml_hip_dp4a(v[l0], u0, sumi);
+      const int u1 = get_int_b4(x[iqs / 2].qs, l0 + 1);
+      sumi = ggml_hip_dp4a(v[l0 + 1], u1, sumi);
+    }
+    sumi *= sc;
+    const float d = __half2float(dh) * __low2float(x[iqs / 2].ds);
+    return IqMoeScale(d) * sumi;
+  }
+};
