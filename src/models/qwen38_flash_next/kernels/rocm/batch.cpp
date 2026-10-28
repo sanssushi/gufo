@@ -68,7 +68,7 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
   s.tokens += r;
   s.res += r * c.HcDim();
   s.xn += r * c.HcDim();
-  s.xn_half += r * c.HcDim();
+  s.xn_half += r * (c.HcDim() + hc_norm_pad_);
   s.lo += r * c.hc_low_rank;
   s.hc_gate += r * c.HcDim();
   s.mixed += r * c.hidden_size;
@@ -127,6 +127,7 @@ void Executor::UseScratch(const Scratch& scratch) const {
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   xn_half_ = false;
+  xn_half_pitch_ = 0;
   moe_pending_ = false;
   moe_f32_rows_ = false;
 }
@@ -146,6 +147,7 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                           std::string* error) const {
   const auto& c = config();
   xn_half_ = false;
+  xn_half_pitch_ = 0;
   DropReadyQ8();  // the batched route rewrites xn and mixed unfused
   if (!normed)
     RmsNormRows(res, m.norm.f32(), s_.xn, rows, c.HcDim(), c.hc_count,

@@ -95,13 +95,15 @@ void HcMixEpilogueVec4(const float* xn, const float* gate, const void* inject_w,
 /// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
 /// four-stream geometry is the caller's contract. Non-null `mixed_half` /
 /// `mixed_q8` also receive the mixed rows as F16 and in the W8A8 tiled Q8
-/// layout (K = hidden).
+/// layout (K = hidden). `norm_stride` is the row stride of `xn` in halves;
+/// zero means streams * hidden. A padded stride requires hidden % 32 == 0.
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const void* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
                           hipStream_t stream,
-                          WeightType inject_type = WeightType::kF32);
+                          WeightType inject_type = WeightType::kF32,
+                          std::uint32_t norm_stride = 0);
 
 /// res[t][s][i] += block_out[t][i] * 2*sigmoid(inject[t][s] / streams), and
 /// when `gamma` is non-null also the next mixer's grouped RMSNorm of the
@@ -130,13 +132,17 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
 /// the stream weights land in defer_w, and true is returned. The update is
 /// then owed by HcCombineMoeF16 (prior_out, prior_w) or HcApplyDeferred.
 /// A deferring combine given `inject_w` also writes the next mixer's
-/// inject partials to `inject_out` (see HcCombineMoeF16).
+/// inject partials to `inject_out` (see HcCombineMoeF16). `inject_w` holds
+/// F32 or BF16 weights, selected by `inject_type`. `norm_stride` is the row
+/// stride of `xn` in halves; zero means streams * hidden.
 bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
                   float* defer_w = nullptr, float* inject_out = nullptr,
-                  const float* inject_w = nullptr);
+                  const void* inject_w = nullptr,
+                  WeightType inject_type = WeightType::kF32,
+                  std::uint32_t norm_stride = 0);
 /// Applies the residual update a deferring HcCombineF16 left out (four
 /// streams), with the same arithmetic.
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
@@ -147,12 +153,15 @@ void HcApplyDeferred(float* res, const float* block_out, const float* w,
 /// F16 rows), `weights`, the gated shared expert; it is formed in
 /// registers and never written. Returns false (launching nothing) for a
 /// geometry the fused kernel does not cover (four 2,560-wide streams).
-/// A null gamma updates only the residual; otherwise xn_q8 is required.
+/// A null gamma updates only the residual; otherwise the F16 norm is
+/// written and a non-null xn_q8 also receives its tiled Q8 copy.
 /// A non-null `prior_out` first applies a deferred HcCombineF16 update
 /// (its block output and `prior_w` stream weights). A non-null `inject_w`
 /// (with gamma and `prior_out`) also writes the next mixer's inject partials
 /// to `inject_out`, as HcMixF16Gemm would from the F16 norm; they may
-/// replace this combine's own `inject` logits.
+/// replace this combine's own `inject` logits. `inject_w` holds F32 or BF16
+/// weights, selected by `inject_type`. `norm_stride` is the row stride of
+/// `xn` in halves; zero means streams * hidden.
 bool HcCombineMoeF16(
     float* res, const __half* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
@@ -160,7 +169,8 @@ bool HcCombineMoeF16(
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t n_tokens,
     std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
     const float* prior_out = nullptr, const float* prior_w = nullptr,
-    float* inject_out = nullptr, const float* inject_w = nullptr);
+    float* inject_out = nullptr, const void* inject_w = nullptr,
+    WeightType inject_type = WeightType::kF32, std::uint32_t norm_stride = 0);
 /// HcCombineMoeF16 over F32 expert rows (the quantized mixes' MMQ down
 /// projection): the block output is MoeEpilogueVec4's result, formed in
 /// registers and never written.
@@ -170,7 +180,8 @@ bool HcCombineMoeF32(float* res, const float* expert_out, const float* weights,
                      const float* inject, std::uint32_t inject_parts,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, float eps, hipStream_t stream);
+                     std::uint32_t streams, float eps, hipStream_t stream,
+                     std::uint32_t norm_stride = 0);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
@@ -296,14 +307,28 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream,
                   WeightType up_type = WeightType::kQ8_0,
-                  WeightType inject_type = WeightType::kF32);
+                  WeightType inject_type = WeightType::kF32,
+                  std::uint32_t norm_stride = 0);
 
 /// F16 activation rows [batch][k], F16 or BF16 (staged as F16) weight rows,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+/// `input_stride` is the row stride of `x` in half elements; zero means k.
+/// A padded BF16 stride is supported by the wide [320,10240] down projection
+/// (batch >= 1024).
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream,
-                        WeightType wtype = WeightType::kF16);
+                        hipStream_t stream, WeightType wtype = WeightType::kF16,
+                        std::size_t input_stride = 0);
+/// The BF16/F16 [320,10240] HC down projection with its SiLU and F16
+/// narrowing fused into the same epilogue: out is [batch][320] and holds
+/// half(silu(down * scale)) with the separate chain's exact bytes. `x` is
+/// [batch][k] (the F16 norm), `input_stride` its half-element row stride.
+/// Returns false for other shapes, below 96 tokens, or an unsupported padded
+/// stride (below 1024 tokens).
+bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
+                       std::size_t batch, std::size_t m, std::size_t k,
+                       hipStream_t stream, WeightType wtype,
+                       std::size_t input_stride, float scale);
 /// input_stride is in half elements; zero means k. Padded rows are supported
 /// by the wide SSM output projection (batch >= 1024, m=2560, k=6144).
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,

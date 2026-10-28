@@ -1074,7 +1074,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
   s.xn = f32(T * hc_dim);
-  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
+  s.xn_half = Alloc<__half>(a, T * (hc_dim + e->hc_norm_pad_), error_msg);
   s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
   s.lo = f32(T * c.hc_low_rank);
   s.mixed = f32(T * hidden);
@@ -1245,6 +1245,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                    !model.layers().empty() &&
                    (model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0 ||
                     model.layers()[0].hc_ffn.down.type == GgmlType::kBF16);
+  // The GSQ mixes' BF16 HC-down reads a 32-half pad at the end of each norm
+  // row. Only those models reserve it; the Q8_0 control keeps its packed
+  // layout and row addresses.
+  const bool bf16_hc_down =
+      std::ranges::any_of(model.layers(), [&](const DeviceLayer& l) {
+        return (l.hc_attn.down.type == GgmlType::kBF16 &&
+                l.hc_attn.down.rows == 320 &&
+                l.hc_attn.down.cols == c.HcDim()) ||
+               (l.hc_ffn.down.type == GgmlType::kBF16 &&
+                l.hc_ffn.down.rows == 320 && l.hc_ffn.down.cols == c.HcDim());
+      });
+  e->hc_norm_pad_ = bf16_hc_down && c.hc_count == 4 && c.HcDim() == 10240 &&
+                            c.hc_low_rank == 320
+                        ? 32
+                        : 0;
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -2127,26 +2142,129 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
 
 namespace {
 
-/// A mixer's F32 inject weights, which its combine can apply (see Combine).
-const float* InjectWeights(const DeviceMixer& m) {
-  return !m.inject.empty() && m.inject.type == GgmlType::kF32 ? m.inject.f32()
-                                                              : nullptr;
+/// A mixer's F32 or BF16 inject weights, which its combine can apply (see
+/// Combine).
+const void* InjectWeights(const DeviceMixer& m) {
+  return !m.inject.empty() && (m.inject.type == GgmlType::kF32 ||
+                               m.inject.type == GgmlType::kBF16)
+             ? m.inject.data
+             : nullptr;
+}
+
+/// The encoding of a mixer's inject weights; the F32 form also covers an
+/// absent matrix (the combine is then never given a pointer).
+WeightType InjectType(const DeviceMixer& m) {
+  return m.inject.type == GgmlType::kBF16 ? WeightType::kBF16
+                                          : WeightType::kF32;
+}
+
+/// Whether the next mixer's down projection reads the norm's tiled Q8 copy:
+/// the wide W8A8 route and the fused HC down projection are Q8_0-only.
+bool MixerNormUsesQ8(const DeviceMixer& m) {
+  return m.down.type == GgmlType::kQ8_0;
+}
+
+/// Whether the next mixer's decode down projection reads the norm's Q8_1
+/// rows: the adapter's MMVQ quantizer ignores the weight type, so every
+/// quantized dense format consumes the same rows.
+bool MixerNormUsesQ8_1(const DeviceMixer& m) {
+  return Q8DenseType(m.down.type);
+}
+
+/// Whether the next mixer's wide BF16 down projection reads a padded F16
+/// norm row. Its [320, 10240] GEMM is the only padded activation route here.
+bool MixerNormPadded(const DeviceMixer& m, std::uint32_t rows,
+                     const Config& c) {
+  return rows >= 1024 && c.hc_count == 4 && c.hc_low_rank == 320 &&
+         c.HcDim() == 10240 && m.down.type == GgmlType::kBF16 &&
+         m.down.rows == 320 && m.down.cols == 10240;
+}
+
+/// Whether a following dense projection reads `mixed` in the tiled Q8
+/// layout. Only Q8_0 weights take that copy; the GSQ mixes' IQ/K types and
+/// the BF16 mixers do not.
+bool AttentionUsesMixedQ8(const DeviceLayer& l) {
+  return l.ssm_in.type == GgmlType::kQ8_0 ||
+         l.ssm_qkv.type == GgmlType::kQ8_0 ||
+         l.ssm_gate.type == GgmlType::kQ8_0 ||
+         l.attn_qkv.type == GgmlType::kQ8_0 ||
+         l.attn_q.type == GgmlType::kQ8_0 || l.attn_k.type == GgmlType::kQ8_0 ||
+         l.attn_v.type == GgmlType::kQ8_0;
+}
+
+/// The router and shared expert are the only FFN consumers of `mixed` that
+/// take the tiled Q8 layout; the routed experts read its F32/F16 rows.
+bool MoeUsesMixedQ8(const DeviceLayer& l) {
+  return l.router.type == GgmlType::kQ8_0 ||
+         l.shexp_gate.type == GgmlType::kQ8_0 ||
+         l.shexp_up.type == GgmlType::kQ8_0;
+}
+
+/// Whether a wide K-quant/IQ projection of a mixer's output decodes its
+/// weight tile into F16 and reads the mixer's producer-written F16 rows.
+bool QuantF16Rows(GgmlType type) {
+  return KQuantWmmaType(type);
+}
+
+/// Whether a wide 16-bit projection reads the mixer's F16 rows: the router,
+/// alpha/beta and indexer matrices take the same half cache.
+bool HalfRows(GgmlType type) {
+  return type == GgmlType::kF16 || type == GgmlType::kBF16;
+}
+
+/// Whether every wide attention/SSM consumer of a mixer's output reads only
+/// its F16 rows: the K-quant/IQ projections decode into F16 tiles and
+/// alpha/beta and the indexer matrices are 16-bit. Q8_0 stacks keep the
+/// separate DenseF16Route clause.
+bool AttentionUsesMixedHalf(const DeviceLayer& l) {
+  if (l.linear) {
+    if (!HalfRows(l.ssm_alpha_beta.type)) {
+      return false;
+    }
+    if (!l.ssm_in.empty()) {
+      return QuantF16Rows(l.ssm_in.type);
+    }
+    return QuantF16Rows(l.ssm_qkv.type) && QuantF16Rows(l.ssm_gate.type);
+  }
+  if (!l.attn_qkv.empty()) {
+    if (!QuantF16Rows(l.attn_qkv.type)) {
+      return false;
+    }
+  } else if (!QuantF16Rows(l.attn_q.type) || !QuantF16Rows(l.attn_k.type) ||
+             !QuantF16Rows(l.attn_v.type)) {
+    return false;
+  }
+  return (l.indexer_k.empty() || HalfRows(l.indexer_k.type)) &&
+         (l.indexer_q.empty() || HalfRows(l.indexer_q.type));
+}
+
+/// Whether the wide FFN reads the mix only through its F16 rows: a 16-bit
+/// router and K-quant/IQ shared-expert gate/up projections.
+bool MoeUsesMixedHalf(const DeviceLayer& l) {
+  return HalfRows(l.router.type) && QuantF16Rows(l.shexp_gate.type) &&
+         QuantF16Rows(l.shexp_up.type);
 }
 
 }  // namespace
 
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-                       const float* inject_w) const {
+                       const void* inject_w, bool norm_q8, bool norm_q8_1,
+                       WeightType inject_type, bool padded_norm) const {
   const Config& c = config();
   inject_fused_ = nullptr;
-  // Wide batches hand the next mixer an F16 norm for its epilogue and the
-  // same norm quantized into the tiled Q8 layout for its W8A8 down
-  // projection: half the bytes for the combine and the epilogue, and no
-  // separate activation pass for the projection.
+  // Wide batches hand the next mixer an F16 norm for its epilogue and, when
+  // its down projection is Q8_0, the same norm quantized into the tiled Q8
+  // layout for its W8A8 projection: half the bytes for the combine and the
+  // epilogue, and no separate activation pass for the projection.
   xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_half_pitch_ = xn_half_ && padded_norm && hc_norm_pad_ != 0
+                       ? c.HcDim() + hc_norm_pad_
+                       : 0;
+  const std::uint32_t norm_stride = xn_half_pitch_;
+  void* xn_q8t = xn_half_ && norm_q8 ? s_.xn_q8t : nullptr;
   xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
   // The next mixer's inject pass reads only the F16 norm written here.
-  const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
+  const void* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
   const bool defer = defer_residual_;
   defer_residual_ = false;
   bool deferred = res_deferred_;
@@ -2168,8 +2286,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
           HcCombineMoeF32(res, s_.down_e, s_.weights, s_.shexp_out,
                           s_.router + c.num_experts, c.num_experts + 1,
                           c.num_experts_used, s_.inject, inject_parts_, gamma,
-                          s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                          c.hc_count, c.rms_eps, stream_)) {
+                          s_.xn_half, xn_q8t, n_tokens, c.hidden_size,
+                          c.hc_count, c.rms_eps, stream_, norm_stride)) {
         return;
       }
       MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
@@ -2178,14 +2296,15 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                       stream_);
     } else {
       const auto* down = reinterpret_cast<const __half*>(s_.down_e);
-      const float* fused_w = deferred ? fused_inject : nullptr;
+      const void* fused_w = deferred ? fused_inject : nullptr;
       if (wide_mixer_ && MatrixRows(n_tokens) &&
           HcCombineMoeF16(
               res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
               c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
-              gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+              gamma, s_.xn_half, xn_q8t, n_tokens, c.hidden_size, c.hc_count,
               c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
-              deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
+              deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w,
+              inject_type, norm_stride)) {
         inject_fused_ = fused_w;
         return;
       }
@@ -2210,18 +2329,19 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     // 4,096 tokens) instead of this combine writing the residual and the
     // next reading it back (168 MB each).
     const bool defer_now = defer && c.hc_count == 4;
-    res_deferred_ =
-        HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
-                     s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
-                     c.rms_eps, stream_, defer_now ? s_.hc_defer_w : nullptr,
-                     s_.inject, defer_now ? fused_inject : nullptr);
+    res_deferred_ = HcCombineF16(
+        res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half, xn_q8t,
+        n_tokens, c.hidden_size, c.hc_count, c.rms_eps, stream_,
+        defer_now ? s_.hc_defer_w : nullptr, s_.inject,
+        defer_now ? fused_inject : nullptr, inject_type, norm_stride);
     if (res_deferred_)
       inject_fused_ = fused_inject;
     return;
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
-  // combine writes those rows as well.
-  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+  // combine writes those rows as well, but only when that projection reads
+  // them (every Q8 dense format does; a BF16/F32 down does not).
+  if (!MatrixRows(n_tokens) && norm_q8_1 && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
                     stream_)) {
@@ -2234,8 +2354,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
-                     std::string* error_msg, bool half_only,
-                     bool no_f32) const {
+                     std::string* error_msg, bool half_only, bool no_f32,
+                     bool q8t) const {
   const Config& c = config();
   mixed_q8_ready_ = {};  // `mixed` is rewritten below
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
@@ -2243,15 +2363,18 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
   if (!normed) {
     xn_half_ = false;
+    xn_half_pitch_ = 0;
     xn_q8_ready_ = {};
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
+  const std::uint32_t xn_half_stride = xn_half_pitch_;
   const bool extras = n_tokens <= options_.max_batch &&
                       c.hidden_size <= model_->max_half_cols();
   // The mixed row's tiled Q8 copy needs the Q8 staging buffer to cover
-  // K = hidden; a mix without Q8_0 matrices does not size it.
-  const bool q8t_copy = extras && c.hidden_size <= model_->max_q8_cols();
+  // K = hidden and a following dense consumer that reads it; the Q8_0 MTP
+  // sidecar alone (which sizes the buffer) is not demand.
+  const bool q8t_copy = q8t && extras && c.hidden_size <= model_->max_q8_cols();
   const bool down_half =
       m.down.type == GgmlType::kBF16 || m.down.type == GgmlType::kF16;
   const bool fused_projection =
@@ -2272,19 +2395,17 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     } else {
-      // The BF16/F16 down reads the F16 norm; its SiLU'd rank rows reach
-      // the gate buffer as F16 like the Q8_0 fused projection's.
-      if (!UnquantizedF16Gemm(
-              m.down.data, static_cast<const __half*>(s_.xn_half), s_.lo,
-              n_tokens, m.down.rows, m.down.cols, stream_, half_type)) {
+      // The BF16/F16 down reads the F16 norm; its SiLU'd rank rows reach the
+      // gate buffer as F16 like the Q8_0 fused projection's. The epilogue
+      // writes the narrowed rows directly.
+      if (!HcDownF16SiluGemm(
+              m.down.data, static_cast<const __half*>(s_.xn_half),
+              reinterpret_cast<__half*>(s_.hc_gate), n_tokens, m.down.rows,
+              m.down.cols, stream_, half_type, xn_half_stride,
+              1.0F / static_cast<float>(c.hc_count))) {
         AssignError(error_msg, "fused HC down projection failed");
         return false;
       }
-      SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-      NarrowActivations(s_.lo, s_.hc_gate, false,
-                        static_cast<std::size_t>(n_tokens) * c.hc_low_rank,
-                        stream_);
     }
   } else {
     if (xn_half_) {
@@ -2295,9 +2416,10 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
           return false;
         }
       } else if (down_half) {
-        if (!UnquantizedF16Gemm(
-                m.down.data, static_cast<const __half*>(s_.xn_half), s_.lo,
-                n_tokens, m.down.rows, m.down.cols, stream_, half_type)) {
+        if (!UnquantizedF16Gemm(m.down.data,
+                                static_cast<const __half*>(s_.xn_half), s_.lo,
+                                n_tokens, m.down.rows, m.down.cols, stream_,
+                                half_type, xn_half_stride)) {
           AssignError(error_msg, "mixer down projection failed");
           return false;
         }
@@ -2338,7 +2460,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   // The previous combine already wrote these partials from the same norm.
   const bool inject_done = fused_inject && inject == s_.inject &&
                            inject_fused_ != nullptr &&
-                           inject_fused_ == m.inject.f32();
+                           inject_fused_ == m.inject.data;
   inject_fused_ = nullptr;
   const WeightType inject_type =
       m.inject.type == GgmlType::kBF16 ? WeightType::kBF16 : WeightType::kF32;
@@ -2366,7 +2488,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                         static_cast<__half*>(s_.x_half),
                         half_only || !q8t_copy ? nullptr : s_.x_q8t, inject,
                         n_tokens, c.hidden_size, c.hc_low_rank, stream_,
-                        up_type, inject_type)) {
+                        up_type, inject_type, xn_half_stride)) {
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
@@ -2375,7 +2497,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                            fused_inject ? m.inject.data : nullptr, mixed,
                            extras ? static_cast<__half*>(s_.x_half) : nullptr,
                            q8t_copy ? s_.x_q8t : nullptr, inject, n_tokens,
-                           c.hidden_size, stream_, inject_type);
+                           c.hidden_size, stream_, inject_type, xn_half_stride);
     }
     if (extras) {
       half_src_ = mixed;
@@ -3378,8 +3500,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         auto dispatch = std::tie(
             moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
             q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
-            half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
-            xn_q8_ready_, mixed_q8_ready_);
+            half_bf16_, xn_half_, xn_half_pitch_, inject_parts_, inject_fused_,
+            q8_slot_, xn_q8_ready_, mixed_q8_ready_);
         const auto before = std::apply(
             [](const auto&... fields) { return std::make_tuple(fields...); },
             dispatch);
@@ -3639,12 +3761,16 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
+    // The K-quant/IQ projections and 16-bit alpha/beta/indexer matrices read
+    // the same producer-written F16 rows as the Q8_0 stacks' F16 route.
     const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
-                           l.linear && DenseF16Route(l.ssm_in, n) &&
-                           l.ssm_alpha_beta.type == GgmlType::kF16 &&
-                           l.ssm_alpha_beta.cols == l.ssm_in.cols;
+                           ((l.linear && DenseF16Route(l.ssm_in, n) &&
+                             l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                             l.ssm_alpha_beta.cols == l.ssm_in.cols) ||
+                            (c.hidden_size <= model_->max_half_cols() &&
+                             AttentionUsesMixedHalf(l)));
     if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-               half_only)) {
+               half_only, false, AttentionUsesMixedQ8(l))) {
       return false;
     }
     // The last target layer's query outputs have no later cache consumer.
@@ -3676,8 +3802,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
             : nullptr;
-    const float* next_inject =
+    const void* next_inject =
         next_norm != nullptr ? InjectWeights(layers[il + 1].hc_attn) : nullptr;
+    const WeightType next_inject_type = next_norm != nullptr
+                                            ? InjectType(layers[il + 1].hc_attn)
+                                            : WeightType::kF32;
     // Cache updates precede the FFN. Without MTP, only requested head rows
     // and the checkpoint frontier consume the final layer's residual.
     // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
@@ -3690,18 +3819,27 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const auto finish = [&](std::uint32_t rows) {
       defer_residual_ = WmmaExperts(l, rows);
       // The wide FFN reads the mix only through its F16 rows (router, routed
-      // experts) and tiled Q8 rows (shared expert).
-      const bool no_f32 = prefill_phase && defer_residual_ &&
-                          rows <= options_.max_batch &&
-                          l.router.type == GgmlType::kF16 &&
-                          l.shexp_gate.type == GgmlType::kQ8_0 &&
-                          l.shexp_up.type == GgmlType::kQ8_0;
-      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn));
+      // experts) and tiled Q8 rows (shared expert). The GSQ mixes' BF16
+      // router and K-quant/IQ shared-expert pair read those same F16 rows.
+      const bool no_f32 =
+          prefill_phase && defer_residual_ && rows <= options_.max_batch &&
+          ((l.router.type == GgmlType::kF16 &&
+            l.shexp_gate.type == GgmlType::kQ8_0 &&
+            l.shexp_up.type == GgmlType::kQ8_0) ||
+           (c.hidden_size <= model_->max_half_cols() && MoeUsesMixedHalf(l)));
+      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
+              MixerNormUsesQ8(l.hc_ffn), MixerNormUsesQ8_1(l.hc_ffn),
+              InjectType(l.hc_ffn), MixerNormPadded(l.hc_ffn, rows, c));
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32) ||
+                 false, no_f32, MoeUsesMixedQ8(l)) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
-      Combine(s_.res, next_norm, rows, next_inject);
+      Combine(s_.res, next_norm, rows, next_inject,
+              next_norm != nullptr && MixerNormUsesQ8(layers[il + 1].hc_attn),
+              next_norm != nullptr && MixerNormUsesQ8_1(layers[il + 1].hc_attn),
+              next_inject_type,
+              next_norm != nullptr &&
+                  MixerNormPadded(layers[il + 1].hc_attn, rows, c));
       return true;
     };
     if (skipped != 0) {
@@ -4965,7 +5103,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
       return false;
   }
-  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
+  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows, nullptr,
+          MixerNormUsesQ8(l.hc_ffn), MixerNormUsesQ8_1(l.hc_ffn),
+          WeightType::kF32, MixerNormPadded(l.hc_ffn, tail_rows, c));
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->attention))
     return false;
   if (!session.CheckCancellation(error_msg))

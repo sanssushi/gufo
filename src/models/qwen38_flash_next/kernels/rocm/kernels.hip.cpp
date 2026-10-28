@@ -44,6 +44,14 @@ __device__ __forceinline__ float Materialize(float v) {
   return v;
 }
 
+/// SiLU of a scaled hyper-connection down-projection row. The scaled value
+/// and the SiLU result are materialized so the fused epilogue rounds them at
+/// the same F32 boundaries as SiluScaleKernel followed by NarrowActivations.
+__device__ __forceinline__ float SiluScaleElement(float v, float scale) {
+  const float t = Materialize(v * scale);
+  return Materialize(SiluF(t));
+}
+
 /// Lane i receives lane (i ^ offset)'s value, as __shfl_xor(v, offset) does
 /// across a wave32. On gfx1151 it is a DPP row_xmask (offsets below 16) or
 /// v_permlanex16 (16): a register move instead of an LDS crossbar round trip
@@ -505,12 +513,15 @@ template<bool kMix = true, bool kInjBf16 = false>
 __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
                                        const void* inject_w, float* mixed,
                                        __half* mixed_half, void* mixed_q8,
-                                       float* inject, std::uint32_t hidden) {
+                                       float* inject, std::uint32_t hidden,
+                                       std::uint32_t norm_stride = 0) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t part = blockIdx.x;
   const std::uint32_t t = blockIdx.y;
   const std::uint32_t i = (part * blockDim.x + threadIdx.x) * 4;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::size_t row =
+      static_cast<std::size_t>(t) * (norm_stride != 0 ? norm_stride : hc_dim);
   const bool live = i < hidden;
   float4 wq[kStreams][kStreams];
 #pragma unroll
@@ -533,11 +544,12 @@ __global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
   float4 acc{0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
-    const std::size_t idx = (static_cast<std::size_t>(t) * hc_dim) +
-                            (static_cast<std::size_t>(s) * hidden) + i;
+    const std::size_t gate_idx = (static_cast<std::size_t>(t) * hc_dim) +
+                                 (static_cast<std::size_t>(s) * hidden) + i;
+    const std::size_t idx = row + (static_cast<std::size_t>(s) * hidden) + i;
     v[s] = live ? Load4(xn + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
     if (kMix && live) {
-      const float4 g = *reinterpret_cast<const float4*>(gate + idx);
+      const float4 g = *reinterpret_cast<const float4*>(gate + gate_idx);
       acc.x = __fmaf_rn(v[s].x, SigmoidF(g.x), acc.x);
       acc.y = __fmaf_rn(v[s].y, SigmoidF(g.y), acc.y);
       acc.z = __fmaf_rn(v[s].z, SigmoidF(g.z), acc.z);
@@ -700,13 +712,18 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
                                 const float* inject, std::uint32_t inject_parts,
                                 const float* gamma, XnT* xn, void* xn_q8,
                                 std::uint32_t hidden, std::uint32_t streams,
-                                float eps, void* xn_q8_1) {
+                                float eps, void* xn_q8_1,
+                                std::uint32_t xn_stride = 0) {
   __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
   const float* parts =
       inject + (static_cast<std::size_t>(t) * streams + s) * inject_parts;
   const std::size_t base = (static_cast<std::size_t>(t) * streams + s) * hidden;
+  const std::size_t xn_row =
+      xn_stride != 0 ? xn_stride : static_cast<std::size_t>(hidden) * streams;
+  const std::size_t xn_base = static_cast<std::size_t>(t) * xn_row +
+                              static_cast<std::size_t>(s) * hidden;
   float* dst = res + base;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
   const float* g = gamma + static_cast<std::size_t>(s) * hidden;
@@ -753,7 +770,7 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
       const std::uint32_t i = threadIdx.x + c * blockDim.x;
       if (i < hidden) {
         const float v = r[c] * scale * gv[c];
-        xn[base + i] = static_cast<XnT>(v);
+        xn[xn_base + i] = static_cast<XnT>(v);
         if (xn_q8_1 != nullptr) {
           QuantizeQ8_1Lane(v, xn_q8_1, base + i);
         }
@@ -779,7 +796,7 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   const float scale = rsqrtf(ss / static_cast<float>(hidden) + eps);
   for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
     const float v = dst[i] * scale * g[i];
-    xn[base + i] = static_cast<XnT>(v);
+    xn[xn_base + i] = static_cast<XnT>(v);
     if (xn_q8_1 != nullptr) {
       // The small-batch mixer down projection's input, as mmq would
       // quantize xn (float rows only; hidden % 32 == 0).
@@ -794,9 +811,12 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
 /// Writes inject partial `part` of token t (HcMixEpilogueF16Kernel<false>'s
 /// grid (part, t)): `xh` holds this thread's four F16-rounded norm streams
 /// at element (part * kThreads + threadIdx.x) * 4, zero past the row.
-/// Reuses `shared` behind a barrier.
+/// `kInjBf16` selects the inject weight encoding; BF16 expands exactly, so
+/// both encodings share one dot-product order. Reuses `shared` behind a
+/// barrier.
+template<bool kInjBf16>
 __device__ __forceinline__ void HcInjectPart(
-    const float4 (&xh)[4], const float* inject_w, float* inject,
+    const float4 (&xh)[4], const void* inject_w, float* inject,
     float (*shared)[8], std::uint32_t t, std::uint32_t part,
     std::uint32_t parts, std::uint32_t hidden) {
   constexpr std::uint32_t kStreams = 4;
@@ -811,10 +831,11 @@ __device__ __forceinline__ void HcInjectPart(
     float4 wq[kStreams];
 #pragma unroll
     for (std::uint32_t s = 0; s < kStreams; ++s) {
-      wq[s] = live ? *reinterpret_cast<const float4*>(
-                         inject_w + (static_cast<std::size_t>(o) * hc_dim) +
-                         (static_cast<std::size_t>(s) * hidden) + i)
-                   : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      wq[s] =
+          live ? InjectLoad4<kInjBf16>(
+                     inject_w, (static_cast<std::size_t>(o) * hc_dim) +
+                                   (static_cast<std::size_t>(s) * hidden) + i)
+               : float4{0.0F, 0.0F, 0.0F, 0.0F};
     }
     // The separate kernel's sum from zero: one product, then FMAs in stream
     // and component order.
@@ -854,12 +875,14 @@ __device__ __forceinline__ void HcInjectPart(
 /// between the two passes, reduces the four stream norms in one block
 /// reduction, and quantizes each 32-wide block over its eight lanes with a
 /// four-code store. Rows of four streams up to 2,560 wide.
-template<typename XnT, bool kDefer = false, bool kInject = false>
+template<typename XnT, bool kDefer = false, bool kInject = false,
+         bool kInjBf16 = false>
 __global__ void HcCombineVec4Kernel(
     float* res, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, XnT* xn, void* xn_q8,
     std::uint32_t hidden, float eps, float* defer_w,
-    const float* inject_w = nullptr, float* inject_out = nullptr) {
+    const void* inject_w = nullptr, float* inject_out = nullptr,
+    std::uint32_t xn_stride = 0) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
   __shared__ float shared[kStreams][kThreads / 32];
@@ -867,6 +890,7 @@ __global__ void HcCombineVec4Kernel(
   __shared__ __half2 s_xn[kInject ? kMaxChunks * kThreads * 2 : 1];
   const std::uint32_t t = blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::size_t xn_row = xn_stride != 0 ? xn_stride : hc_dim;
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
@@ -953,7 +977,7 @@ __global__ void HcCombineVec4Kernel(
       const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
       n = float4{v[c].x * sc * gm.x, v[c].y * sc * gm.y, v[c].z * sc * gm.z,
                  v[c].w * sc * gm.w};
-      XnT* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
+      XnT* out = xn + (static_cast<std::size_t>(t) * xn_row) + e;
       if constexpr (std::is_same_v<XnT, float>) {
         *reinterpret_cast<float4*>(out) = n;
       } else {
@@ -1019,7 +1043,8 @@ __global__ void HcCombineVec4Kernel(
                            __high2float(hi)};
         }
       }
-      HcInjectPart(part, inject_w, inject_out, shared, t, c, parts, hidden);
+      HcInjectPart<kInjBf16>(part, inject_w, inject_out, shared, t, c, parts,
+                             hidden);
     }
   }
 }
@@ -1032,19 +1057,20 @@ __global__ void HcCombineVec4Kernel(
 /// output never round-trips memory. Threads own hidden lanes (up to three
 /// float4 each) across the four streams.
 template<bool kNormalize, typename ExpertT, bool kPrior = false,
-         bool kInject = false>
+         bool kInject = false, bool kInjBf16 = false>
 __global__ void HcCombineMoeKernel(
     float* res, const ExpertT* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
     std::uint32_t used, const float* inject, std::uint32_t inject_parts,
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t hidden,
     float eps, const float* prior_out, const float* prior_w,
-    const float* inject_w, float* inject_out) {
+    const void* inject_w, float* inject_out, std::uint32_t xn_stride = 0) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 3;  // 2560 / 4 / kThreads, rounded up
   __shared__ float shared[kStreams][kThreads / 32];
   const std::uint32_t t = blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const std::size_t xn_row = xn_stride != 0 ? xn_stride : hc_dim;
   float w[kStreams];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
@@ -1183,7 +1209,7 @@ __global__ void HcCombineMoeKernel(
                    __fmul_rn(gm.z, scale[s]), __fmul_rn(gm.w, scale[s])};
         n = float4{__fmul_rn(v[s][c].x, g.x), __fmul_rn(v[s][c].y, g.y),
                    __fmul_rn(v[s][c].z, g.z), __fmul_rn(v[s][c].w, g.w)};
-        __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
+        __half* out = xn + (static_cast<std::size_t>(t) * xn_row) + e;
         const __half2 lo = __floats2half2_rn(n.x, n.y);
         const __half2 hi = __floats2half2_rn(n.z, n.w);
         *reinterpret_cast<__half2*>(out) = lo;
@@ -1192,6 +1218,9 @@ __global__ void HcCombineMoeKernel(
           xh[s][c] = float4{__low2float(lo), __high2float(lo), __low2float(hi),
                             __high2float(hi)};
         }
+      }
+      if (xn_q8 == nullptr) {
+        continue;
       }
       // Eight lanes hold one 32-wide block: absmax over them, then each
       // lane stores its four codes as one word.
@@ -1232,7 +1261,8 @@ __global__ void HcCombineMoeKernel(
       if (c >= parts)
         break;
       const float4 part[kStreams] = {xh[0][c], xh[1][c], xh[2][c], xh[3][c]};
-      HcInjectPart(part, inject_w, inject_out, shared, t, c, parts, hidden);
+      HcInjectPart<kInjBf16>(part, inject_w, inject_out, shared, t, c, parts,
+                             hidden);
     }
   }
 }
@@ -6203,20 +6233,21 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           const void* inject_w, float* mixed,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
-                          hipStream_t stream, WeightType inject_type) {
+                          hipStream_t stream, WeightType inject_type,
+                          std::uint32_t norm_stride) {
   const bool bf16 = inject_type == WeightType::kBF16;
   if (hidden % 32 == 0) {
     if (bf16) {
       hipLaunchKernelGGL((HcMixEpilogueF16Kernel<true, true>),
                          dim3(HcInjectPartsVec4(hidden), n_tokens),
                          dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                         mixed_half, mixed_q8, inject, hidden);
+                         mixed_half, mixed_q8, inject, hidden, norm_stride);
       return;
     }
     hipLaunchKernelGGL((HcMixEpilogueF16Kernel<true, false>),
                        dim3(HcInjectPartsVec4(hidden), n_tokens),
                        dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                       mixed_half, mixed_q8, inject, hidden);
+                       mixed_half, mixed_q8, inject, hidden, norm_stride);
     return;
   }
   if (bf16) {
@@ -6281,23 +6312,26 @@ static bool HcCombineMoeLaunch(
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t n_tokens,
     std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
     const float* prior_out = nullptr, const float* prior_w = nullptr,
-    float* inject_out = nullptr, const float* inject_w = nullptr) {
+    float* inject_out = nullptr, const void* inject_w = nullptr,
+    WeightType inject_type = WeightType::kF32, std::uint32_t norm_stride = 0) {
   if (streams != 4 || hidden % 128 != 0 || hidden > 3 * 4 * kThreads ||
-      (gamma != nullptr && xn_q8 == nullptr) ||
       (inject_w != nullptr && (gamma == nullptr || prior_out == nullptr))) {
     return false;
   }
-  const auto combine = inject_w != nullptr
-                           ? HcCombineMoeKernel<true, ExpertT, true, true>
-                       : prior_out != nullptr
-                           ? (gamma ? HcCombineMoeKernel<true, ExpertT, true>
-                                    : HcCombineMoeKernel<false, ExpertT, true>)
-                           : (gamma ? HcCombineMoeKernel<true, ExpertT>
-                                    : HcCombineMoeKernel<false, ExpertT>);
+  const auto combine =
+      inject_w != nullptr
+          ? (inject_type == WeightType::kBF16
+                 ? HcCombineMoeKernel<true, ExpertT, true, true, true>
+                 : HcCombineMoeKernel<true, ExpertT, true, true>)
+      : prior_out != nullptr
+          ? (gamma ? HcCombineMoeKernel<true, ExpertT, true>
+                   : HcCombineMoeKernel<false, ExpertT, true>)
+          : (gamma ? HcCombineMoeKernel<true, ExpertT>
+                   : HcCombineMoeKernel<false, ExpertT>);
   hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                      expert_out, weights, shared_out, gate, gate_stride, used,
                      inject, inject_parts, gamma, xn, xn_q8, hidden, eps,
-                     prior_out, prior_w, inject_w, inject_out);
+                     prior_out, prior_w, inject_w, inject_out, norm_stride);
   return true;
 }
 
@@ -6309,11 +6343,12 @@ bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, float eps, hipStream_t stream,
                      const float* prior_out, const float* prior_w,
-                     float* inject_out, const float* inject_w) {
-  return HcCombineMoeLaunch(res, expert_out, weights, shared_out, gate,
-                            gate_stride, used, inject, inject_parts, gamma, xn,
-                            xn_q8, n_tokens, hidden, streams, eps, stream,
-                            prior_out, prior_w, inject_out, inject_w);
+                     float* inject_out, const void* inject_w,
+                     WeightType inject_type, std::uint32_t norm_stride) {
+  return HcCombineMoeLaunch(
+      res, expert_out, weights, shared_out, gate, gate_stride, used, inject,
+      inject_parts, gamma, xn, xn_q8, n_tokens, hidden, streams, eps, stream,
+      prior_out, prior_w, inject_out, inject_w, inject_type, norm_stride);
 }
 
 bool HcCombineMoeF32(float* res, const float* expert_out, const float* weights,
@@ -6322,10 +6357,12 @@ bool HcCombineMoeF32(float* res, const float* expert_out, const float* weights,
                      const float* inject, std::uint32_t inject_parts,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, float eps, hipStream_t stream) {
-  return HcCombineMoeLaunch(res, expert_out, weights, shared_out, gate,
-                            gate_stride, used, inject, inject_parts, gamma, xn,
-                            xn_q8, n_tokens, hidden, streams, eps, stream);
+                     std::uint32_t streams, float eps, hipStream_t stream,
+                     std::uint32_t norm_stride) {
+  return HcCombineMoeLaunch(
+      res, expert_out, weights, shared_out, gate, gate_stride, used, inject,
+      inject_parts, gamma, xn, xn_q8, n_tokens, hidden, streams, eps, stream,
+      nullptr, nullptr, nullptr, nullptr, WeightType::kF32, norm_stride);
 }
 
 /// res[t][s][i] += block_out[t][i] * w[t][s], the update a deferring
@@ -6360,29 +6397,39 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
-                  float* defer_w, float* inject_out, const float* inject_w) {
+                  float* defer_w, float* inject_out, const void* inject_w,
+                  WeightType inject_type, std::uint32_t norm_stride) {
   // F16 prefill keeps the same reduction even for a one-token tail.
   if (streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
     if (inject_w != nullptr && defer_w != nullptr && gamma != nullptr) {
       // The inject partials may replace the logits this combine reads;
       // every thread reads them before its first barrier.
-      hipLaunchKernelGGL((HcCombineVec4Kernel<__half, true, true>),
-                         dim3(n_tokens), dim3(kThreads), 0, stream, res,
-                         block_out, inject, inject_parts, gamma, xn, xn_q8,
-                         hidden, eps, defer_w, inject_w, inject_out);
+      if (inject_type == WeightType::kBF16) {
+        hipLaunchKernelGGL((HcCombineVec4Kernel<__half, true, true, true>),
+                           dim3(n_tokens), dim3(kThreads), 0, stream, res,
+                           block_out, inject, inject_parts, gamma, xn, xn_q8,
+                           hidden, eps, defer_w, inject_w, inject_out,
+                           norm_stride);
+      } else {
+        hipLaunchKernelGGL((HcCombineVec4Kernel<__half, true, true>),
+                           dim3(n_tokens), dim3(kThreads), 0, stream, res,
+                           block_out, inject, inject_parts, gamma, xn, xn_q8,
+                           hidden, eps, defer_w, inject_w, inject_out,
+                           norm_stride);
+      }
       return true;
     }
     const auto combine = defer_w != nullptr ? HcCombineVec4Kernel<__half, true>
                                             : HcCombineVec4Kernel<__half>;
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
                        block_out, inject, inject_parts, gamma, xn, xn_q8,
-                       hidden, eps, defer_w, nullptr, nullptr);
+                       hidden, eps, defer_w, nullptr, nullptr, norm_stride);
     return defer_w != nullptr;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, xn_q8, hidden, streams, eps,
-                     nullptr);
+                     nullptr, norm_stride);
   return false;
 }
 
@@ -7021,7 +7068,7 @@ template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
          bool kHalfWeights = false, bool kBf16 = false, bool kStrided = false,
          bool kYarn = false, bool kStageBf16 = false,
-         core::GgmlType kQType = core::GgmlType::kQ8_0>
+         core::GgmlType kQType = core::GgmlType::kQ8_0, bool kHcSilu = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -7029,7 +7076,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     void* mixed_q8 = nullptr, const float* conv_w = nullptr,
     float* conv_out = nullptr, AttentionProjectionOutput attention = {},
     std::uint32_t checkpoint_tokens = 0, std::size_t input_stride = 0,
-    std::uint32_t first_row_tile = 0) {
+    std::uint32_t first_row_tile = 0, std::size_t norm_stride = 0,
+    float silu_scale = 0.0F) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
@@ -7478,94 +7526,106 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   }
 
   if constexpr (kHcMix) {
-    static_assert(BM == 256 && BN == 128 && BK == 1 && WM == 4 && WN == 2);
+    static_assert((BM == 128 || BM == 256) && BN == 128 && BK == 1 && WM == 4 &&
+                  WN == 2);
     constexpr unsigned kHiddenTile = BM / 4;
+    // 256 threads cover kHiddenTile/4 tokens per pass, four hidden values
+    // each: 16 tokens for a 256-row tile, 32 for the 128-row BF16 tile.
+    constexpr unsigned kEpilogueTokens = 1024 / kHiddenTile;
+    constexpr unsigned kTilesPerPass = kEpilogueTokens / 16;
+    constexpr unsigned kPassesPerGroup = kWaveTokTiles / kTilesPerPass;
+    static_assert(4096 % BM == 0 && BN % kEpilogueTokens == 0);
+    static_assert(kWaveTokTiles % kTilesPerPass == 0);
     constexpr unsigned kStreamStride = kHiddenTile + 1;
-    constexpr unsigned kPlane = 16 * kStreamStride;
+    constexpr unsigned kPlane = kEpilogueTokens * kStreamStride;
     static_assert(4 * kPlane * sizeof(float) <= sizeof(s_lds));
     float* gates = reinterpret_cast<float*>(s_lds);
     const std::size_t hidden = m / 4;
 #pragma unroll
-    for (int j = 0; j < kWaveTokTiles; ++j) {
+    for (unsigned pass = 0; pass < BN / kEpilogueTokens; ++pass) {
+      const unsigned token_group = pass / kPassesPerGroup;
+      if (wave_tok == token_group) {
+        const unsigned j0 = (pass % kPassesPerGroup) * kTilesPerPass;
 #pragma unroll
-      for (int token_group = 0; token_group < WN; ++token_group) {
-        if (wave_tok == token_group) {
+        for (unsigned q = 0; q < kTilesPerPass; ++q) {
 #pragma unroll
           for (int i = 0; i < kWaveRowTiles; ++i) {
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
               const unsigned row =
                   (wave_row * kWaveRowTiles + i) * 16 + 2 * l + half_id;
-              gates[(row % 4) * kPlane + sub_lane * kStreamStride + row / 4] =
-                  acc[i][j][l];
+              gates[(row % 4) * kPlane + (q * 16 + sub_lane) * kStreamStride +
+                    row / 4] = acc[i][j0 + q][l];
             }
           }
         }
-        __syncthreads();
-        // A half-wave writes all 64 hidden values of one token. The stream
-        // planes are padded to avoid the gate transpose's LDS bank conflicts.
-        const unsigned token_in_tile = tid / (kHiddenTile / 4);
-        const unsigned h_local = (tid % (kHiddenTile / 4)) * 4;
-        const std::size_t token =
-            t_block + (token_group * kWaveTokTiles + j) * 16 + token_in_tile;
-        const std::size_t h = r_block / 4 + h_local;
-        if (token < batch) {
-          float4 value{0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
-          for (unsigned stream = 0; stream < 4; ++stream) {
-            const float* g = gates + stream * kPlane +
-                             token_in_tile * kStreamStride + h_local;
-            const float4 v = Load4(xn + token * m + stream * hidden + h);
-            // Preserve the separate mixer's F32 FMA rounding.
-            value.x = __fmaf_rn(v.x, SigmoidF(g[0]), value.x);
-            value.y = __fmaf_rn(v.y, SigmoidF(g[1]), value.y);
-            value.z = __fmaf_rn(v.z, SigmoidF(g[2]), value.z);
-            value.w = __fmaf_rn(v.w, SigmoidF(g[3]), value.w);
-          }
-          value.x *= 0.25F;
-          value.y *= 0.25F;
-          value.z *= 0.25F;
-          value.w *= 0.25F;
-          if (y != nullptr)
-            *reinterpret_cast<float4*>(y + token * hidden + h) = value;
-          if (mixed_half != nullptr) {
-            *reinterpret_cast<__half2*>(mixed_half + token * hidden + h) =
-                __floats2half2_rn(value.x, value.y);
-            *reinterpret_cast<__half2*>(mixed_half + token * hidden + h + 2) =
-                __floats2half2_rn(value.z, value.w);
-          }
-          if (mixed_q8 != nullptr) {
-            float max_abs = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
-                                  fmaxf(fabsf(value.z), fabsf(value.w)));
-#pragma unroll
-            for (int off = 4; off > 0; off >>= 1) {
-              max_abs = fmaxf(max_abs, XorLane(max_abs, off));
-            }
-            const float d = max_abs / 127.0F;
-            const float id = d != 0.0F ? 1.0F / d : 0.0F;
-            const auto q0 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.x * id))));
-            const auto q1 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.y * id))));
-            const auto q2 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.z * id))));
-            const auto q3 = static_cast<unsigned>(static_cast<unsigned char>(
-                static_cast<signed char>(roundf(value.w * id))));
-            const unsigned pos = h % 32;
-            auto* tile = Q8ActTile(mixed_q8, hidden / 32,
-                                   token / kQ8ActTileTokens, h / 32);
-            const std::size_t tl = token % kQ8ActTileTokens;
-            *reinterpret_cast<unsigned*>(tile + (pos >> 4) * 256 + tl * 16 +
-                                         (pos & 15)) =
-                q0 | q1 << 8 | q2 << 16 | q3 << 24;
-            if (pos == 0) {
-              *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
-                                        tl * sizeof(float)) = d;
-            }
-          }
-        }
-        __syncthreads();
       }
+      __syncthreads();
+      // A half-wave writes all kHiddenTile hidden values of one token. The
+      // stream planes are padded to avoid the gate transpose's LDS bank
+      // conflicts.
+      const unsigned token_in_tile = tid / (kHiddenTile / 4);
+      const unsigned h_local = (tid % (kHiddenTile / 4)) * 4;
+      const std::size_t token =
+          t_block + pass * kEpilogueTokens + token_in_tile;
+      const std::size_t h = r_block / 4 + h_local;
+      if (token < batch) {
+        float4 value{0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+        for (unsigned stream = 0; stream < 4; ++stream) {
+          const float* g =
+              gates + stream * kPlane + token_in_tile * kStreamStride + h_local;
+          const std::size_t xn_row = norm_stride != 0 ? norm_stride : m;
+          const float4 v = Load4(xn + token * xn_row + stream * hidden + h);
+          // Preserve the separate mixer's F32 FMA rounding.
+          value.x = __fmaf_rn(v.x, SigmoidF(g[0]), value.x);
+          value.y = __fmaf_rn(v.y, SigmoidF(g[1]), value.y);
+          value.z = __fmaf_rn(v.z, SigmoidF(g[2]), value.z);
+          value.w = __fmaf_rn(v.w, SigmoidF(g[3]), value.w);
+        }
+        value.x *= 0.25F;
+        value.y *= 0.25F;
+        value.z *= 0.25F;
+        value.w *= 0.25F;
+        if (y != nullptr)
+          *reinterpret_cast<float4*>(y + token * hidden + h) = value;
+        if (mixed_half != nullptr) {
+          *reinterpret_cast<__half2*>(mixed_half + token * hidden + h) =
+              __floats2half2_rn(value.x, value.y);
+          *reinterpret_cast<__half2*>(mixed_half + token * hidden + h + 2) =
+              __floats2half2_rn(value.z, value.w);
+        }
+        if (mixed_q8 != nullptr) {
+          float max_abs = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                                fmaxf(fabsf(value.z), fabsf(value.w)));
+#pragma unroll
+          for (int off = 4; off > 0; off >>= 1) {
+            max_abs = fmaxf(max_abs, XorLane(max_abs, off));
+          }
+          const float d = max_abs / 127.0F;
+          const float id = d != 0.0F ? 1.0F / d : 0.0F;
+          const auto q0 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.x * id))));
+          const auto q1 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.y * id))));
+          const auto q2 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.z * id))));
+          const auto q3 = static_cast<unsigned>(static_cast<unsigned char>(
+              static_cast<signed char>(roundf(value.w * id))));
+          const unsigned pos = h % 32;
+          auto* tile = Q8ActTile(mixed_q8, hidden / 32,
+                                 token / kQ8ActTileTokens, h / 32);
+          const std::size_t tl = token % kQ8ActTileTokens;
+          *reinterpret_cast<unsigned*>(tile + (pos >> 4) * 256 + tl * 16 +
+                                       (pos & 15)) =
+              q0 | q1 << 8 | q2 << 16 | q3 << 24;
+          if (pos == 0) {
+            *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
+                                      tl * sizeof(float)) = d;
+          }
+        }
+      }
+      __syncthreads();
     }
     return;
   }
@@ -7653,6 +7713,35 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
                     SsmConv4Value(w3, x0.w, x1.w, x2.w, current.w)};
                 *reinterpret_cast<float4*>(conv_out + tok * channels + row) =
                     value;
+              }
+            }
+          }
+        } else if constexpr (kHcSilu) {
+          // The HC down projection's SiLU and F16 narrowing, fused after the
+          // same transpose so each element keeps the separate chain's F32
+          // multiply, exp and reciprocal rounding.
+          auto* half_out = reinterpret_cast<__half*>(y);
+          if (tok < batch && r0 + 32 <= m && ((tok * m) % 2 == 0)) {
+            __half* dst =
+                half_out + (tok * m) + r0 + static_cast<std::size_t>(row_l);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              const float4 v = src[q];
+              *reinterpret_cast<__half2*>(dst + q * 4) =
+                  __floats2half2_rn(SiluScaleElement(v.x, silu_scale),
+                                    SiluScaleElement(v.y, silu_scale));
+              *reinterpret_cast<__half2*>(dst + q * 4 + 2) =
+                  __floats2half2_rn(SiluScaleElement(v.z, silu_scale),
+                                    SiluScaleElement(v.w, silu_scale));
+            }
+          } else if (tok < batch) {
+#pragma unroll
+            for (int q = 0; q < 16; ++q) {
+              const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
+              if (r < m) {
+                half_out[(tok * m) + r] = __float2half_rn(SiluScaleElement(
+                    tile_scratch[(tok_l * kOutputStride) + row_l + q],
+                    silu_scale));
               }
             }
           }
@@ -7804,7 +7893,8 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   const void* inject_w, float* mixed, __half* mixed_half,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream,
-                  WeightType up_type, WeightType inject_type) {
+                  WeightType up_type, WeightType inject_type,
+                  std::uint32_t norm_stride) {
   if (n_tokens < 96 || hidden != 2560 || rank != 320 || up == nullptr ||
       low_rank == nullptr || xn == nullptr ||
       (mixed == nullptr && mixed_half == nullptr && mixed_q8 == nullptr) ||
@@ -7812,27 +7902,37 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
       (up_type != WeightType::kQ8_0 && up_type != WeightType::kBF16)) {
     return false;
   }
-  const dim3 grid((n_tokens + 127) / 128, 4 * hidden / 256);
+  // The BF16 up tile halves the row count: 128 rows keep the two K16
+  // accumulator chains and the 128-token width at 128 F32 values per thread.
+  const dim3 grid((n_tokens + 127) / 128, up_type == WeightType::kBF16
+                                              ? 4 * hidden / 128
+                                              : 4 * hidden / 256);
   if (up_type == WeightType::kBF16) {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true, false,
-                                           false, true, false, false, true>),
-                       grid, dim3(kThreads), 0, stream, up, low_rank, mixed,
-                       n_tokens, 4 * hidden, rank, xn, mixed_half, mixed_q8);
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<128, 128, 1, 4, 2, 8, true, false, false, true,
+                            false, false, false, true>),
+        grid, dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
+        4 * hidden, rank, xn, mixed_half, mixed_q8, nullptr, nullptr,
+        AttentionProjectionOutput{}, 0, 0, 0, norm_stride);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 4, 2, 8, true>), grid,
                        dim3(kThreads), 0, stream, up, low_rank, mixed, n_tokens,
-                       4 * hidden, rank, xn, mixed_half, mixed_q8);
+                       4 * hidden, rank, xn, mixed_half, mixed_q8, nullptr,
+                       nullptr, AttentionProjectionOutput{}, 0, 0, 0,
+                       norm_stride);
   }
   if (inject_w != nullptr) {
     const dim3 inject_grid(HcInjectPartsVec4(hidden), n_tokens);
     if (inject_type == WeightType::kBF16) {
       hipLaunchKernelGGL((HcMixEpilogueF16Kernel<false, true>), inject_grid,
                          dim3(kThreads), 0, stream, xn, nullptr, inject_w,
-                         nullptr, nullptr, nullptr, inject, hidden);
+                         nullptr, nullptr, nullptr, inject, hidden,
+                         norm_stride);
     } else {
       hipLaunchKernelGGL((HcMixEpilogueF16Kernel<false, false>), inject_grid,
                          dim3(kThreads), 0, stream, xn, nullptr, inject_w,
-                         nullptr, nullptr, nullptr, inject, hidden);
+                         nullptr, nullptr, nullptr, inject, hidden,
+                         norm_stride);
     }
   }
   return true;
@@ -7840,10 +7940,63 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         std::size_t batch, std::size_t m, std::size_t k,
-                        hipStream_t stream, WeightType wtype) {
+                        hipStream_t stream, WeightType wtype,
+                        std::size_t input_stride) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0 ||
       (wtype != WeightType::kF16 && wtype != WeightType::kBF16))
     return false;
+  const bool strided = input_stride != 0 && input_stride != k;
+  if (strided && (wtype != WeightType::kBF16 || m != 320 || k != 10240 ||
+                  batch < 1024 || input_stride < k || input_stride % 8 != 0))
+    return false;
+  // The BF16 mixer up projection at decode: the 64 x 128 plan computes a full
+  // 128-token tile for at most eight rows. A 256 x 16 tile keeps the same
+  // staged BF16 rounding and two K16 accumulator chains at a sixteenth of
+  // the token width.
+  if (wtype == WeightType::kBF16 && m == 10240 && k == 320 && batch <= 8) {
+    const dim3 narrow_grid(static_cast<unsigned int>((batch + 15) / 16),
+                           static_cast<unsigned int>((m + 255) / 256));
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<256, 16, 1, 8, 1, 1, false, false, false, true,
+                            false, false, false, true>),
+        narrow_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    return true;
+  }
+  // Wide BF16 mixer down projection [320, 10240]: the 128-row tile keeps
+  // the same K16 order and stages BF16 rows to F16 at LDS commit, with two
+  // fewer row blocks per token tile than the 5 x 64 plan at this shape.
+  if (wtype == WeightType::kBF16 && m == 320 && k == 10240 && batch >= 1024) {
+    const dim3 wide_grid(static_cast<unsigned int>((batch + 127) / 128),
+                         static_cast<unsigned int>((m + 127) / 128));
+    if (strided) {
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
+                              false, true, false, true>),
+          wide_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k, nullptr,
+          nullptr, nullptr, nullptr, nullptr, AttentionProjectionOutput{}, 0,
+          input_stride);
+    } else {
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
+                              false, false, false, true>),
+          wide_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    }
+    return true;
+  }
+  // BF16 rows over the small-K 16-bit shapes (the 2560-wide router, PLE and
+  // indexer matrices): at 512 or more tokens the 128-row tile halves the
+  // activation traffic and measures faster; below that the 64-row tile keeps
+  // the decode waves. The K order per output is unchanged, so the result is
+  // bit-exact against the 64-row tile.
+  if (wtype == WeightType::kBF16 && k <= 4096 && batch >= 512) {
+    const dim3 wide_grid(static_cast<unsigned int>((batch + 127) / 128),
+                         static_cast<unsigned int>((m + 127) / 128));
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
+                            false, false, false, true>),
+        wide_grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    return true;
+  }
   // 64-row x 128-token tiles (the W8A8 narrow geometry): half the weight
   // re-reads per token tile of the 64 x 64 plan. The K order per output is
   // unchanged, so the results stay bit-exact across the plan and every
@@ -7860,6 +8013,65 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false, false, true>),
       grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+  return true;
+}
+
+bool HcDownF16SiluGemm(const void* w, const __half* x, __half* out,
+                       std::size_t batch, std::size_t m, std::size_t k,
+                       hipStream_t stream, WeightType wtype,
+                       std::size_t input_stride, float scale) {
+  if (m != 320 || k != 10240 || batch < 96 ||
+      (wtype != WeightType::kF16 && wtype != WeightType::kBF16)) {
+    return false;
+  }
+  const bool strided = input_stride != 0 && input_stride != k;
+  if (strided && (wtype != WeightType::kBF16 || batch < 1024 ||
+                  input_stride < k || input_stride % 8 != 0)) {
+    return false;
+  }
+  auto* half_out = reinterpret_cast<float*>(out);
+  if (wtype == WeightType::kBF16 && batch >= 1024) {
+    const dim3 wide_grid(static_cast<unsigned int>((batch + 127) / 128),
+                         static_cast<unsigned int>((m + 127) / 128));
+    if (strided) {
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
+                              false, true, false, true, core::GgmlType::kQ8_0,
+                              true>),
+          wide_grid, dim3(kThreads), 0, stream, w, x, half_out, batch, m, k,
+          nullptr, nullptr, nullptr, nullptr, nullptr,
+          AttentionProjectionOutput{}, 0, input_stride, 0, 0, scale);
+    } else {
+      hipLaunchKernelGGL(
+          (DenseF16GEMMKernel<128, 128, 2, 4, 2, 1, false, false, false, true,
+                              false, false, false, true, core::GgmlType::kQ8_0,
+                              true>),
+          wide_grid, dim3(kThreads), 0, stream, w, x, half_out, batch, m, k,
+          nullptr, nullptr, nullptr, nullptr, nullptr,
+          AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+    }
+    return true;
+  }
+  // The 64-row x 128-token plan that UnquantizedF16Gemm uses for this down
+  // projection outside the wide BF16 branch. BF16 rows round to F16 as they
+  // are staged; F16 rows pass through unchanged.
+  const dim3 grid(static_cast<unsigned int>((batch + 127) / 128),
+                  static_cast<unsigned int>((m + 63) / 64));
+  if (wtype == WeightType::kBF16) {
+    hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
+                                           false, true, false, false, false,
+                                           true, core::GgmlType::kQ8_0, true>),
+                       grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
+                       m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+  } else {
+    hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
+                                           false, true, false, false, false,
+                                           false, core::GgmlType::kQ8_0, true>),
+                       grid, dim3(kThreads), 0, stream, w, x, half_out, batch,
+                       m, k, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       AttentionProjectionOutput{}, 0, 0, 0, 0, scale);
+  }
   return true;
 }
 
