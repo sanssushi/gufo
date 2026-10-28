@@ -194,7 +194,11 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
       return false;
   }
   const bool fused_inject = inject != nullptr && !m.inject.empty() &&
-                            m.inject.type == core::GgmlType::kF32;
+                            (m.inject.type == core::GgmlType::kF32 ||
+                             m.inject.type == core::GgmlType::kBF16);
+  const WeightType inject_type = m.inject.type == core::GgmlType::kBF16
+                                     ? WeightType::kBF16
+                                     : WeightType::kF32;
   const bool separate_inject =
       inject != nullptr && !m.inject.empty() && !fused_inject;
   q8t_src_ = nullptr;
@@ -211,9 +215,9 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
       }
     }
   }
-  HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
+  HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.data : nullptr,
                 mixed, inject, rows, c.hidden_size, c.hc_count, stream_,
-                mixed_q8);
+                mixed_q8, inject_type);
   if (mixed_q8 == s_.mixed_q8_1) {
     mixed_q8_ready_ = {mixed, s_.mixed_q8_1, rows, c.hidden_size};
   } else if (mixed_q8 == s_.x_q8t) {
