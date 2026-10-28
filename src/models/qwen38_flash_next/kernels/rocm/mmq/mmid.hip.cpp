@@ -16,7 +16,9 @@ namespace qfn_mmq {
 //      in-block rank goes to scratch and the block's per-expert counts to
 //      global memory.
 //   2. one thread per expert: prefix over the blocks' counts (block bases)
-//      and the expert bounds.
+//      and the expert bounds. The counts stay read-only and the bases land
+//      in their own block-major region: a read-modify-write of one array
+//      serializes the scan's 80 dependent loads behind its stores.
 //   3. scatter: position = bound[e] + block_base[b][e] + in-block rank.
 // Like llama.cpp's helper, a negative id is counted below every expert (it
 // shifts all bounds by one and leaves its slot unwritten) and an id at or
@@ -83,16 +85,18 @@ static __global__ void mm_ids_rank_kernel(
 }
 
 static __global__ void mm_ids_bounds_kernel(
-        int32_t * __restrict__ block_counts, int32_t * __restrict__ expert_bounds,
+        const int32_t * __restrict__ block_counts, int32_t * __restrict__ block_bases,
+        int32_t * __restrict__ expert_bounds,
         const int n_blocks, const int n_experts) {
     // One block: per-expert totals, then a block-wide exclusive scan over
-    // experts for the bounds. Block counts become block bases in place.
+    // experts for the bounds. The per-block bases land beside the counts so
+    // the scan streams read-only loads and plain stores.
     extern __shared__ int32_t totals[];  // [n_experts + 1]
     for (int e = threadIdx.x; e <= n_experts; e += blockDim.x) {
         int running = 0;
         for (int b = 0; b < n_blocks; ++b) {
             const int c = block_counts[b * (n_experts + 1) + e];
-            block_counts[b * (n_experts + 1) + e] = running;
+            block_bases[b * (n_experts + 1) + e] = running;
             running += c;
         }
         totals[e] = running;
@@ -110,7 +114,7 @@ static __global__ void mm_ids_bounds_kernel(
 
 static __global__ void mm_ids_scatter_kernel(
         const int32_t * __restrict__ ids, const int32_t * __restrict__ local_rank,
-        const int32_t * __restrict__ block_counts,
+        const int32_t * __restrict__ block_bases,
         const int32_t * __restrict__ expert_bounds,
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
         const int n_rows, const int n_experts, const int n_expert_used,
@@ -127,7 +131,7 @@ static __global__ void mm_ids_scatter_kernel(
     const int iex = row - it * n_expert_used;
     const int expert = ids[it * si1 + iex];
     const int pos = expert_bounds[expert] +
-                    block_counts[blockIdx.x * (n_experts + 1) + expert] + rank;
+                    block_bases[blockIdx.x * (n_experts + 1) + expert] + rank;
     ids_src1[pos] = it * sis1 + iex % nchannels_y;
     ids_dst[pos] = it * n_expert_used + iex;
 }
@@ -140,7 +144,7 @@ static void launch_mm_ids_helper_scan(
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
     const int n_rows = n_tokens * n_expert_used;
     const int n_blocks = (n_rows + kIdsRowsPerBlock - 1) / kIdsRowsPerBlock;
-    const size_t need = (size_t)n_rows + (size_t)n_blocks * (n_experts + 1);
+    const size_t need = (size_t)n_rows + (size_t)n_blocks * (n_experts + 1) * 2;
     const size_t lds = (size_t)(n_experts + 1) * kIdsWaves * sizeof(int32_t);
     GGML_ASSERT(n_rows > 0 && lds <= 48 * 1024 && "routed id maps: shape");
     if (need > g_ids_scratch_elems) {
@@ -154,12 +158,13 @@ static void launch_mm_ids_helper_scan(
     }
     int32_t * local_rank = g_ids_scratch;
     int32_t * block_counts = g_ids_scratch + n_rows;
+    int32_t * block_bases = block_counts + (size_t)n_blocks * (n_experts + 1);
     mm_ids_rank_kernel<<<n_blocks, kIdsRowsPerBlock, lds, stream>>>(
         ids, local_rank, block_counts, n_rows, n_experts, n_expert_used, si1);
     mm_ids_bounds_kernel<<<1, 1024, (size_t)(n_experts + 1) * sizeof(int32_t), stream>>>(
-        block_counts, expert_bounds, n_blocks, n_experts);
+        block_counts, block_bases, expert_bounds, n_blocks, n_experts);
     mm_ids_scatter_kernel<<<n_blocks, kIdsRowsPerBlock, 0, stream>>>(
-        ids, local_rank, block_counts, expert_bounds, ids_src1, ids_dst, n_rows,
+        ids, local_rank, block_bases, expert_bounds, ids_src1, ids_dst, n_rows,
         n_experts, n_expert_used, nchannels_y, si1, sis1);
 }
 

@@ -533,8 +533,8 @@ void CheckRoutedQ8Placement() {
            "routed Q8 upload");
   qfn_mmq_set_routed_max_expert_rows(tokens);
   qfn_mmq_set_routed_tile_cols(32);
-  if (qfn_mmq_q8_0_moe_raw(dw, dx, di, dy, rows, cols, tokens, experts, experts,
-                           nullptr) != 0)
+  if (qfn_mmq_moe_raw(static_cast<int>(q::WeightType::kQ8_0), dw, dx, di, dy,
+                      rows, cols, tokens, experts, experts, nullptr) != 0)
     throw std::runtime_error("routed Q8 placement projection failed");
   CheckHip(hipMemcpy(output.data(), dy, output.size() * sizeof(float),
                      hipMemcpyDeviceToHost),

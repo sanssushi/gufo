@@ -44,7 +44,14 @@ extern "C" int qfn_mmq_routed_tile_cols_for_counts(
         const unsigned int *counts, int n_experts) {
 
     if (!counts || n_experts <= 0) return 0;
-    constexpr int kPanel = 16;
+    /* Per tile the kernel re-streams and re-decodes one weight row slice for
+     * every column tile, while the pad columns a wider tile leaves are cheap
+     * fragment work over data already in flight. kPanel is that fixed tile
+     * cost in units of one pad column: forced-width sweeps of the routed
+     * prefill GEMMs put the per-launch optimum at 48 columns at 2048-4096
+     * token chunks, and under-shooting the width costs more than over-shooting
+     * (0.9 vs 0.25 ms per launch), so 32 reproduces the measured optima. */
+    constexpr int kPanel = 32;
     int best_cols = 0;
     long long best_cost = 0;
     for (int w = 16; w <= 80; w += 16) {
@@ -135,7 +142,7 @@ int qfn_mmq_dense_impl(
     char *src1_q8_1 = src1_q8_1_pool.get();
 
         quantize_mmq_q8_1_hip(
-            X_f32, nullptr, (void *)src1_q8_1,
+            X_f32, nullptr, nullptr, (void *)src1_q8_1,
             type, K, (int64_t)K, 0, 0,
             ne10_padded, ne11, ne12, ne13,
             stream);
@@ -207,7 +214,8 @@ int qfn_mmq_moe_impl(
         int             n_experts,
         int             n_expert_used,
         hipStream_t    stream,
-        const void * W_b = nullptr, float *out_b = nullptr) {
+        const void * W_b = nullptr, float *out_b = nullptr,
+        const float * X_up = nullptr) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -218,8 +226,8 @@ int qfn_mmq_moe_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 32 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 32\n", tag, K);
+    if (K % ggml_blck_size(type) != 0) {
+        fprintf(stderr, "%s: K=%d is not a whole weight block\n", tag, K);
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -277,7 +285,7 @@ int qfn_mmq_moe_impl(
     const int64_t s13_src = (int64_t)K * ne11 * ne12;
 
         quantize_mmq_q8_1_hip(
-            X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
+            X_f32, X_up, ids_src1.get(), (void *)src1_q8_1.get(),
             type, K, s11_src, s12_src, s13_src,
             ne10_padded, ne_get_rows, 1, 1,
             stream);
@@ -349,17 +357,37 @@ int qfn_mmq_moe_impl(
     return 0;
 }
 
-static int moe_vector_projection(int weight_type, const void* W,
+// The fused gate/up SwiGLU vector path covers every routed expert format
+// except Q5_1 (down projections only).
+extern "C" int qfn_mmq_moe_gated_type(int weight_type) {
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_Q5_K:
+    case GGML_TYPE_Q6_K:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_Q2_0:
+    case GGML_TYPE_IQ2_XXS:
+    case GGML_TYPE_IQ2_XS:
+    case GGML_TYPE_IQ2_S:
+    case GGML_TYPE_IQ3_XXS:
+    case GGML_TYPE_IQ3_S:
+    case GGML_TYPE_IQ4_NL:
+    case GGML_TYPE_IQ4_XS:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static int moe_vector_projection(const char* tag, int weight_type, const void* W,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_f32, int M, int K, int n_tokens,
                                  int n_experts, int n_expert_used,
                                  hipStream_t stream, const void* W_b,
                                  float* out_b, bool gated,
                                  const void* X_q8 = nullptr) {
-  constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
-  if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0) {
+  if (!qfn_mmq_moe_gated_type(weight_type) && type != GGML_TYPE_Q5_1) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -503,9 +531,9 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
                                int n_experts, int n_expert_used,
                                hipStream_t stream, const void* W_b,
                                float* out_b) {
-  return moe_vector_projection(weight_type, W, X_f32, ids, out_f32, M, K,
-                               n_tokens, n_experts, n_expert_used, stream, W_b,
-                               out_b, false);
+  return moe_vector_projection("qfn_mmq_moe_vec", weight_type, W, X_f32, ids,
+                               out_f32, M, K, n_tokens, n_experts, n_expert_used,
+                               stream, W_b, out_b, false);
 }
 
 extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
@@ -513,9 +541,9 @@ extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
                                      const int32_t* ids, float* out, int m,
                                      int k, int tokens, int experts,
                                      int experts_used, hipStream_t stream) {
-  return moe_vector_projection(weight_type, gate, x, ids, out, m, k, tokens,
-                               experts, experts_used, stream, up, nullptr,
-                               true);
+  return moe_vector_projection("qfn_mmq_moe_gated_vec", weight_type, gate, x,
+                               ids, out, m, k, tokens, experts, experts_used,
+                               stream, up, nullptr, true);
 }
 
 extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
@@ -524,9 +552,9 @@ extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
                                           int m, int k, int tokens, int experts,
                                           int experts_used,
                                           hipStream_t stream) {
-  return moe_vector_projection(weight_type, gate, nullptr, ids, out, m, k,
-                               tokens, experts, experts_used, stream, up,
-                               nullptr, true, x_q8);
+  return moe_vector_projection("qfn_mmq_moe_gated_vec_preq", weight_type, gate,
+                               nullptr, ids, out, m, k, tokens, experts,
+                               experts_used, stream, up, nullptr, true, x_q8);
 }
 
 extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
@@ -538,41 +566,102 @@ extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
       n_expert_used, stream, nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q4_K_moe_raw(
-        const void * W, const float * X, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_moe_raw", W, X, ids, out, M, K,
-                                            n_tokens, n_experts, n_expert_used, stream,
-                                            nullptr, nullptr);
+static int moe_mmq_projection(int weight_type, const char* tag, const void* W,
+                              const float* X_f32, const int32_t* ids,
+                              float* out_f32, int M, int K, int n_tokens,
+                              int n_experts, int n_expert_used,
+                              hipStream_t stream, const void* W_b,
+                              float* out_b, const float* X_up = nullptr) {
+  switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q4_K:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_Q5_K:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q5_K>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_Q6_K:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q6_K>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_Q5_1:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q5_1>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_Q8_0:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q8_0>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_Q2_0:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q2_0>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ2_XXS:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ2_XXS>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ2_XS:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ2_XS>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ2_S:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ2_S>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ3_XXS:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ3_XXS>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ3_S:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ3_S>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ4_NL:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ4_NL>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    case GGML_TYPE_IQ4_XS:
+      return qfn_mmq_moe_impl<GGML_TYPE_IQ4_XS>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
+    default:
+      fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
+      return -1;
+  }
 }
 
-extern "C" int qfn_mmq_q5_1_moe_raw(
-        const void * W, const float * X, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+extern "C" int qfn_mmq_moe_raw(
+        int weight_type, const void * W, const float * X, const int32_t * ids,
+        float * out, int M, int K, int n_tokens, int n_experts, int n_expert_used,
         hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q5_1>("qfn_mmq_q5_1_moe_raw", W, X, ids, out, M, K,
-                                            n_tokens, n_experts, n_expert_used, stream,
-                                            nullptr, nullptr);
+    return moe_mmq_projection(weight_type, "qfn_mmq_moe_raw", W, X, ids, out, M,
+                              K, n_tokens, n_experts, n_expert_used, stream,
+                              nullptr, nullptr);
 }
 
-extern "C" int qfn_mmq_q5_K_moe_raw(
-        const void * W, const float * X, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        hipStream_t stream) {
-    return qfn_mmq_moe_impl<GGML_TYPE_Q5_K>("qfn_mmq_q5_K_moe_raw", W, X, ids, out, M, K,
-                                            n_tokens, n_experts, n_expert_used, stream,
-                                            nullptr, nullptr);
+// The routed down projection over the gate/up pair's SwiGLU: silu(gate)*up is
+// formed in the activation quantize, so the wide pair path skips the separate
+// SwigluKernel pass and its F32 round trip. Codes are bit-identical to
+// SwigluKernel followed by qfn_mmq_moe_raw.
+extern "C" int qfn_mmq_moe_raw_silu(
+        int weight_type, const void * W, const float * gate, const float * up,
+        const int32_t * ids, float * out, int M, int K, int n_tokens,
+        int n_experts, int n_expert_used, hipStream_t stream) {
+    if (!gate || !up) return -1;
+    return moe_mmq_projection(weight_type, "qfn_mmq_moe_raw_silu", W, gate,
+                              ids, out, M, K, n_tokens, n_experts,
+                              n_expert_used, stream, nullptr, nullptr, up);
 }
 
-extern "C" int qfn_mmq_q4_K_moe_pair_unique(
-    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
-    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
-    int n_expert_used, hipStream_t stream) {
+extern "C" int qfn_mmq_moe_pair_unique(
+    int weight_type, const void * W_a, const void * W_b, const float * X,
+    const int32_t * ids, float * out_a, float * out_b, int M, int K,
+    int n_tokens, int n_experts, int n_expert_used, hipStream_t stream) {
     if (!W_b || !out_b) return -1;
-    return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_moe_pair_unique",
-        W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
-        W_b, out_b);
+    return moe_mmq_projection(weight_type, "qfn_mmq_moe_pair_unique", W_a, X,
+                              ids, out_a, M, K, n_tokens, n_experts,
+                              n_expert_used, stream, W_b, out_b);
 }
 
 extern "C" size_t qfn_mmq_q8_1_bytes(int N, int K) {
@@ -729,5 +818,23 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q2_0>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XS>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ3_S>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_NL>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 } // namespace qfn_mmq
