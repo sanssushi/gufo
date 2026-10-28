@@ -198,7 +198,19 @@ bool ReferenceModel::Ple(const LayerWeights& l, std::int32_t token,
   const std::uint32_t hist = c_.PleConvHistory();
   const std::uint32_t kern = c_.ple_conv_kernel;
   const std::uint32_t dil = c_.ple_ngram_size;
-  const auto* conv_w = static_cast<const float*>(l.ple_conv1d.data);
+  std::vector<float> conv_w_store;
+  const float* conv_w = nullptr;
+  if (l.ple_conv1d.type == core::GgmlType::kF32) {
+    conv_w = static_cast<const float*>(l.ple_conv1d.data);
+  } else {
+    conv_w_store.resize(static_cast<std::size_t>(l.ple_conv1d.rows) *
+                        l.ple_conv1d.cols);
+    for (std::uint64_t r = 0; r < l.ple_conv1d.rows; ++r) {
+      cpu::DequantizeRow(l.ple_conv1d, 0, r,
+                         conv_w_store.data() + r * l.ple_conv1d.cols);
+    }
+    conv_w = conv_w_store.data();
+  }
   std::vector<float> conv_out(hc_dim, 0.0F);
   for (std::uint32_t k = 0; k < kern; ++k) {
     const std::uint32_t back = (kern - 1 - k) * dil;

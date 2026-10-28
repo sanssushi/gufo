@@ -128,8 +128,14 @@ __device__ __forceinline__ float RowElement(const void* row, WeightType type,
           static_cast<const void*>(blk + 2))[i % 32];
       return __half2float(d) * static_cast<float>(q);
     }
+    case WeightType::kIQ3_S:
+      return gufo::hip::QuantBlockElement(gufo::core::GgmlType::kIQ3_S, row, i);
+    case WeightType::kIQ4_XS:
+      return gufo::hip::QuantBlockElement(gufo::core::GgmlType::kIQ4_XS, row,
+                                          i);
+    default:
+      __builtin_trap();
   }
-  return 0.0f;
 }
 
 __device__ __forceinline__ std::size_t RowBytes(WeightType type,
@@ -142,8 +148,13 @@ __device__ __forceinline__ std::size_t RowBytes(WeightType type,
       return static_cast<std::size_t>(k) * 2;
     case WeightType::kQ8_0:
       return static_cast<std::size_t>(k / 32) * 34;
+    case WeightType::kIQ3_S:
+      return gufo::hip::QuantRowBytes(gufo::core::GgmlType::kIQ3_S, k);
+    case WeightType::kIQ4_XS:
+      return gufo::hip::QuantRowBytes(gufo::core::GgmlType::kIQ4_XS, k);
+    default:
+      __builtin_trap();
   }
-  return 0;
 }
 
 /// Sum over one wave; every lane receives the total. The wave-per-row
@@ -1463,6 +1474,93 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   }
 }
 
+/// Few-row, long-K 16-bit projections (the hyper-connection down at
+/// [320, 10240]) starve the device of waves, and every wave re-reads the
+/// complete activation block per token. One wave computes kWideGemmRows
+/// weight rows per step, loading each activation fragment once for all of
+/// them. Each row's dot product uses this kernel's eight-element lane
+/// partition, so a row never depends on the token count or the wave's other
+/// rows. Two rows per wave (not four) double the resident waves: the
+/// shape has 320 rows, and 40 blocks hide more of the DRAM latency than the
+/// four-row ILP they trade away (measured 82 -> 116 GB/s cold on gfx1151).
+constexpr unsigned kWideGemmRows = 2;
+template<WeightType type, unsigned tokens>
+__global__ void SmallGemmWideKernel(const void* w, const float* x, float* out,
+                                    std::uint32_t m, std::uint32_t k) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t wave = threadIdx.x / warpSize;
+  const std::uint32_t row0 =
+      (blockIdx.x * (blockDim.x / warpSize) + wave) * kWideGemmRows;
+  float acc[kWideGemmRows][tokens] = {};
+  for (std::uint32_t i0 = lane * 8; i0 < k; i0 += warpSize * 8) {
+    float xv[tokens][8];
+    if (i0 + 8 <= k) {
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+        __builtin_memcpy(xv[j], x + static_cast<std::size_t>(j) * k + i0,
+                         sizeof(xv[j]));
+      }
+    } else {
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          xv[j][r] =
+              i0 + r < k ? x[static_cast<std::size_t>(j) * k + i0 + r] : 0.0f;
+        }
+      }
+    }
+#pragma unroll
+    for (unsigned row = 0; row < kWideGemmRows; ++row) {
+      const std::uint32_t m_row = row0 + row;
+      if (m_row >= m) {
+        break;
+      }
+      const auto* wrow =
+          static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * m_row;
+      float wv[8];
+      if (i0 + 8 <= k) {
+        std::uint16_t packed[8];
+        __builtin_memcpy(packed, wrow + static_cast<std::size_t>(i0) * 2,
+                         sizeof(packed));
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          wv[r] = type == WeightType::kBF16
+                      ? Bf16ToF32(packed[r])
+                      : __half2float(__builtin_bit_cast(__half, packed[r]));
+        }
+      } else {
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          wv[r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
+        }
+      }
+#pragma unroll
+      for (unsigned j = 0; j < tokens; ++j) {
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < 8; ++r) {
+          dot += wv[r] * xv[j][r];
+        }
+        acc[row][j] += dot;
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned row = 0; row < kWideGemmRows; ++row) {
+#pragma unroll
+    for (unsigned j = 0; j < tokens; ++j) {
+      acc[row][j] = WaveSum(acc[row][j]);
+    }
+  }
+  if (lane < kWideGemmRows && row0 + lane < m) {
+#pragma unroll
+    for (unsigned j = 0; j < tokens; ++j) {
+      out[static_cast<std::size_t>(j) * m + row0 + lane] = acc[lane][j];
+    }
+  }
+}
+
 __global__ void PleGateKernel(const float* key_n, const float* query_n,
                               const float* value, float* gated,
                               std::uint32_t hidden, std::uint32_t streams) {
@@ -1485,7 +1583,7 @@ __global__ void PleGateKernel(const float* key_n, const float* query_n,
   }
 }
 
-__global__ void PleConvKernel(const float* in, const float* w,
+__global__ void PleConvKernel(const float* in, const void* w, WeightType wtype,
                               const float* history, float* out,
                               std::uint32_t n_tokens, std::uint32_t channels,
                               std::uint32_t kernel, std::uint32_t dilation,
@@ -1506,7 +1604,7 @@ __global__ void PleConvKernel(const float* in, const float* w,
         src_t >= 0
             ? in[static_cast<std::size_t>(src_t) * channels + c]
             : history[static_cast<std::size_t>(hist + src_t) * channels + c];
-    acc += w[static_cast<std::size_t>(c) * kernel + k] * v;
+    acc += RowElement(w, wtype, static_cast<std::size_t>(c) * kernel + k) * v;
   }
   out[idx] = SiluF(acc);
 }
@@ -7651,10 +7749,45 @@ void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
 }
 
+template<WeightType type, unsigned tokens>
+void LaunchSmallGemmWide(const void* w, const float* x, float* out,
+                         std::uint32_t m, std::uint32_t k, hipStream_t stream) {
+  hipLaunchKernelGGL((SmallGemmWideKernel<type, tokens>),
+                     dim3((m + kSmallGemmRows * kWideGemmRows - 1) /
+                          (kSmallGemmRows * kWideGemmRows)),
+                     dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+}
+
 template<WeightType type>
 void SmallGemmForType(const void* w, const float* x, float* out,
                       std::uint32_t tokens, std::uint32_t m, std::uint32_t k,
                       hipStream_t stream) {
+  // The 16-bit few-row, long-K shapes take the wide waves.
+  constexpr bool kWide = type == WeightType::kBF16 || type == WeightType::kF16;
+  if constexpr (kWide) {
+    if (m <= 512 && k >= 8192 && tokens >= 1 && tokens <= 8) {
+      switch (tokens) {
+        case 1:
+          return LaunchSmallGemmWide<type, 1>(w, x, out, m, k, stream);
+        case 2:
+          return LaunchSmallGemmWide<type, 2>(w, x, out, m, k, stream);
+        case 3:
+          return LaunchSmallGemmWide<type, 3>(w, x, out, m, k, stream);
+        case 4:
+          return LaunchSmallGemmWide<type, 4>(w, x, out, m, k, stream);
+        case 5:
+          return LaunchSmallGemmWide<type, 5>(w, x, out, m, k, stream);
+        case 6:
+          return LaunchSmallGemmWide<type, 6>(w, x, out, m, k, stream);
+        case 7:
+          return LaunchSmallGemmWide<type, 7>(w, x, out, m, k, stream);
+        case 8:
+          return LaunchSmallGemmWide<type, 8>(w, x, out, m, k, stream);
+        default:
+          break;
+      }
+    }
+  }
   if (tokens > 8) {
     const auto groups = tokens / 8;
     hipLaunchKernelGGL((SmallGemmKernel<type, 8, true>),
@@ -7714,15 +7847,15 @@ void PleGate(const float* key_n, const float* query_n, const float* value,
                      stream, key_n, query_n, value, gated, hidden, streams);
 }
 
-void PleConv(const float* in, const float* w, float* history,
+void PleConv(const float* in, const void* w, WeightType wtype, float* history,
              float* history_scratch, float* out, RollbackRows snapshots,
              std::uint32_t n_tokens, std::uint32_t channels,
              std::uint32_t kernel, std::uint32_t dilation, hipStream_t stream) {
   const std::uint32_t hist = (kernel - 1) * dilation;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   hipLaunchKernelGGL(PleConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
-                     stream, in, w, history, out, n_tokens, channels, kernel,
-                     dilation, hist);
+                     stream, in, w, wtype, history, out, n_tokens, channels,
+                     kernel, dilation, hist);
   if (snapshots.rows[0] != nullptr && n_tokens > 1) {
     const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
     hipLaunchKernelGGL(RollingSnapshotKernel, dim3(Blocks(saved * hist)),

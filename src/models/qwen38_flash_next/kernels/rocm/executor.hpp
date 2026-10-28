@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -458,6 +459,11 @@ private:
   };
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                 Q8Input* q, std::string* error_msg) const;
+  /// Quantizes only when a consumer reads the Q8_1 rows (Q8_0 weights);
+  /// every other format quantizes the F32 rows in its own entry.
+  bool QuantizeFor(std::initializer_list<const DeviceTensor*> consumers,
+                   const float* x, std::uint32_t n_tokens, std::uint32_t k,
+                   Q8Input* q, std::string* error_msg) const;
   /// Q8_1 rows of a small-batch input that its producer kernel already
   /// wrote (byte-identical to Quantize's), or null.
   const void* ReadyQ8(const float* x, std::uint32_t n_tokens,

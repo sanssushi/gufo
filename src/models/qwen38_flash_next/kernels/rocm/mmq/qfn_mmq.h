@@ -16,14 +16,21 @@ void qfn_mmq_set_routed_tile_cols(int cols);
 int qfn_mmq_routed_tile_cols_for_counts(const unsigned int *counts,
                                         int n_experts);
 
-int qfn_mmq_q8_0_dense(
-    const void  * W_q8_0,
+// Dense quantized projection out[N][M] = W[M][K] x[N][K] for the loader's
+// dense and shexpert formats.
+int qfn_mmq_dense(
+    int           weight_type,
+    const void  * W,
     const float * X_f32,
     float       * out_f32,
     int           M,
     int           N,
     int           K,
     hipStream_t  stream);
+
+// Dense vector projection, same formats and (M, N, K) order as qfn_mmq_dense.
+int qfn_mmq_dense_vec(int weight_type, const void* W, const float* X_f32,
+                      float* out, int M, int N, int K, hipStream_t stream);
 
 int qfn_mmq_moe_pair_unique(int weight_type, const void* W_a, const void* W_b,
                             const float* X_f32, const int32_t* ids,

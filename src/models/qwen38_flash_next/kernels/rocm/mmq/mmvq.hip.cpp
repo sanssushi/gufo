@@ -366,6 +366,106 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
+// A dense projection routes every token to its single expert slot, so one
+// warp can compute them all per weight-row pair: the token sweep reuses each
+// weight fragment from cache instead of re-reading it once per token wave.
+// Rows, per-token dot products, quantized inputs and reductions are those of
+// the one-token waves above.
+template<ggml_type type, int tokens>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q_dense_multi(const void* __restrict__ weights,
+                                   const void* __restrict__ vy,
+                                   const int32_t* __restrict__ ids,
+                                   float* __restrict__ dst,
+                                   const uint32_t ncols_x,
+                                   const uint32_t nrows_x,
+                                   const uint32_t stride_row_x,
+                                   const uint32_t stride_col_y,
+                                   const uint32_t stride_col_dst) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
+
+  constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
+
+  const int row0 = 2 * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+  // The single expert slot is uniform across the token rows.
+  const int32_t id_raw = ids[0];
+  const bool invalid_id = id_raw < 0;
+  const uint32_t channel_x = invalid_id ? 0u : (uint32_t)id_raw;
+
+  const block_q8_1* y = (const block_q8_1*)vy;
+  uint32_t row_offsets[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        // A ragged tile reads the last valid row again for its unused lane.
+        // Keep the bounds check out of the quantized dot-product loop.
+        const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
+        row_offsets[i] = channel_x*stride_row_x + row*stride_row_x;
+    }
+
+    // partial sum for each token
+    float tmp[tokens][2] = {};
+
+    for (int kbx = threadIdx.x / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+            const block_q8_1* yt = y + t * stride_col_y;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                tmp[t][i] += vec_dot_q_hip(weights, &yt[kby], row_offsets[i] + kbx, kqs);
+            }
+        }
+    }
+
+    // Warp-level reduction only - no shared memory needed
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            tmp[t][i] = warp_reduce_sum<warp_size>(tmp[t][i]);
+        }
+    }
+
+    // Write results
+    if (threadIdx.x < 2 && (uint32_t(row0 + threadIdx.x) < nrows_x)) {
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+            const float value = tmp[t][threadIdx.x];
+            dst[t*stride_col_dst + row0 + threadIdx.x] =
+                isfinite(value) ? value : 0.0f;
+        }
+    }
+}
+
+template<ggml_type type, int tokens = 2>
+static void launch_dense_multi(const void* weights, const block_q8_1* input,
+                               const int32_t* ids, float* output, int k, int rows,
+                               int tokens_, int input_stride,
+                               hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
+  if (tokens_ == tokens) {
+    mul_mat_vec_q_dense_multi<type, tokens>
+        <<<(rows + 1) / 2, 32, 0, stream>>>(
+            weights, input, ids, output, k, rows, k / ggml_blck_size(type),
+            input_stride, rows);
+    return;
+  }
+  if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+    launch_dense_multi<type, tokens + 1>(weights, input, ids, output, k, rows,
+                                         tokens_, input_stride, stream);
+    return;
+  }
+  GGML_ABORT("invalid dense vector batch width");
+}
+
 // Keep one anchor per expert and a slot mask for each token. Duplicate
 // experts share their weights; inactive slots still get explicit zeroes.
 // Two anchor lists follow the groups, each a count and then its anchors in
@@ -889,6 +989,59 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
             break;
         default: GGML_ABORT("unsupported vector weight format");
     }
+}
+
+// The dense projection of a decode or verification batch: every token is
+// routed to the single expert, so the multi-token waves above apply. The
+// caller guarantees n_experts == n_expert_used == 1.
+void mul_mat_vec_dense_multi(const void* weights, ggml_type type,
+                             const block_q8_1* input, const int32_t* ids,
+                             float* output, int k, int rows, int tokens,
+                             int input_stride, hipStream_t stream) {
+#define LAUNCH_DENSE_MULTI(vendored_type)                                   \
+  launch_dense_multi<vendored_type>(weights, input, ids, output, k, rows,   \
+                                    tokens, input_stride, stream)
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_Q4_K);
+      return;
+    case GGML_TYPE_Q5_K:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_Q5_K);
+      return;
+    case GGML_TYPE_Q6_K:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_Q6_K);
+      return;
+    case GGML_TYPE_Q8_0:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_Q8_0);
+      return;
+    case GGML_TYPE_Q2_0:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_Q2_0);
+      return;
+    case GGML_TYPE_IQ2_XXS:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ2_XXS);
+      return;
+    case GGML_TYPE_IQ2_XS:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ2_XS);
+      return;
+    case GGML_TYPE_IQ2_S:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ2_S);
+      return;
+    case GGML_TYPE_IQ3_XXS:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ3_XXS);
+      return;
+    case GGML_TYPE_IQ3_S:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ3_S);
+      return;
+    case GGML_TYPE_IQ4_NL:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ4_NL);
+      return;
+    case GGML_TYPE_IQ4_XS:
+      LAUNCH_DENSE_MULTI(GGML_TYPE_IQ4_XS);
+      return;
+    default:
+      GGML_ABORT("unsupported dense vector weight format");
+  }
+#undef LAUNCH_DENSE_MULTI
 }
 
 template <ggml_type type>

@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/quant/ggml_gemm.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -600,10 +601,10 @@ void CheckDenseAcrossStreams() {
   CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
            "upload");
   const auto dense = [&](int input, hipStream_t stream) {
-    if (qfn_mmq_q8_0_dense(d_w, d_x + input * batch * k,
-                           d_y + input * batch * m, static_cast<int>(m),
-                           static_cast<int>(batch), static_cast<int>(k),
-                           stream) != 0)
+    if (qfn_mmq_dense(static_cast<int>(q::WeightType::kQ8_0), d_w,
+                      d_x + input * batch * k, d_y + input * batch * m,
+                      static_cast<int>(m), static_cast<int>(batch),
+                      static_cast<int>(k), stream) != 0)
       throw std::runtime_error("MMQ dense failed");
   };
   dense(0, nullptr);
@@ -659,9 +660,9 @@ void CheckArenaGrowth() {
   CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
            "upload");
   const auto dense = [&](std::size_t batch, hipStream_t stream) {
-    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
-                           static_cast<int>(batch), static_cast<int>(k),
-                           stream) != 0)
+    if (qfn_mmq_dense(static_cast<int>(q::WeightType::kQ8_0), d_w, d_x, d_y,
+                      static_cast<int>(m), static_cast<int>(batch),
+                      static_cast<int>(k), stream) != 0)
       throw std::runtime_error("MMQ dense failed");
     CheckHip(hipStreamSynchronize(stream), "dense");
     std::vector<float> y(batch * m);
@@ -707,9 +708,9 @@ void CheckArenaGraphReplay() {
   CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
            "upload");
   const auto launch = [&](std::size_t batch, hipStream_t stream) {
-    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
-                           static_cast<int>(batch), static_cast<int>(k),
-                           stream) != 0)
+    if (qfn_mmq_dense(static_cast<int>(q::WeightType::kQ8_0), d_w, d_x, d_y,
+                      static_cast<int>(m), static_cast<int>(batch),
+                      static_cast<int>(k), stream) != 0)
       throw std::runtime_error("MMQ dense failed");
   };
   const auto download = [&](std::size_t batch) {
@@ -799,9 +800,9 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
            "upload");
   CheckHip(hipMemset(d_w8, 0, batch * m * 4), "memset");
   CheckHip(hipMemset(d_f16, 0, batch * m * 4), "memset");
-  if (qfn_mmq_q8_0_dense(d_w, d_x, d_mmq, static_cast<int>(m),
-                         static_cast<int>(batch), static_cast<int>(k),
-                         nullptr) != 0) {
+  if (qfn_mmq_dense(static_cast<int>(q::WeightType::kQ8_0), d_w, d_x, d_mmq,
+                    static_cast<int>(m), static_cast<int>(batch),
+                    static_cast<int>(k), nullptr) != 0) {
     throw std::runtime_error("MMQ dense failed");
   }
   q::QuantizeQ8Tiled(d_x, d_tiled, batch, k, nullptr);
@@ -1257,6 +1258,419 @@ void CheckW8A8PassWidths(std::size_t m, std::size_t k, std::size_t wide,
             << " rows: exact\n";
 }
 
+template<typename T>
+std::vector<T> Download(const T* device, std::size_t count) {
+  std::vector<T> host(count);
+  CheckHip(
+      hipMemcpy(host.data(), device, count * sizeof(T), hipMemcpyDeviceToHost),
+      "download");
+  return host;
+}
+
+std::size_t QuantBlockElements(q::WeightType type) {
+  switch (type) {
+    case q::WeightType::kQ8_0:
+    case q::WeightType::kIQ4_NL:
+      return 32;
+    case q::WeightType::kQ2_0:
+      return 64;
+    default:
+      return 256;
+  }
+}
+
+std::size_t QuantBlockBytes(q::WeightType type) {
+  switch (type) {
+    case q::WeightType::kQ8_0:
+      return 34;
+    case q::WeightType::kQ2_0:
+    case q::WeightType::kIQ4_NL:
+      return 18;
+    case q::WeightType::kQ4_K:
+      return 144;
+    case q::WeightType::kQ5_K:
+      return 176;
+    case q::WeightType::kQ6_K:
+      return 210;
+    case q::WeightType::kIQ2_XXS:
+      return 66;
+    case q::WeightType::kIQ2_XS:
+      return 74;
+    case q::WeightType::kIQ2_S:
+      return 82;
+    case q::WeightType::kIQ3_XXS:
+      return 98;
+    case q::WeightType::kIQ3_S:
+      return 110;
+    case q::WeightType::kIQ4_XS:
+      return 136;
+    default:
+      return 0;
+  }
+}
+
+/// Random packed blocks with safe scales; the values come from the CPU
+/// dequantization oracle, independently of the GPU kernels.
+struct DenseWeights {
+  std::vector<std::uint8_t> packed;
+  std::vector<float> values;
+};
+
+DenseWeights MakeQuant(q::WeightType type, std::size_t m, std::size_t k,
+                       std::uint32_t seed) {
+  const std::size_t elements = QuantBlockElements(type);
+  const std::size_t bytes = QuantBlockBytes(type);
+  const std::size_t blocks = m * (k / elements);
+  DenseWeights w;
+  w.packed.resize(blocks * bytes);
+  w.values.resize(m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * bytes;
+    for (std::size_t i = 0; i < bytes; ++i)
+      blk[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    if (type == q::WeightType::kQ6_K) {
+      std::memcpy(blk + bytes - 2, &d, 2);
+    } else {
+      std::memcpy(blk, &d, 2);
+      if (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K) {
+        const __half dmin = __float2half(Uniform(&seed, 0.01F) + 0.015F);
+        std::memcpy(blk + 2, &dmin, 2);
+      }
+    }
+  }
+  const auto ggml =
+      static_cast<gufo::core::GgmlType>(static_cast<std::uint32_t>(type));
+  for (std::size_t r = 0; r < m; ++r) {
+    gufo::quant::Dequantize(ggml, w.packed.data() + r * (k / elements) * bytes,
+                            w.values.data() + r * k, k);
+  }
+  return w;
+}
+
+/// Formats outside the adapter set (Q5_1 is routed down-projection only,
+/// Q4_0 has no GPU kernels) must fail the executor's format probe and both
+/// dense entry points, so a widened whitelist cannot make decode and prefill
+/// disagree.
+void CheckDenseRejectsNonDense() {
+  for (int type : {static_cast<int>(q::WeightType::kQ5_1),
+                   static_cast<int>(gufo::core::GgmlType::kQ4_0)}) {
+    if (qfn_mmq_moe_gated_type(type) != 0)
+      throw std::runtime_error("dense format probe accepted a non-dense type");
+    if (qfn_mmq_dense(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) == 0)
+      throw std::runtime_error("qfn_mmq_dense accepted a non-dense type");
+    if (qfn_mmq_dense_vec(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) ==
+        0)
+      throw std::runtime_error("qfn_mmq_dense_vec accepted a non-dense type");
+  }
+}
+
+/// MMQ and MMVQ dense projections for a GSQ-RCO format over random packed
+/// blocks, against an F64 reference over the CPU-dequantized weights.
+void CheckDenseQuant(q::WeightType type, std::size_t m, std::size_t k,
+                     std::size_t n_tokens, std::uint32_t seed) {
+  const DenseWeights w = MakeQuant(type, m, k, seed);
+  std::vector<float> x(n_tokens * k);
+  std::uint32_t state = seed ^ 0x5A5A5A5AU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  constexpr std::size_t guard = 8;
+  constexpr float poison = -1234567.0F;
+  const std::vector<float> zeros(n_tokens * m + guard, poison);
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_mmq = nullptr;
+  float* d_vec = nullptr;
+  // The MMQ tier reads whole 256-element k-iterations, so short rows
+  // over-read past the tensor; production uploads carry a zeroed tail for
+  // this (device_model.cpp kTailMargin).
+  constexpr std::size_t tail = 4096;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "dense quant weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "dense quant input");
+  CheckHip(hipMalloc(&d_mmq, zeros.size() * 4), "dense quant MMQ output");
+  CheckHip(hipMalloc(&d_vec, zeros.size() * 4), "dense quant MMVQ output");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "dense quant weights upload");
+  CheckHip(
+      hipMemset(static_cast<std::uint8_t*>(d_w) + w.packed.size(), 0, tail),
+      "dense quant weights tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "dense quant input upload");
+  CheckHip(
+      hipMemcpy(d_mmq, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+      "dense quant MMQ guards");
+  CheckHip(
+      hipMemcpy(d_vec, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+      "dense quant MMVQ guards");
+  if (qfn_mmq_dense(static_cast<int>(type), d_w, d_x, d_mmq,
+                    static_cast<int>(m), static_cast<int>(n_tokens),
+                    static_cast<int>(k), nullptr) != 0)
+    throw std::runtime_error("dense MMQ failed");
+  if (qfn_mmq_dense_vec(static_cast<int>(type), d_w, d_x, d_vec,
+                        static_cast<int>(m), static_cast<int>(n_tokens),
+                        static_cast<int>(k), nullptr) != 0)
+    throw std::runtime_error("dense MMVQ failed");
+  CheckHip(hipDeviceSynchronize(), "dense quant GEMMs");
+  const auto mmq = Download(d_mmq, zeros.size());
+  const auto vec = Download(d_vec, zeros.size());
+  for (std::size_t i = n_tokens * m; i < zeros.size(); ++i) {
+    if (mmq[i] != poison || vec[i] != poison)
+      throw std::runtime_error("dense quant projection overwrote its guard");
+  }
+  double vs_mmq = 0.0, vs_ref = 0.0, mmq_vs_ref = 0.0, scale = 0.0;
+  for (std::size_t t = 0; t < n_tokens; ++t) {
+    for (std::size_t row = 0; row < m; ++row) {
+      double ref = 0.0;
+      const float* wr = w.values.data() + row * k;
+      const float* xr = x.data() + t * k;
+      for (std::size_t i = 0; i < k; ++i) {
+        ref += static_cast<double>(wr[i]) * xr[i];
+      }
+      const float v = mmq[t * m + row];
+      const float u = vec[t * m + row];
+      if (!std::isfinite(v) || !std::isfinite(u)) {
+        throw std::runtime_error("dense quant output is not finite");
+      }
+      vs_mmq = std::max(vs_mmq, std::abs(static_cast<double>(u - v)));
+      vs_ref = std::max(vs_ref, std::abs(ref - static_cast<double>(u)));
+      mmq_vs_ref = std::max(mmq_vs_ref, std::abs(ref - static_cast<double>(v)));
+      scale = std::max(scale, std::abs(ref));
+    }
+  }
+  // The vector/MMQ tiers approximate the F64 reference through the same
+  // activation quantization, so each may sit a full quantization step from
+  // it and two apart from each other.
+  if (!(vs_ref < 1e-2 * scale && mmq_vs_ref < 1e-2 * scale &&
+        vs_mmq < 2e-2 * scale)) {
+    throw std::runtime_error(
+        "dense quant projection differs from the F64 oracle: m=" +
+        std::to_string(m) + " k=" + std::to_string(k) +
+        " n=" + std::to_string(n_tokens) + " vs_mmq=" + std::to_string(vs_mmq) +
+        " vs_ref=" + std::to_string(vs_ref) + " mmq_vs_ref=" +
+        std::to_string(mmq_vs_ref) + " scale=" + std::to_string(scale));
+  }
+  std::cout << "dense " << std::to_string(static_cast<unsigned>(type))
+            << " m=" << m << " k=" << k << " n=" << n_tokens
+            << ": worst |MMVQ - MMQ| " << vs_mmq << ", worst |MMVQ - F64| "
+            << vs_ref << ", worst |MMVQ - F64| " << mmq_vs_ref << " (scale "
+            << scale << ")\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_mmq), static_cast<void*>(d_vec)})
+    if (p != nullptr)
+      CheckHip(hipFree(p), "dense quant free");
+}
+
+/// The dense vector projection computes every token of a decode or
+/// verification batch in one call: its rows must stay bit-identical to the
+/// one-token waves at any batch width (the batched-decode contract).
+void CheckDenseVecTokens(q::WeightType type, std::size_t m, std::size_t k,
+                         std::size_t tokens, std::uint32_t seed) {
+  const DenseWeights w = MakeQuant(type, m, k, seed);
+  std::vector<float> x(tokens * k);
+  std::uint32_t state = seed ^ 0xA5A5A5A5U;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  constexpr std::size_t guard = 8;
+  constexpr float poison = -1234567.0F;
+  const std::vector<float> zeros(tokens * m + guard, poison);
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_out = nullptr;
+  constexpr std::size_t tail = 4096;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "dense vec weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "dense vec input");
+  CheckHip(hipMalloc(&d_out, zeros.size() * 4), "dense vec output");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "dense vec weights upload");
+  CheckHip(
+      hipMemset(static_cast<std::uint8_t*>(d_w) + w.packed.size(), 0, tail),
+      "dense vec weights tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "dense vec input upload");
+  std::vector<float> scalar(tokens * m, poison);
+  for (std::size_t t = 0; t < tokens; ++t) {
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "dense vec guards");
+    if (qfn_mmq_dense_vec(
+            static_cast<int>(type), d_w, d_x + static_cast<std::size_t>(t) * k,
+            d_out, static_cast<int>(m), 1, static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error("dense vec one-token projection failed");
+    CheckHip(hipMemcpy(scalar.data() + static_cast<std::size_t>(t) * m, d_out,
+                       m * sizeof(float), hipMemcpyDeviceToHost),
+             "dense vec scalar output");
+  }
+  for (std::size_t n = 2; n <= tokens; ++n) {
+    CheckHip(
+        hipMemcpy(d_out, zeros.data(), zeros.size() * 4, hipMemcpyHostToDevice),
+        "dense vec guards");
+    if (qfn_mmq_dense_vec(static_cast<int>(type), d_w, d_x + (tokens - n) * k,
+                          d_out, static_cast<int>(m), static_cast<int>(n),
+                          static_cast<int>(k), nullptr) != 0)
+      throw std::runtime_error("dense vec batched projection failed");
+    const auto batch = Download(d_out, zeros.size());
+    if (std::memcmp(scalar.data() + (tokens - n) * m, batch.data(),
+                    n * m * sizeof(float)) != 0)
+      throw std::runtime_error(
+          "dense vec rows depend on the token count: m=" + std::to_string(m) +
+          " k=" + std::to_string(k) + " n=" + std::to_string(n));
+    for (std::size_t i = n * m; i < zeros.size(); ++i) {
+      if (batch[i] != poison)
+        throw std::runtime_error("dense vec projection overwrote its guard");
+    }
+  }
+  std::cout << "dense vec " << std::to_string(static_cast<unsigned>(type))
+            << " m=" << m << " k=" << k << ": rows exact at 1.." << tokens
+            << " tokens\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_out)})
+    CheckHip(hipFree(p), "dense vec free");
+}
+
+/// One-shot and chunked prefill must write identical logits per output
+/// column (session_test CheckPrefillChunks): the projection result for a
+/// token may not depend on how many other tokens share the call. Runs the
+/// adapter MMQ tier, or the F16-tile WMMA tier production uses at wide batch.
+void CheckDenseChunkExact(q::WeightType type, std::size_t m, std::size_t k,
+                          std::size_t length, std::size_t boundary,
+                          std::uint32_t seed) {
+  const DenseWeights w = MakeQuant(type, m, k, seed);
+  std::vector<float> x(length * k);
+  std::uint32_t state = seed ^ 0x5A5A5A5AU;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  constexpr std::size_t tail = 4096;
+  std::uint8_t* d_w = nullptr;
+  float* d_x = nullptr;
+  float* d_bulk = nullptr;
+  float* d_head = nullptr;
+  float* d_tail = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size() + tail), "chunk exact weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "chunk exact input");
+  CheckHip(hipMalloc(&d_bulk, length * m * 4), "chunk exact bulk output");
+  CheckHip(hipMalloc(&d_head, boundary * m * 4), "chunk exact head output");
+  CheckHip(hipMalloc(&d_tail, (length - boundary) * m * 4),
+           "chunk exact tail output");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "chunk exact weights upload");
+  CheckHip(
+      hipMemset(static_cast<std::uint8_t*>(d_w) + w.packed.size(), 0, tail),
+      "chunk exact weights tail");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "chunk exact input upload");
+  const auto run_tier = [&](float* out, std::size_t rows,
+                            std::size_t row_offset) {
+    return qfn_mmq_dense(static_cast<int>(type), d_w, d_x + row_offset * k, out,
+                         static_cast<int>(m), static_cast<int>(rows),
+                         static_cast<int>(k), nullptr) == 0;
+  };
+  if (!run_tier(d_bulk, length, 0))
+    throw std::runtime_error("chunk exact bulk projection failed");
+  if (!run_tier(d_head, boundary, 0))
+    throw std::runtime_error("chunk exact head projection failed");
+  if (!run_tier(d_tail, length - boundary, boundary))
+    throw std::runtime_error("chunk exact tail projection failed");
+  CheckHip(hipDeviceSynchronize(), "chunk exact GEMMs");
+  const auto bulk = Download(d_bulk, length * m);
+  const auto head = Download(d_head, boundary * m);
+  const auto tail_out = Download(d_tail, (length - boundary) * m);
+  for (std::size_t t = 0; t < length; ++t) {
+    const float* chunk = t < boundary ? head.data() + t * m
+                                      : tail_out.data() + (t - boundary) * m;
+    if (std::memcmp(bulk.data() + t * m, chunk, m * sizeof(float)) != 0) {
+      double worst = 0.0;
+      std::size_t rows = 0;
+      std::size_t first_row = m;
+      for (std::size_t r = 0; r < m; ++r) {
+        const double d = std::abs(static_cast<double>(bulk[t * m + r]) -
+                                  static_cast<double>(chunk[r]));
+        if (d != 0.0) {
+          ++rows;
+          first_row = std::min(first_row, r);
+          worst = std::max(worst, d);
+        }
+      }
+      std::cerr << "MISMATCH type=" << static_cast<unsigned>(type) << " m=" << m
+                << " k=" << k << " length=" << length
+                << " boundary=" << boundary << " token=" << t
+                << " rows=" << rows << "/" << m << " first_row=" << first_row
+                << " worst=" << worst << " bulk=" << bulk[t * m + first_row]
+                << " chunk=" << chunk[first_row] << "\n";
+      throw std::runtime_error(
+          "dense projection depends on the chunk width: type=" +
+          std::to_string(static_cast<unsigned>(type)) +
+          " m=" + std::to_string(m) + " k=" + std::to_string(k) + " length=" +
+          std::to_string(length) + " boundary=" + std::to_string(boundary) +
+          " token=" + std::to_string(t));
+    }
+  }
+  std::cout << "dense chunk exact " << static_cast<unsigned>(type) << " m=" << m
+            << " k=" << k << " length=" << length << " boundary=" << boundary
+            << " mmq\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_bulk), static_cast<void*>(d_head),
+                  static_cast<void*>(d_tail)})
+    if (p != nullptr)
+      CheckHip(hipFree(p), "chunk exact free");
+}
+
+/// Embedding gather for a GSQ-RCO token table against the CPU oracle.
+void CheckEmbedQuant(q::WeightType type, std::size_t rows, std::size_t hidden,
+                     std::uint32_t seed) {
+  const DenseWeights w = MakeQuant(type, rows, hidden, seed);
+  std::vector<std::int32_t> tokens(rows);
+  std::uint32_t state = seed ^ 0x5A5A5A5AU;
+  for (std::size_t t = 0; t < rows; ++t) {
+    tokens[t] = static_cast<std::int32_t>(NextRandom(&state) % rows);
+  }
+  constexpr unsigned streams = 4;
+  std::uint8_t* d_w = nullptr;
+  std::int32_t* d_tokens = nullptr;
+  float* d_res = nullptr;
+  CheckHip(hipMalloc(&d_w, w.packed.size()), "embed weights");
+  CheckHip(hipMalloc(&d_tokens, tokens.size() * 4), "embed tokens");
+  CheckHip(hipMalloc(&d_res, rows * streams * hidden * 4), "embed output");
+  CheckHip(
+      hipMemcpy(d_w, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "embed weights upload");
+  CheckHip(hipMemcpy(d_tokens, tokens.data(), tokens.size() * 4,
+                     hipMemcpyHostToDevice),
+           "embed tokens upload");
+  q::EmbedTokens(d_w, type, d_tokens, d_res, static_cast<std::uint32_t>(rows),
+                 static_cast<std::uint32_t>(hidden), streams, nullptr);
+  CheckHip(hipDeviceSynchronize(), "embed");
+  const auto res = Download(d_res, rows * streams * hidden);
+  double worst = 0.0, scale = 0.0;
+  for (std::size_t t = 0; t < rows; ++t) {
+    for (std::size_t i = 0; i < hidden; ++i) {
+      const float expected =
+          w.values[static_cast<std::size_t>(tokens[t]) * hidden + i];
+      for (std::size_t s = 0; s < streams; ++s) {
+        const float v = res[(t * streams + s) * hidden + i];
+        worst = std::max(worst, std::abs(static_cast<double>(v - expected)));
+        scale = std::max(scale, std::abs(static_cast<double>(expected)));
+      }
+    }
+  }
+  if (!(worst <= 1e-6 * (scale + 1.0))) {
+    throw std::runtime_error("embedding gather differs from the CPU oracle: " +
+                             std::to_string(worst) + " scale " +
+                             std::to_string(scale));
+  }
+  std::cout << "embed " << std::to_string(static_cast<unsigned>(type))
+            << " rows=" << rows << " hidden=" << hidden
+            << ": worst |GPU - CPU| " << worst << " (scale " << scale << ")\n";
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_tokens),
+                  static_cast<void*>(d_res)})
+    CheckHip(hipFree(p), "embed free");
+}
+
 }  // namespace
 
 int main() {
@@ -1298,6 +1712,77 @@ int main() {
     CheckW8A8PassWidths(2560, 6144, 1549, 0x5B6144U);
     CheckW8A8PassWidths(320, 10240, 1549, 0x5A0320U);
     CheckW8A8PassWidths(640, 2560, 1619, 0x5A0640U);
+    CheckDenseRejectsNonDense();
+    // Per-type dense projections against the CPU-dequantized oracle: the
+    // decode-width vector path, the tiled MMQ path, and a wide batch.
+    std::uint32_t seed = 0x1D1D1D1DU;
+    for (q::WeightType type :
+         {q::WeightType::kQ8_0, q::WeightType::kQ2_0, q::WeightType::kQ4_K,
+          q::WeightType::kQ5_K, q::WeightType::kQ6_K, q::WeightType::kIQ2_XXS,
+          q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,
+          q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+          q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS}) {
+      CheckDenseQuant(type, 64, 512, 1, seed++);
+      CheckDenseQuant(type, 64, 512, 7, seed++);
+      CheckDenseQuant(type, 129, 2560, 24, seed++);
+    }
+    // Production shapes: attn_qkv / shexp gate-up / shexp down.
+    CheckDenseQuant(q::WeightType::kQ6_K, 10240, 2560, 1, seed++);
+    CheckDenseQuant(q::WeightType::kQ6_K, 640, 2560, 7, seed++);
+    CheckDenseQuant(q::WeightType::kIQ4_XS, 10240, 2560, 1, seed++);
+    CheckDenseQuant(q::WeightType::kIQ4_XS, 640, 2560, 7, seed++);
+    CheckDenseQuant(q::WeightType::kQ5_K, 10240, 2560, 1, seed++);
+    CheckDenseQuant(q::WeightType::kIQ4_NL, 2560, 640, 7, seed++);
+    CheckDenseQuant(q::WeightType::kQ2_0, 2560, 640, 7, seed++);
+    // Tight K tails: a single weight block and a one-block trailing tile.
+    CheckDenseQuant(q::WeightType::kQ2_0, 64, 64, 1, seed++);
+    CheckDenseQuant(q::WeightType::kQ2_0, 64, 64, 7, seed++);
+    CheckDenseQuant(q::WeightType::kQ2_0, 129, 320, 24, seed++);
+    // Chunk-width exactness at the session test's boundary pairs: the MMQ
+    // tile width may not depend on the token count. (160,80) keeps every
+    // token's tile slot identical across the three calls, so it is the
+    // slot-control pair; (96,32) shifts slots at the boundary.
+    for (q::WeightType type :
+         {q::WeightType::kQ8_0, q::WeightType::kQ2_0, q::WeightType::kQ4_K,
+          q::WeightType::kQ5_K, q::WeightType::kQ6_K, q::WeightType::kIQ2_XXS,
+          q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,
+          q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+          q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS}) {
+      CheckDenseChunkExact(type, 64, 512, 160, 80, seed++);
+      CheckDenseChunkExact(type, 64, 512, 96, 32, seed++);
+      CheckDenseChunkExact(type, 64, 512, 96, 48, seed++);
+      CheckDenseChunkExact(type, 64, 512, 128, 64, seed++);
+      CheckDenseChunkExact(type, 64, 512, 136, 94, seed++);
+      CheckDenseChunkExact(type, 64, 512, 136, 127, seed++);
+      CheckDenseChunkExact(type, 64, 512, 136, 135, seed++);
+      CheckDenseChunkExact(type, 64, 512, 2048, 1025, seed++);
+    }
+    CheckDenseChunkExact(q::WeightType::kIQ4_XS, 10240, 2560, 136, 94, seed++);
+    CheckDenseChunkExact(q::WeightType::kIQ4_XS, 2560, 6144, 17, 9, seed++);
+    CheckDenseChunkExact(q::WeightType::kIQ4_XS, 2560, 6144, 32, 16, seed++);
+    CheckDenseChunkExact(q::WeightType::kQ6_K, 10240, 2560, 4096, 2048, seed++);
+    CheckDenseChunkExact(q::WeightType::kQ2_0, 2560, 640, 136, 94, seed++);
+    // Token-table gathers for the GSQ embedding formats.
+    CheckEmbedQuant(q::WeightType::kIQ3_S, 17, 2560, seed++);
+    CheckEmbedQuant(q::WeightType::kIQ4_XS, 17, 2560, seed++);
+    CheckEmbedQuant(q::WeightType::kIQ3_S, 5, 512, seed++);
+    CheckEmbedQuant(q::WeightType::kIQ4_XS, 5, 512, seed++);
+    // Decode and verification batch widths share the dense vector entry: the
+    // rows must be bit-identical across the batch width.
+    for (q::WeightType type :
+         {q::WeightType::kQ8_0, q::WeightType::kQ2_0, q::WeightType::kQ4_K,
+          q::WeightType::kQ5_K, q::WeightType::kQ6_K, q::WeightType::kIQ2_XXS,
+          q::WeightType::kIQ2_XS, q::WeightType::kIQ2_S,
+          q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+          q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS}) {
+      CheckDenseVecTokens(type, 64, 512, 8, seed++);
+      CheckDenseVecTokens(type, 129, 2560, 8, seed++);
+    }
+    CheckDenseVecTokens(q::WeightType::kQ6_K, 2560, 6144, 8, seed++);
+    CheckDenseVecTokens(q::WeightType::kIQ4_XS, 2560, 6144, 8, seed++);
+    CheckDenseVecTokens(q::WeightType::kIQ4_NL, 2560, 640, 8, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ2_0, 2560, 640, 8, seed++);
+    CheckDenseVecTokens(q::WeightType::kQ2_0, 129, 320, 8, seed++);
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.

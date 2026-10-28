@@ -513,9 +513,9 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           rows.rows[i] =
               snapshots ? snapshots + (saved - 1 - i) * kPleHistory : nullptr;
         Upload(&ple_current, ple_history);
-        q::PleConv(d_qkv.get(), d_conv_w.get(), ple_current.get(),
-                   ple_scratch.get(), ple_out.get(), rows, n, kChannels,
-                   kKernel, kDilation, nullptr);
+        q::PleConv(d_qkv.get(), d_conv_w.get(), q::WeightType::kF32,
+                   ple_current.get(), ple_scratch.get(), ple_out.get(), rows, n,
+                   kChannels, kKernel, kDilation, nullptr);
       };
       ple(kTokens, ple_snaps.get());
       const auto saved_ple = Download(&ple_snaps, saved * kPleHistory + kGuard);

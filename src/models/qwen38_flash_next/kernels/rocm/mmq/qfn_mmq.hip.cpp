@@ -91,6 +91,28 @@ ggml_backend_hip_context * get_ctx_for_device(int device) {
     return cached[device].get();
 }
 
+// Prompt arithmetic must stay independent of the chunk width: the tile-width
+// rule in mul_mat_q_case fits ncols_max, so a bulk prefill and its chunks pick
+// different template instantiations, which accumulate in different orders.
+// Dense callers request the widest usable tile instead, like the routed pin.
+template <ggml_type type>
+static int dense_tile_cols(const int cc, const size_t smpbo,
+                           const int warp_size, const int nwarps,
+                           const int mmq_y) {
+    const int mmq_x_max = get_mmq_x_max_host(cc);
+    const int ncw = (amd_wmma_available(cc) && !amd_mfma_available(cc))
+            ? QFN_WMMA_MMQ_NCW : 1;
+    int best = 0;
+    for (int mmq_x = 8; mmq_x <= mmq_x_max; mmq_x += 8) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        if (mmq_x % (granularity * ncw) != 0) continue;
+        if (mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps)
+                > smpbo) continue;
+        best = mmq_x;
+    }
+    return best;
+}
+
 template <ggml_type type>
 int qfn_mmq_dense_impl(
         const char  * tag,
@@ -110,14 +132,16 @@ int qfn_mmq_dense_impl(
         fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
         return -1;
     }
-    if (K % 32 != 0) {
+    if (K % ggml_blck_size(type) != 0) {
 
-        fprintf(stderr, "%s: K=%d must be a multiple of 32\n", tag, K);
+        fprintf(stderr, "%s: K=%d is not a whole weight block\n", tag, K);
         return -1;
     }
 
     const int dev = ggml_hip_get_device();
     const int cc  = ggml_hip_info().devices[dev].cc;
+    const size_t smpbo = ggml_hip_info().devices[dev].smpbo;
+    const int warp_size = ggml_hip_info().devices[dev].warp_size;
 
     ggml_backend_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -182,6 +206,15 @@ int qfn_mmq_dense_impl(
         type == GGML_TYPE_Q8_0 && !use_stream_k;
     args.sanitize_output = inline_sanitize;
 
+    args.mmq_x_request = dense_tile_cols<type>(
+        cc, smpbo, warp_size, mmq_get_nwarps_host(cc, warp_size),
+        get_mmq_y_host(cc));
+    if (args.mmq_x_request <= 0) {
+        fprintf(stderr, "%s: no usable tile width for type %d\n", tag,
+                (int)type);
+        return -1;
+    }
+
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = hipGetLastError();
@@ -195,10 +228,51 @@ int qfn_mmq_dense_impl(
     return 0;
 }
 
-extern "C" int qfn_mmq_q8_0_dense(
-        const void * W, const float * X, float * out,
+extern "C" int qfn_mmq_dense(
+        int weight_type, const void * W, const float * X, float * out,
         int M, int N, int K, hipStream_t stream) {
-    return qfn_mmq_dense_impl<GGML_TYPE_Q8_0>("qfn_mmq_q8_0_dense", W, X, out, M, N, K, stream);
+    switch (static_cast<ggml_type>(weight_type)) {
+        case GGML_TYPE_Q8_0:
+            return qfn_mmq_dense_impl<GGML_TYPE_Q8_0>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_Q2_0:
+            return qfn_mmq_dense_impl<GGML_TYPE_Q2_0>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_Q4_K:
+            return qfn_mmq_dense_impl<GGML_TYPE_Q4_K>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_Q5_K:
+            return qfn_mmq_dense_impl<GGML_TYPE_Q5_K>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_Q6_K:
+            return qfn_mmq_dense_impl<GGML_TYPE_Q6_K>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ2_XXS:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ2_XXS>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ2_XS:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ2_XS>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ2_S:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ2_S>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ3_XXS:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ3_XXS>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ3_S:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ3_S>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ4_NL:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ4_NL>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        case GGML_TYPE_IQ4_XS:
+            return qfn_mmq_dense_impl<GGML_TYPE_IQ4_XS>(
+                "qfn_mmq_dense", W, X, out, M, N, K, stream);
+        default:
+            fprintf(stderr, "qfn_mmq_dense: unsupported weight type %d\n",
+                    weight_type);
+            return -1;
+    }
 }
 
 template <ggml_type type>
@@ -416,8 +490,7 @@ static int moe_vector_projection(const char* tag, int weight_type, const void* W
                                  ? MMVQ_MAX_ROUTED_BATCH
                                  : MMVQ_MAX_BATCH_SIZE;
   if (gated && (n_tokens > max_gated_rows || n_expert_used > 32 ||
-                (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-                 type != GGML_TYPE_Q8_0))) {
+                !qfn_mmq_moe_gated_type(weight_type))) {
     fprintf(stderr,
             "%s: gated vector exceeds its format's row or expert limit\n",
             tag);
@@ -509,10 +582,18 @@ static int moe_vector_projection(const char* tag, int weight_type, const void* W
   for (int projection = 0; projection < (W_b ? 2 : 1); ++projection) {
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
-    mul_mat_vec_moe_dispatch(weights, type, input,
-                             by_expert ? sorted_ids : ids, output, K, M,
-                             n_tokens, n_expert_used, input_stride, stream,
-                             slot_of_rank);
+    if (n_experts == 1 && n_expert_used == 1 && n_tokens > 1 &&
+        n_tokens <= MMVQ_MAX_BATCH_SIZE) {
+      // The single-expert contract (dense rows): every token shares the
+      // expert, so the multi-token waves compute them per weight-row pair.
+      mul_mat_vec_dense_multi(weights, type, input, ids, output, K, M,
+                              n_tokens, input_stride, stream);
+    } else {
+      mul_mat_vec_moe_dispatch(weights, type, input,
+                               by_expert ? sorted_ids : ids, output, K, M,
+                               n_tokens, n_expert_used, input_stride, stream,
+                               slot_of_rank);
+    }
 
     err = hipGetLastError();
     if (err != hipSuccess) {
@@ -564,6 +645,40 @@ extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
   return qfn_mmq_moe_impl<GGML_TYPE_Q8_0>(
       "qfn_mmq_q8_0_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
       n_expert_used, stream, nullptr, nullptr);
+}
+
+// The dense product is the routed one with a single expert slot per token and
+// every token routed to it; the [N][1][M] output is the dense [N][M] layout.
+extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,
+                                 const float* X_f32, float* out_f32, int M,
+                                 int N, int K, hipStream_t stream) {
+  // Same formats as qfn_mmq_dense: the routed set without Q5_1 (down
+  // projections only), so decode and prefill accept one dense set.
+  if (!qfn_mmq_moe_gated_type(weight_type)) {
+    fprintf(stderr, "qfn_mmq_dense_vec: unsupported weight type %d\n",
+            weight_type);
+    return -1;
+  }
+  if (!W || !X_f32 || !out_f32 || M <= 0 || K <= 0 || N <= 0) {
+    fprintf(stderr, "qfn_mmq_dense_vec: bad arguments M=%d N=%d K=%d\n", M, N,
+            K);
+    return -1;
+  }
+  ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
+  if (!ctx) {
+    fprintf(stderr, "qfn_mmq_dense_vec: failed to get HIP context\n");
+    return -1;
+  }
+  ggml_hip_pool_alloc<int32_t> ids(qfn_pool_for_stream(ctx->device, stream),
+                                   (size_t)N);
+  if (hipMemsetAsync(ids.get(), 0, (size_t)N * sizeof(int32_t), stream) !=
+      hipSuccess) {
+    fprintf(stderr, "qfn_mmq_dense_vec: failed to zero expert ids\n");
+    return -2;
+  }
+  return moe_vector_projection("qfn_mmq_dense_vec", weight_type, W, X_f32,
+                               ids.get(), out_f32, M, K, N, 1, 1, stream,
+                               nullptr, nullptr, false);
 }
 
 static int moe_mmq_projection(int weight_type, const char* tag, const void* W,
