@@ -649,36 +649,49 @@ extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
 
 // The dense product is the routed one with a single expert slot per token and
 // every token routed to it; the [N][1][M] output is the dense [N][M] layout.
-extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,
-                                 const float* X_f32, float* out_f32, int M,
-                                 int N, int K, hipStream_t stream) {
+static int dense_vector_projection(const char* tag, int weight_type,
+                                   const void* W, const float* X_f32,
+                                   const void* X_q8, float* out_f32, int M,
+                                   int N, int K, hipStream_t stream) {
   // Same formats as qfn_mmq_dense: the routed set without Q5_1 (down
   // projections only), so decode and prefill accept one dense set.
   if (!qfn_mmq_moe_gated_type(weight_type)) {
-    fprintf(stderr, "qfn_mmq_dense_vec: unsupported weight type %d\n",
-            weight_type);
+    fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
-  if (!W || !X_f32 || !out_f32 || M <= 0 || K <= 0 || N <= 0) {
-    fprintf(stderr, "qfn_mmq_dense_vec: bad arguments M=%d N=%d K=%d\n", M, N,
-            K);
+  if (!W || !(X_f32 || X_q8) || !out_f32 || M <= 0 || K <= 0 || N <= 0) {
+    fprintf(stderr, "%s: bad arguments M=%d N=%d K=%d\n", tag, M, N, K);
     return -1;
   }
   ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
   if (!ctx) {
-    fprintf(stderr, "qfn_mmq_dense_vec: failed to get HIP context\n");
+    fprintf(stderr, "%s: failed to get HIP context\n", tag);
     return -1;
   }
   ggml_hip_pool_alloc<int32_t> ids(qfn_pool_for_stream(ctx->device, stream),
                                    (size_t)N);
   if (hipMemsetAsync(ids.get(), 0, (size_t)N * sizeof(int32_t), stream) !=
       hipSuccess) {
-    fprintf(stderr, "qfn_mmq_dense_vec: failed to zero expert ids\n");
+    fprintf(stderr, "%s: failed to zero expert ids\n", tag);
     return -2;
   }
-  return moe_vector_projection("qfn_mmq_dense_vec", weight_type, W, X_f32,
-                               ids.get(), out_f32, M, K, N, 1, 1, stream,
-                               nullptr, nullptr, false);
+  return moe_vector_projection(tag, weight_type, W, X_f32, ids.get(), out_f32,
+                               M, K, N, 1, 1, stream, nullptr, nullptr, false,
+                               X_q8);
+}
+
+extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,
+                                 const float* X_f32, float* out_f32, int M,
+                                 int N, int K, hipStream_t stream) {
+  return dense_vector_projection("qfn_mmq_dense_vec", weight_type, W, X_f32,
+                                 nullptr, out_f32, M, N, K, stream);
+}
+
+extern "C" int qfn_mmq_dense_vec_preq(int weight_type, const void* W,
+                                      const void* X_q8, float* out_f32, int M,
+                                      int N, int K, hipStream_t stream) {
+  return dense_vector_projection("qfn_mmq_dense_vec_preq", weight_type, W,
+                                 nullptr, X_q8, out_f32, M, N, K, stream);
 }
 
 static int moe_mmq_projection(int weight_type, const char* tag, const void* W,

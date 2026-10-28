@@ -1138,6 +1138,34 @@ void CheckVectorGrouping(bool down = false) {
                 (down ? " down rows" : " gate rows"));
           }
         }
+        if (!down) {
+          // A producer's decode Q8_1 rows reach the same gated kernel and
+          // must keep every bit of the F32 entry's quantized activation.
+          std::uint8_t* dq = nullptr;
+          CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
+                   "prequantized gated rows");
+          if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr))
+            throw std::runtime_error(
+                "prequantized gated input quantization failed");
+          for (int n : gated_widths) {
+            CheckHip(
+                hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                          hipMemcpyHostToDevice),
+                "poison prequantized gated output");
+            if (qfn_mmq_moe_gated_vec_preq(static_cast<int>(formats[f]), w, wb,
+                                           dq, di, batch + guard, rows, cols, n,
+                                           experts, used, nullptr))
+              throw std::runtime_error("prequantized gated launch failed");
+            const auto gated = check_output(batch, n);
+            if (std::memcmp(gated_reference.data() + guard,
+                            gated.data() + guard,
+                            n * used * rows * sizeof(float)) != 0)
+              throw std::runtime_error(
+                  "prequantized gated vector differs for format " +
+                  std::to_string(f) + " width " + std::to_string(n));
+          }
+          CheckHip(hipFree(dq), "prequantized gated rows free");
+        }
       }
       CheckHip(hipFree(wb), "paired weight free");
       CheckHip(hipFree(w), "grouping weight free");
@@ -1149,6 +1177,110 @@ void CheckVectorGrouping(bool down = false) {
   }
   CheckHip(hipFree(dx), "grouping input free");
   CheckHip(hipFree(di), "grouping IDs free");
+}
+
+/// The decode shared-expert pair runs one gated vector launch with a single
+/// expert and a stable zero id. It must reproduce the dense prequantized
+/// gate/up pair followed by SwiGLU byte for byte, including each
+/// projection's nonfinite handling and the output guards, for every format
+/// that takes the fused route.
+void CheckDenseGatedExact() {
+  constexpr int rows = 640;
+  constexpr int cols = 2560;
+  constexpr int tokens = 8;
+  constexpr std::size_t guard = 16;
+  constexpr float poison = -1234567.0F;
+  const std::vector<q::WeightType> formats = {
+      q::WeightType::kQ4_K,   q::WeightType::kQ5_K,    q::WeightType::kQ6_K,
+      q::WeightType::kQ2_0,   q::WeightType::kIQ2_XXS, q::WeightType::kIQ2_XS,
+      q::WeightType::kIQ2_S,  q::WeightType::kIQ3_XXS, q::WeightType::kIQ3_S,
+      q::WeightType::kIQ4_NL, q::WeightType::kIQ4_XS};
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 0x737301U;
+  // Mix ordinary and small activations: saturated SwiGLU alone misses
+  // rounding changes that appear in real predictor inputs.
+  for (std::size_t i = 0; i < x.size(); ++i)
+    x[i] = Uniform(&seed, (i / cols) % 2 ? 1.0F / 128.0F : 2.0F);
+  auto* dx = Upload(x);
+  void* dq = nullptr;
+  CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
+           "dense gated rows");
+  if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr) != 0)
+    throw std::runtime_error("dense gated quantization failed");
+  const std::vector<std::int32_t> zero_ids(tokens, 0);
+  auto* di = Upload(zero_ids);
+  const std::size_t count = std::size_t{tokens} * rows;
+  const std::vector<float> dirty(count + guard, poison);
+  auto* ref_gate = Upload(dirty);
+  auto* ref_up = Upload(dirty);
+  auto* fused = Upload(dirty);
+
+  for (std::size_t f = 0; f < formats.size(); ++f) {
+    for (int poisoned = 0; poisoned < 2; ++poisoned) {
+      auto gate =
+          MakeExperts(formats[f], 1, rows, cols, 0x737300U + 2 * f + poisoned);
+      auto up =
+          MakeExperts(formats[f], 1, rows, cols, 0x747400U + 2 * f + poisoned);
+      if (poisoned != 0) {
+        // One nonfinite scale per projection: each must clamp before
+        // SwiGLU exactly as the separate dense projections do.
+        const __half infinite_scale = __float2half(INFINITY);
+        const std::size_t gate_scale = QuantScaleOffset(formats[f]);
+        const std::size_t up_scale = gate_scale + QuantBlockBytes(formats[f]);
+        std::memcpy(gate.packed.data() + gate_scale, &infinite_scale,
+                    sizeof(infinite_scale));
+        std::memcpy(up.packed.data() + up_scale, &infinite_scale,
+                    sizeof(infinite_scale));
+      }
+      auto* d_gate = Upload(gate.packed);
+      auto* d_up = Upload(up.packed);
+      for (int n = 1; n <= tokens; ++n) {
+        const std::size_t bytes =
+            static_cast<std::size_t>(n) * rows * sizeof(float);
+        CheckHip(hipMemcpy(ref_gate, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison dense gate");
+        CheckHip(hipMemcpy(ref_up, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison dense up");
+        CheckHip(hipMemcpy(fused, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison fused pair");
+        if (qfn_mmq_dense_vec_preq(static_cast<int>(formats[f]), d_gate, dq,
+                                   ref_gate, rows, n, cols, nullptr) != 0 ||
+            qfn_mmq_dense_vec_preq(static_cast<int>(formats[f]), d_up, dq,
+                                   ref_up, rows, n, cols, nullptr) != 0)
+          throw std::runtime_error("dense prequantized pair failed");
+        q::Swiglu(ref_gate, ref_up, static_cast<std::size_t>(n) * rows,
+                  nullptr);
+        const auto expected = Download(ref_gate, count + guard);
+        if (qfn_mmq_moe_gated_vec_preq(static_cast<int>(formats[f]), d_gate,
+                                       d_up, dq, di, fused, rows, cols, n, 1, 1,
+                                       nullptr) != 0)
+          throw std::runtime_error("fused shared-expert pair failed");
+        const auto actual = Download(fused, count + guard);
+        if (std::memcmp(expected.data(), actual.data(), bytes) != 0)
+          throw std::runtime_error(
+              "fused shared-expert pair differs from the dense pair for " +
+              std::string(TypeName(formats[f])) + " width " +
+              std::to_string(n));
+        for (std::size_t i = static_cast<std::size_t>(n) * rows;
+             i < count + guard; ++i) {
+          if (actual[i] != poison)
+            throw std::runtime_error(
+                "fused shared-expert pair overwrote its guard");
+        }
+      }
+      CheckHip(hipFree(d_gate), "dense pair gate free");
+      CheckHip(hipFree(d_up), "dense pair up free");
+    }
+  }
+  std::cout << "fused shared-expert pair: exact against the dense "
+               "prequantized pair at 1..8 rows, every format\n";
+  for (void* p : {static_cast<void*>(dx), dq, static_cast<void*>(di),
+                  static_cast<void*>(ref_gate), static_cast<void*>(ref_up),
+                  static_cast<void*>(fused)})
+    CheckHip(hipFree(p), "dense pair free");
 }
 
 void CheckPairedMmq(q::WeightType type) {
@@ -1751,6 +1883,7 @@ int main() {
     ReportVectorAccuracy();
     CheckVectorGrouping();
     CheckVectorGrouping(true);
+    CheckDenseGatedExact();
     for (q::WeightType type :
          {q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ6_K,
           q::WeightType::kQ5_1, q::WeightType::kQ8_0, q::WeightType::kQ2_0,

@@ -459,8 +459,8 @@ private:
   };
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                 Q8Input* q, std::string* error_msg) const;
-  /// Quantizes only when a consumer reads the Q8_1 rows (Q8_0 weights);
-  /// every other format quantizes the F32 rows in its own entry.
+  /// Quantizes once when at least two consumers read the Q8_1 rows (any
+  /// quantized dense format); a single consumer quantizes in its own entry.
   bool QuantizeFor(std::initializer_list<const DeviceTensor*> consumers,
                    const float* x, std::uint32_t n_tokens, std::uint32_t k,
                    Q8Input* q, std::string* error_msg) const;
@@ -694,6 +694,8 @@ private:
     float* shexp_gate;
     float* shexp_up;
     float* shexp_out;
+    /// Stable zero expert ids for the fused shared-expert gate/up pair.
+    std::int32_t* shexp_ids;
     /// Shared-expert SwiGLU rows narrowed for the F16 down projection, so
     /// s_.x_half keeps the routed experts' token rows.
     __half* shexp_half;
