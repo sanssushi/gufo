@@ -116,6 +116,12 @@
       "ctest": "qwen38_flash_next\\.continuation_layout",
       "check_pr": true,
       "windows_build": true
+    },
+    {
+      "target": "qwen38_flash_next_weights_test",
+      "ctest": "qwen38_flash_next\\.weights",
+      "check_pr": true,
+      "windows_build": true
     }
   ],
   "test_labels": [
