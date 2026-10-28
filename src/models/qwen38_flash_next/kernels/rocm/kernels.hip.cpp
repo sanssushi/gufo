@@ -1057,14 +1057,18 @@ __global__ void HcCombineVec4Kernel(
 /// output never round-trips memory. Threads own hidden lanes (up to three
 /// float4 each) across the four streams.
 template<bool kNormalize, typename ExpertT, bool kPrior = false,
-         bool kInject = false, bool kInjBf16 = false>
+         bool kInject = false, bool kInjBf16 = false, bool kQ8Out = true>
 __global__ void HcCombineMoeKernel(
     float* res, const ExpertT* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
     std::uint32_t used, const float* inject, std::uint32_t inject_parts,
-    const float* gamma, __half* xn, void* xn_q8, std::uint32_t hidden,
+    const float* gamma, __half* xn, void* xn_q8_arg, std::uint32_t hidden,
     float eps, const float* prior_out, const float* prior_w,
     const void* inject_w, float* inject_out, std::uint32_t xn_stride = 0) {
+  // The tiled Q8 norm exists only for a Q8_0 down projection; when the next
+  // mixer's down projection reads the F16 norm, compiling the quantizer out
+  // removes its registers and branch from the wide combine.
+  void* xn_q8 = kQ8Out ? xn_q8_arg : nullptr;
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 3;  // 2560 / 4 / kThreads, rounded up
   __shared__ float shared[kStreams][kThreads / 32];
@@ -6304,6 +6308,36 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
   return true;
 }
 
+template<typename ExpertT, bool kQ8Out>
+static bool HcCombineMoeLaunchQ8(
+    float* res, const ExpertT* expert_out, const float* weights,
+    const float* shared_out, const float* gate, std::uint32_t gate_stride,
+    std::uint32_t used, const float* inject, std::uint32_t inject_parts,
+    const float* gamma, __half* xn, void* xn_q8, std::uint32_t n_tokens,
+    std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
+    const float* prior_out, const float* prior_w, float* inject_out,
+    const void* inject_w, WeightType inject_type, std::uint32_t norm_stride) {
+  const auto combine =
+      inject_w != nullptr
+          ? (inject_type == WeightType::kBF16
+                 ? HcCombineMoeKernel<true, ExpertT, true, true, true, kQ8Out>
+                 : HcCombineMoeKernel<true, ExpertT, true, true, false, kQ8Out>)
+      : prior_out != nullptr
+          ? (gamma
+                 ? HcCombineMoeKernel<true, ExpertT, true, false, false, kQ8Out>
+                 : HcCombineMoeKernel<false, ExpertT, true, false, false,
+                                      kQ8Out>)
+          : (gamma ? HcCombineMoeKernel<true, ExpertT, false, false, false,
+                                        kQ8Out>
+                   : HcCombineMoeKernel<false, ExpertT, false, false, false,
+                                        kQ8Out>);
+  hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
+                     expert_out, weights, shared_out, gate, gate_stride, used,
+                     inject, inject_parts, gamma, xn, xn_q8, hidden, eps,
+                     prior_out, prior_w, inject_w, inject_out, norm_stride);
+  return true;
+}
+
 template<typename ExpertT>
 static bool HcCombineMoeLaunch(
     float* res, const ExpertT* expert_out, const float* weights,
@@ -6318,21 +6352,17 @@ static bool HcCombineMoeLaunch(
       (inject_w != nullptr && (gamma == nullptr || prior_out == nullptr))) {
     return false;
   }
-  const auto combine =
-      inject_w != nullptr
-          ? (inject_type == WeightType::kBF16
-                 ? HcCombineMoeKernel<true, ExpertT, true, true, true>
-                 : HcCombineMoeKernel<true, ExpertT, true, true>)
-      : prior_out != nullptr
-          ? (gamma ? HcCombineMoeKernel<true, ExpertT, true>
-                   : HcCombineMoeKernel<false, ExpertT, true>)
-          : (gamma ? HcCombineMoeKernel<true, ExpertT>
-                   : HcCombineMoeKernel<false, ExpertT>);
-  hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream, res,
-                     expert_out, weights, shared_out, gate, gate_stride, used,
-                     inject, inject_parts, gamma, xn, xn_q8, hidden, eps,
-                     prior_out, prior_w, inject_w, inject_out, norm_stride);
-  return true;
+  return gamma != nullptr && xn_q8 != nullptr
+             ? HcCombineMoeLaunchQ8<ExpertT, true>(
+                   res, expert_out, weights, shared_out, gate, gate_stride,
+                   used, inject, inject_parts, gamma, xn, xn_q8, n_tokens,
+                   hidden, streams, eps, stream, prior_out, prior_w, inject_out,
+                   inject_w, inject_type, norm_stride)
+             : HcCombineMoeLaunchQ8<ExpertT, false>(
+                   res, expert_out, weights, shared_out, gate, gate_stride,
+                   used, inject, inject_parts, gamma, xn, xn_q8, n_tokens,
+                   hidden, streams, eps, stream, prior_out, prior_w, inject_out,
+                   inject_w, inject_type, norm_stride);
 }
 
 bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
