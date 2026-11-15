@@ -32,6 +32,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -457,6 +458,11 @@ struct DeviceModelTestAccess {
       throw std::runtime_error("synthetic model upload failed");
     return m;
   }
+  static void SetOutput(DeviceModel& model, const DeviceTensor& output,
+                        const DeviceTensor& draft) {
+    model.output_ = output;
+    model.draft_output_ = draft;
+  }
 };
 
 // Test-only access: production has no switch for disabling graphs or overlap.
@@ -466,6 +472,86 @@ struct ExecutorTestAccess {
     return session.graphs_.size();
   }
   static bool Capturing(const Executor& exec) { return exec.capturing_; }
+  static void CheckQ4Dense(const Executor& exec, const DeviceTensor& w,
+                           bool draft) {
+    if (w.type != GgmlType::kQ4_K)
+      throw std::runtime_error("Q4 dense fixture has the wrong type");
+    constexpr std::uint32_t kMaxRows = 17;
+    std::vector<float> input(std::size_t{kMaxRows} * w.cols);
+    for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = 0.7F * std::sin(static_cast<float>(i) * 0.013F);
+    if (hipMemcpy(exec.s_.mixed, input.data(), input.size() * sizeof(float),
+                  hipMemcpyHostToDevice) != hipSuccess)
+      throw std::runtime_error("Q4 dense input upload failed");
+    for (const auto rows : {1U, 8U, 9U, 17U}) {
+      const std::size_t count = std::size_t{rows} * w.rows;
+      std::string error;
+      if (draft && rows > 8) {
+        if (exec.Dense(w, exec.s_.mixed, exec.s_.block_out, rows, &error) ||
+            error != "Q4_K draft head projection failed")
+          throw std::runtime_error("copied Q4 draft head accepted wide batch");
+        continue;
+      }
+      if (draft) {
+        if (qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, exec.s_.mixed,
+                            exec.s_.draft_head_ids, exec.s_.block_out, w.rows,
+                            w.cols, rows, 1, 1, exec.stream_) != 0)
+          throw std::runtime_error("Q4 draft reference failed");
+      } else if (rows <= 8) {
+        if (qfn_mmq_dense_vec(static_cast<int>(w.type), w.data, exec.s_.mixed,
+                              exec.s_.block_out, w.rows, rows, w.cols,
+                              exec.stream_) != 0)
+          throw std::runtime_error("Q4 dense vector reference failed");
+      } else {
+        NarrowActivations(exec.s_.mixed, exec.s_.x_half, false,
+                          std::size_t{rows} * w.cols, exec.stream_);
+        if (!DenseQuantF16Gemm(
+                w.type, w.data, static_cast<const __half*>(exec.s_.x_half),
+                exec.s_.block_out, rows, w.rows, w.cols, exec.stream_))
+          throw std::runtime_error("Q4 dense prefill reference failed");
+      }
+      std::vector<float> expected(count), actual(count);
+      if (hipStreamSynchronize(exec.stream_) != hipSuccess ||
+          hipMemcpy(expected.data(), exec.s_.block_out, count * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess)
+        throw std::runtime_error("Q4 dense reference download failed");
+      exec.DropReadyQ8();
+      exec.half_src_ = nullptr;
+      if (!exec.Dense(w, exec.s_.mixed, exec.s_.block_out, rows, &error))
+        throw std::runtime_error("Q4 dense executor: " + error);
+      if (hipStreamSynchronize(exec.stream_) != hipSuccess ||
+          hipMemcpy(actual.data(), exec.s_.block_out, count * sizeof(float),
+                    hipMemcpyDeviceToHost) != hipSuccess)
+        throw std::runtime_error("Q4 dense output download failed");
+      if (!std::all_of(actual.begin(), actual.end(),
+                       [](float v) { return std::isfinite(v); }) ||
+          std::memcmp(expected.data(), actual.data(), count * sizeof(float)) !=
+              0)
+        throw std::runtime_error("Q4 dense route changed its output at width " +
+                                 std::to_string(rows));
+      if (!draft && rows > 8) {
+        if (qfn_mmq_dense_vec(static_cast<int>(w.type), w.data, exec.s_.mixed,
+                              exec.s_.block_out, w.rows, rows, w.cols,
+                              exec.stream_) != 0 ||
+            hipStreamSynchronize(exec.stream_) != hipSuccess ||
+            hipMemcpy(expected.data(), exec.s_.block_out, count * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess)
+          throw std::runtime_error("Q4 grouped reference failed");
+        exec.q8t_src_ = nullptr;
+        if (!exec.DenseBatch(w, exec.s_.mixed, exec.s_.block_out, rows,
+                             &error) ||
+            hipStreamSynchronize(exec.stream_) != hipSuccess ||
+            hipMemcpy(actual.data(), exec.s_.block_out, count * sizeof(float),
+                      hipMemcpyDeviceToHost) != hipSuccess ||
+            std::memcmp(expected.data(), actual.data(),
+                        count * sizeof(float)) != 0)
+          throw std::runtime_error("Q4 grouped executor: " + error);
+      }
+    }
+    exec.DropReadyQ8();
+    exec.half_src_ = nullptr;
+    exec.q8t_src_ = nullptr;
+  }
   /// Forces a decode layout; returns the one Create calibrated.
   static bool SetDecodeOverlap(const Executor& exec, bool overlap) {
     return std::exchange(const_cast<Executor&>(exec).decode_overlap_, overlap);
@@ -1182,7 +1268,9 @@ void WriteNgramTable(const std::filesystem::path& path,
 int main(int argc, char** argv) {
   const bool graph_only =
       argc == 2 && std::string_view(argv[1]) == "--decode-graph-only";
-  if (argc != 1 && !graph_only)
+  const bool q4_dense_only =
+      argc == 2 && std::string_view(argv[1]) == "--q4-dense-only";
+  if (argc != 1 && !graph_only && !q4_dense_only)
     return 2;
   try {
     auto config = SyntheticConfig();
@@ -1220,6 +1308,24 @@ int main(int argc, char** argv) {
         Throw("executor", error);
       rocm::ExecutorTestAccess::CheckNormAllocation(
           *exec, style == rocm::TrunkStyle::kGsqRco ? 32 : 0);
+      if (!graph_only) {
+        if (style == rocm::TrunkStyle::kQ8Control)
+          rocm::ExecutorTestAccess::CheckQ4Dense(*exec, model->draft_output(),
+                                                 true);
+        else
+          rocm::ExecutorTestAccess::CheckQ4Dense(
+              *exec, model->layers()[2].ssm_gate, false);
+        if (style == rocm::TrunkStyle::kGsqRco) {
+          const auto output = model->output();
+          const auto draft = model->draft_output();
+          const auto native_q4 = model->layers()[2].ssm_gate;
+          rocm::DeviceModelTestAccess::SetOutput(*model, native_q4, native_q4);
+          rocm::ExecutorTestAccess::CheckQ4Dense(*exec, native_q4, false);
+          rocm::DeviceModelTestAccess::SetOutput(*model, output, draft);
+        }
+      }
+      if (q4_dense_only)
+        continue;
       if (style == rocm::TrunkStyle::kGsqRco)
         rocm::ExecutorTestAccess::CheckPaddedNormLayerHook(*exec);
       if (graph_only) {
@@ -1231,7 +1337,10 @@ int main(int argc, char** argv) {
       if (LedgerChecks(*exec, style) != 0)
         return 1;
     }
-    std::cout << "wide verification matches eight-row and scalar passes\n";
+    if (q4_dense_only)
+      std::cout << "Q4 dense and copied draft routes match their references\n";
+    else
+      std::cout << "wide verification matches eight-row and scalar passes\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

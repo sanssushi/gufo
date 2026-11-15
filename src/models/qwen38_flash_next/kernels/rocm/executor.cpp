@@ -2415,22 +2415,10 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
   if (w.format_state != nullptr) [[unlikely]] {
     return StageLinear(w, {x, n_tokens, 1, nullptr}, out, n_tokens, error_msg);
   }
-  if (w.type == GgmlType::kQ4_K) {
-    // The draft head (DeviceModel::SetDraftVocab): use the dense Q4_K decode
-    // kernel at decode widths.
-    if (n_tokens <= kVecBatch && w.cols % 256 == 0) {
-      Q8Input q;
-      if (!Quantize(x, n_tokens, w.cols, &q, error_msg))
-        return false;
-      if (qfn_mmq_q4_K_dense_vec_preq(w.data, q.data, out,
-                                      static_cast<int>(w.rows),
-                                      static_cast<int>(n_tokens),
-                                      static_cast<int>(w.cols), stream_) != 0) {
-        AssignError(error_msg, "Q4_K draft head projection failed");
-        return false;
-      }
-      return true;
-    }
+  if (w.type == GgmlType::kQ4_K && w.data == model_->draft_output().data &&
+      w.data != model_->output().data) {
+    // The draft head (DeviceModel::SetDraftVocab) as one routed expert:
+    // every row's logits are the same at any batch width.
     if (n_tokens > kDraftHeadRows || s_.draft_head_ids == nullptr ||
         qfn_mmq_moe_vec(static_cast<int>(GgmlType::kQ4_K), w.data, x,
                         s_.draft_head_ids, out, static_cast<int>(w.rows),
