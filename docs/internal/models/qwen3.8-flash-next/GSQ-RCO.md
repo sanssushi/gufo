@@ -17,39 +17,11 @@ gufo runs the ISTA-DASLab GSQ-RCO GGUFs of Qwen3.8-Flash-Next: IQ3_XXS
 two variants, called mixes below, support the same features as the unsloth
 UD-Q4_K_XL target: AR and MTP generation (with the shared Q8_0 MTP sidecar),
 image input (BF16 mmproj sidecar), the chat template, graph capture, batched
-sessions and serving modes. All in-repo quality checks pass on both mixes,
-and the UD-Q4_K_XL control shows no regression relative to `main`.
+sessions and serving modes.
 
-Speed (details in "Performance state"):
-
-- AR token generation at depth 32768 is within about 3.1% of the control on
-  both mixes; xxs is above the control.
-- MTP token generation at a 32768-token context measures the multi-row
-  verification forward pass. For greedy runs, upstream's prompt-lookup
-  draft copies bypass the neural draft head and chains end at the first
-  unconfident draft (the two mixes and the control all take the same 10
-  cycles, accept 118 draft tokens and copy 108 by lookup), so this
-  measurement is dominated by verifying 16 or 20 rows at a time. The
-  difference is -2.0% for xxs and -4.7% for s. The forward includes low-bit
-  weight decoding and BF16 hyper-connection projections; the shared expert's
-  decoded weight fragments are reused across the tokens in a group, and the
-  wide Q5_K/Q6_K dense projections reuse each weight row across sixteen
-  tokens. The Q6_K sixteen-token dense and head calls are the largest
-  single line item, and the routed stages are together faster than the
-  control's. Within the routed down stage, a bounded row-slice order limits
-  weight re-reads across slot groups.
-- MTP token generation with no preceding context follows the draft
-  acceptance rate rather than kernel speed, so the result varies with the
-  draft trajectory and between runs at the same trajectory.
-- Prefill throughput at depth 32768 is about 5.5-6.1% lower. The residual is
-  the quantization format: the BF16 hyper-connection down projection runs an
-  exact F16 WMMA path against the control's Q8_0 int8 path, the routed
-  gate/up pair and down projection run exact low-bit register decode,
-  mixed-type SSM and attention layers decode each projection in its own
-  format, and the PLE is BF16. The mixes win on routed down, SSM QKV+conv,
-  output projections and hyper-connection up/combine. Depth-0 prefill cells
-  are advisory; their spread follows run noise and the control's own
-  depth-0 rate. The deep-prefill residual is the accepted format floor.
+MTP token generation at a 32768-token context measures the multi-row
+verification forward pass when prompt-lookup drafts bypass the neural draft
+head. Depth-0 MTP speed depends on the draft acceptance trajectory.
 
 On the implementation side, the IQ2/IQ3 prefill decoder builds each group of
 signed bytes directly from the quantization grid words, using packed sign
@@ -356,14 +328,18 @@ vendored code is re-imported (see "Vendored-code obligations").
   eight-row waves for a decode-width batch; a wider batch runs every full
   group in one grid (`blockIdx.y`) and the ragged tail on the narrower
   specializations, up to the wide verification width.
-- `Executor::Dense` keeps the Q8_0 fast path and sends every other
-  non-F32/BF16/F16 matrix through the adapter (MMVQ below `MatrixRows`,
-  MMQ above). The generic fallback rejects other types with an error, and the
-  error path distinguishes an unsupported format (probed through
+- `Executor::Dense` keeps the Q8_0 fast path and sends other quantized
+  matrices through MMVQ at decode width, F16 tiles for wide K-quant/IQ
+  matrices and MMQ for other wide formats. The generic fallback rejects
+  other types with an error. The error path distinguishes an unsupported
+  format (probed through
   `qfn_mmq_moe_gated_type`) from a launch failure. From nine rows
   `DenseBatch` quantizes an adapter format's whole activation batch once and
   projects it with one grouped dense-vector call; other matrices keep
   Dense's chunked dispatch.
+  The Q4_K copy of a Q8_0 draft-head prefix uses its own routed vector
+  projection at up to eight rows. Ordinary Q4_K projections and a native
+  Q4_K output head retain the dense routes.
 - Decode projections share one Q8_1 activation row set across the formats
   that read it. The attention Q/K/V, SSM QKV/gate and PLE key/value groups
   quantize once when at least two members are quantized, and the
@@ -720,6 +696,11 @@ Breaking any of them silently breaks session or audit replay.
   routed gate/up and down stages each record one call per layer at the
   outer width. The fixture also checks the padded norm allocation and the
   bytes and pitch parked across a layer hook.
+- Q4_K executor dispatch: `wide_verification` compares ordinary Q4_K dense
+  projections at 1, 8, 9 and 17 rows with their vector or F16-tile
+  references and grouped verification with its vector reference. A native
+  Q4_K output head uses the same routes. The copied Q4_K draft head matches
+  its routed vector reference at 1 and 8 rows and rejects wider calls.
 - Wide grouped routed gate/up: `routed_wmma_ops` runs the complete-batch
   gated vector entry at 9, 17, 33 and 64 rows for Q4_K and the six low-bit
   IQ gate/up formats, over a disjoint route and a shared route whose groups
@@ -879,9 +860,10 @@ Breaking any of them silently breaks session or audit replay.
   all-small-head batches and mixed full/small-head batches. Its one-row
   prefix guarantees rare-token candidate coverage independently of generated
   language or neural-draft acceptance rate.
-- Determinism: the depth-32768 128-token benchmark completion is bit-identical
-  (sha `d856f78e…`) across all three models, AR and MTP, and MTP cycle counts
-  are deterministic per binary. Depth-0 traces are advisory and follow the
+- Determinism: at depth 32768 the completion SHA-256 is
+  `d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57`.
+  MTP uses 10 cycles, with 118 drafted and accepted tokens and 108 prompt
+  lookup proposals and acceptances. Depth-0 traces are advisory and follow the
   known borderline-argmax case: token ids can differ per model, per binary and
   between runs of one binary while the produced text is identical (not a
   correctness or speed issue).
@@ -921,59 +903,35 @@ cmake --preset release && cmake --build --preset release   # -> build/release/gu
 
 ## Performance state
 
-Measured with the release binary on an AMD Strix Halo (`gfx1151`).
+The measurements below are from November 2026 on AMD Strix Halo (`gfx1151`).
+Component measurements describe the measured shapes.
 
 Benchmark setup: `gufo bench`, greedy, `-p 2048 -n 128 -d 0,32768 -r 1 -v`,
 single user. Depth (`d`) is the number of context tokens before generation;
 `tg128` is 128 generated tokens and `pp2048` is a 2048-token prompt.
 The shared Q8_0 MTP sidecar is attached in MTP mode for the MTP measurements
 and detached (`--speculative off`) for the AR measurements. One binary runs
-all three models. Each depth-32768 cell uses the better of the two
-same-round matched deltas (the mix against that round's control). Depth-0
+all three models. Each cell uses the better of the two same-round matched
+deltas (the mix against that round's control). Depth-0
 cells are advisory and follow run noise and, for MTP, the draft acceptance
 rate; the depth-32768 cells compare the stable long-context path. Negative
 values mean the GSQ mix is slower than the control.
 
-Δ vs UD-Q4_K_XL control:
-
-| Measurement | xxs | s |
-| --- | ---: | ---: |
-| AR tg128 at d0 | +2.2% | -3.7% |
-| AR tg128 at d32768 | +2.2% | -3.1% |
-| MTP tg128 at d0 (acceptance-rate dependent) | +2.2% | -19.4% |
-| MTP tg128 at d32768 | -2.0% | -4.7% |
-| pp2048 at d32768, AR (speculation off) | -5.5% | -6.1% |
-| pp2048 at d32768, MTP | -5.6% | -5.9% |
-| pp2048 at d0, AR (speculation off) | -8.3% | -7.8% |
-| pp2048 at d0, MTP | -9.2% | -7.0% |
+| Mode | Test | xxs vs q4 | s vs q4 |
+| --- | --- | ---: | ---: |
+| AR | pp2048, d0 | -6.07% | -7.64% |
+| AR | pp2048, d32768 | -5.92% | -6.36% |
+| AR | tg128, d0 | +18.70% | +11.74% |
+| AR | tg128, d32768 | +1.33% | -4.08% |
+| MTP | pp2048, d0 | -6.10% | -6.74% |
+| MTP | pp2048, d32768 | -5.55% | -6.21% |
+| MTP | tg128, d0 | +19.37% | -21.28% |
+| MTP | tg128, d32768 | -1.58% | -5.41% |
 
 ### Decode
 
-- Decode results: AR token generation at depth 32768 is within about 3.1%
-  of the control; xxs is above it. Depth-32768 measurements are +2.2% (xxs)
-  and -3.1% (s). Depth-0 AR cells are advisory: stable readings are near
-  28.3 t/s (xxs) and 26.7 t/s (s) against a control near 27.7 t/s. MTP
-  depth-0 measurements follow the draft acceptance rate
-  rather than kernel speed (the control reads 51.3/51.5 t/s over 41
-  cycles with 86 of 128 drafts accepted; the xxs runs take 46 cycles with
-  81 of 104 accepted at 52.5 t/s; the s runs take 60 cycles with 67
-  of 104 accepted at 41.5 t/s). The chain length follows the draft
-  head's confidence; the policy's cost table only prices the AR backoff.
-  Measured small-head costs do not change the conclusion that the depth-0
-  gap follows acceptance rather than cost-model fit.
-  At depth 32768, upstream's prompt-lookup draft copies bypass the neural
-  draft head for greedy runs and chains end at the first unconfident draft
-  (the two mixes and the control take the same 10 cycles, accept 118 draft
-  tokens and copy 108 by lookup), so this measurement reflects the multi-row
-  verification forward pass. The -2.0% (xxs) and -4.7% (s) gaps measure the
-  complete verification forward, including the BF16 mixers and quantized
-  dense/routed projections. Shared-expert weight fragments are reused
-  across the group's tokens. The gated verification rounds verify 16 or 20
-  rows; the router, dense and shared projections run one grouped call over
-  that width, and the routed experts group by expert across the batch.
-  The complete outer target widths are 8, 8, 8, 8, 16, 16, 20, 20, 20 and 4.
-  The width-16/20 calls carry most of the GPU-time difference. BF16 HC-down
-  runs one grouped wide grid over the batch's eight-row groups. Below sixteen
+- Decode execution: BF16 HC-down runs one grouped wide grid over the batch's
+  eight-row groups. Below sixteen
   rows Q5_K/Q6_K dense projections and heads run grouped eight-row vector
   waves; from sixteen rows they reuse each weight row across the group with
   exact lane-partial integer WMMA at about twice the eight-row Q5_K
@@ -1006,16 +964,13 @@ values mean the GSQ mix is slower than the control.
 
 ### Prefill
 
-- Prefill throughput at depth 32768 is about 5.5-6.1% below the control.
-  The residual is the quantization format. The BF16 hyper-connection down
-  projection runs an exact F16 WMMA path against the control's Q8_0 int8
+- The BF16 hyper-connection down projection runs an exact F16 WMMA path
+  against the control's Q8_0 int8
   path; the routed gate/up pair and down projection run exact low-bit
   register decode; mixed-type SSM and attention layers decode each
-  projection in its own format; and the PLE is BF16. The mixes win on
-  routed down, SSM QKV+conv, output projections and hyper-connection
-  up/combine. Exact structural alternatives measure flat or negative, and
-  the approximate int8 route loses; the residual is the accepted format
-  floor.
+  projection in its own format; and the PLE is BF16. Measured component
+  alternatives include flat or slower exact routes and a slower approximate
+  int8 route.
   Kernel-family differences are not additive role penalties: the control's
   HC down belongs to its int8 family, and fused SSM projections include
   convolution work.
@@ -1149,14 +1104,13 @@ values mean the GSQ mix is slower than the control.
 
 ### Control
 
-- Control health: UD-Q4_K_XL shows no regression relative to `main`.
-  MTP tg128 at depth 32768 reads 109.15/109.20 t/s against main's
-  108.34/108.82 t/s (within 0.8%), with the same trajectory of 10 cycles,
-  118 drafted and accepted tokens, and 108 lookup proposed and accepted
-  tokens, and completion sha `d856f78e…`. AR reads 27.14/27.15 against
-  27.12/27.11 t/s (within 0.2%). AR prefill reads 1517.81/1515.27 against
-  1517.11/1512.42 t/s (within 0.2%); MTP prefill reads 1461.11/1462.61
-  against 1462.83/1463.40 t/s (within 0.2%).
+- At depth 32768, UD-Q4_K_XL on the fork and `main` produces the same
+  completion hash and MTP trajectory. AR pp2048 measures 1548.87/1550.42
+  tokens/s on the fork and 1548.27/1552.48 tokens/s on `main`; AR tg128
+  measures 27.75/27.78 and 27.74/27.74 tokens/s. MTP pp2048 measures
+  1494.43/1496.75 and 1492.51/1494.34 tokens/s; MTP tg128 measures
+  110.93/110.96 and 110.46/110.32 tokens/s. The paired comparisons meet
+  the control timing bounds.
 
 ## Vendored-code obligations
 
@@ -1191,10 +1145,7 @@ re-imports must re-apply the recorded blocks.
   calls (see above).
 - `GdnRowSplitKernel`'s 112 B of scratch belongs to upstream code, not this
   feature.
-- `DenseBatch`/`GatedDenseBatch` executor-level coverage comes from session
-  replay, not direct operator tests: these are private `Executor` members
-  behind a full `DeviceModel`, and a synthetic test hook would add
-  scaffolding that the fork's minimal-diff policy rules out.
+- `GatedDenseBatch` executor-level coverage comes from session replay.
 - MTP depth-0 greedy traces are advisory: token ids can differ per model, per
   binary and between runs of one binary while the produced text is identical
   (the borderline-argmax case; accepted).
