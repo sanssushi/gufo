@@ -206,8 +206,17 @@ __device__ inline constexpr std::int8_t kDeviceValuesIq4Nl[16] = {
 
 // opt-r2-q8_0: type-aware quant block geometry helpers so RowDot can own the
 // per-type row stride (bytes per block and elements per block).
+struct Q50Block {
+  __half d;
+  std::uint8_t qh[4];
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Q50Block) == 22, "block_q5_0 must be 22 bytes");
+
 __device__ inline std::size_t QuantBlockBytes(core::GgmlType t) {
   switch (t) {
+    case core::GgmlType::kQ5_0:
+      return sizeof(Q50Block);
     case core::GgmlType::kQ8_0:
       return sizeof(Q8_0Block);
     case core::GgmlType::kQ8_K:
@@ -243,6 +252,8 @@ __device__ inline std::size_t QuantBlockBytes(core::GgmlType t) {
 
 __device__ inline std::size_t QuantBlockQK(core::GgmlType t) {
   switch (t) {
+    case core::GgmlType::kQ5_0:
+      return 32;
     case core::GgmlType::kQ8_0:
       return kQ8_0BlockSize;
     case core::GgmlType::kQ8_K:
@@ -1272,6 +1283,21 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
                                         QuantSub16& out) noexcept {
   out.offset = 0.0F;
   switch (type) {
+    case core::GgmlType::kQ5_0: {
+      const auto& blk = static_cast<const Q50Block*>(row)[sub16 / 2];
+      const unsigned half = static_cast<unsigned>(sub16 % 2);
+      std::uint32_t high = 0;
+      __builtin_memcpy(&high, blk.qh, sizeof(high));
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int low = (blk.qs[j] >> (4 * half)) & 15;
+        const int code =
+            low | (static_cast<int>((high >> (j + 16 * half)) & 1U) << 4);
+        out.q[j] = static_cast<std::int8_t>(code - 16);
+      }
+      out.scale = __half2float(blk.d);
+      return;
+    }
     case core::GgmlType::kQ8_0: {
       const auto& blk = static_cast<const Q8_0Block*>(row)[sub16 / 2];
       const std::size_t base = (sub16 % 2) * 16;

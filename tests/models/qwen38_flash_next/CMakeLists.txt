@@ -37,9 +37,16 @@ add_qwen38_flash_next_test(rope_scaling_oracle
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 add_qwen38_flash_next_test(weights gufo_qwen38_flash_next "cpu")
 
+if(Python3_EXECUTABLE)
+  add_test(NAME qwen38_flash_next.catalog COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/catalog_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(qwen38_flash_next.catalog PROPERTIES
+    LABELS "qwen38_flash_next;cpu;extensions" TIMEOUT 60)
+endif()
+
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
-  gufo_qwen38_flash_next_reference)
+  gufo_qwen38_flash_next_reference gufo_qwen_text)
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)

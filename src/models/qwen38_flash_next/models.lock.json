@@ -68,6 +68,190 @@
           }
         ]
       }
+    },
+    "qfn-iq4-xs": {
+      "weights": {
+        "source": {
+          "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "814db05f88b3b827ea7cfcab5344fd218de494d2"
+        },
+        "include": [
+          "UD-IQ4_XS/*"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf",
+            "size": 10946618,
+            "sha256": "93ff23a08e5cd7501f24fa16f5b415d5807d0175e04edd3ed6a7a41b601a4eef"
+          },
+          {
+            "path": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf",
+            "size": 49604491008,
+            "sha256": "13d5dc8b93d039e4cfade5a9af7037f10c97f7ec4e53f75bd2e9ae34aae54aeb"
+          },
+          {
+            "path": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf",
+            "size": 15256783680,
+            "sha256": "f6b9b5934908a2043732269dd740155d0f921d0763a1dcdd3452246311651f87"
+          },
+          {
+            "path": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf",
+            "size": 28800138432,
+            "sha256": "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"
+          }
+        ]
+      },
+      "mtp": {
+        "source": {
+          "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+        },
+        "include": [
+          "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            "size": 2786568256,
+            "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+        },
+        "include": [
+          "mmproj-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-BF16.gguf",
+            "size": 907542944,
+            "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+          }
+        ]
+      }
+    },
+    "qfn-iq3-xxs": {
+      "weights": {
+        "source": {
+          "hf": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09"
+        },
+        "include": [
+          "IQ3_XXS/*"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+            "size": 47039860096,
+            "sha256": "219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15"
+          },
+          {
+            "path": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+            "size": 28800138432,
+            "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+          }
+        ]
+      },
+      "mtp": {
+        "source": {
+          "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+        },
+        "include": [
+          "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            "size": 2786568256,
+            "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09"
+        },
+        "include": [
+          "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+            "size": 907543008,
+            "sha256": "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"
+          }
+        ]
+      }
+    },
+    "qfn-iq3-s": {
+      "weights": {
+        "source": {
+          "hf": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09"
+        },
+        "include": [
+          "IQ3_S/*"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+            "size": 54817524224,
+            "sha256": "4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb86465e0f7d2aca3"
+          },
+          {
+            "path": "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+            "size": 28800138432,
+            "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+          }
+        ]
+      },
+      "mtp": {
+        "source": {
+          "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+        },
+        "include": [
+          "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            "size": 2786568256,
+            "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+          }
+        ]
+      },
+      "mmproj": {
+        "source": {
+          "hf": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09"
+        },
+        "include": [
+          "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
+        ],
+        "exclude": [],
+        "files": [
+          {
+            "path": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+            "size": 907543008,
+            "sha256": "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"
+          }
+        ]
+      }
     }
   }
 }

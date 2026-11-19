@@ -47,6 +47,10 @@ bool ProbeFlashNextGguf(const core::GgufReader& reader) {
         name != ".ffn_down_exps.weight") {
       continue;
     }
+    if (name == ".ffn_down_exps.weight" &&
+        tensor.type == core::GgmlType::kQ5_0) {
+      continue;
+    }
     if (std::find(kExpertFormats.begin(), kExpertFormats.end(), tensor.type) ==
         kExpertFormats.end()) {
       return false;

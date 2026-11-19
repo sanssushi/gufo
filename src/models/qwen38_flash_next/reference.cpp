@@ -131,7 +131,7 @@ void ReferenceModel::HcMix(const HcMixer& m, std::span<const float> res,
     v /= static_cast<float>(c_.hc_count);
   }
   if (!inject.empty()) {
-    MatVec(m.inject, 0, xn, inject);
+    cpu::MatVec(m.inject, 0, xn, inject);
   }
 }
 

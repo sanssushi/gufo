@@ -2014,19 +2014,25 @@ void CheckSsmSeparateProjectionQuant(gufo::core::GgmlType type,
                "checkpoint are exact\n";
 }
 
-/// Formats outside the adapter set (Q5_1 is routed down-projection only,
-/// Q4_0 has no GPU kernels) must fail the executor's format probe and both
-/// dense entry points, so a widened whitelist cannot make decode and prefill
-/// disagree. The F16-tile dense set is the K-quant/IQ family: the Q8_0 route
-/// has its own GEMM and the low-bit formats stay on the adapter's MMQ.
+/// Q5_0, Q5_1 and Q4_0 must fail the dense format probe and both dense entry
+/// points with otherwise valid device buffers.
 void CheckDenseRejectsNonDense() {
-  for (int type : {static_cast<int>(q::WeightType::kQ5_1),
+  void* weights = nullptr;
+  float* input = nullptr;
+  float* output = nullptr;
+  CheckHip(hipMalloc(&weights, 65536), "non-dense weights");
+  CheckHip(hipMalloc(&input, 256 * sizeof(float)), "non-dense input");
+  CheckHip(hipMalloc(&output, 128 * sizeof(float)), "non-dense output");
+  CheckHip(hipMemset(weights, 0, 65536), "zero non-dense weights");
+  CheckHip(hipMemset(input, 0, 256 * sizeof(float)), "zero non-dense input");
+  for (int type : {static_cast<int>(q::WeightType::kQ5_0),
+                   static_cast<int>(q::WeightType::kQ5_1),
                    static_cast<int>(gufo::core::GgmlType::kQ4_0)}) {
     if (qfn_mmq_moe_gated_type(type) != 0)
       throw std::runtime_error("dense format probe accepted a non-dense type");
-    if (qfn_mmq_dense(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) == 0)
+    if (qfn_mmq_dense(type, weights, input, output, 1, 1, 256, nullptr) == 0)
       throw std::runtime_error("qfn_mmq_dense accepted a non-dense type");
-    if (qfn_mmq_dense_vec(type, nullptr, nullptr, nullptr, 1, 1, 32, nullptr) ==
+    if (qfn_mmq_dense_vec(type, weights, input, output, 1, 1, 256, nullptr) ==
         0)
       throw std::runtime_error("qfn_mmq_dense_vec accepted a non-dense type");
     if (q::KQuantWmmaType(static_cast<gufo::core::GgmlType>(type)))
@@ -2035,6 +2041,9 @@ void CheckDenseRejectsNonDense() {
                              nullptr, nullptr, 1, 1, 32, nullptr))
       throw std::runtime_error("DenseQuantF16Gemm accepted a non-dense type");
   }
+  CheckHip(hipFree(weights), "free non-dense weights");
+  CheckHip(hipFree(input), "free non-dense input");
+  CheckHip(hipFree(output), "free non-dense output");
   for (q::WeightType type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K,
                              q::WeightType::kQ6_K, q::WeightType::kIQ4_NL,
                              q::WeightType::kIQ3_S, q::WeightType::kIQ4_XS}) {

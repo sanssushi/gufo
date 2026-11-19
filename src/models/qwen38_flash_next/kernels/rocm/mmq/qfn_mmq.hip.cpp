@@ -431,8 +431,7 @@ int qfn_mmq_moe_impl(
     return 0;
 }
 
-// The fused gate/up SwiGLU vector path covers every routed expert format
-// except Q5_1 (down projections only).
+// The fused gate/up SwiGLU vector path excludes Q5_0 and Q5_1.
 extern "C" int qfn_mmq_moe_gated_type(int weight_type) {
   switch (static_cast<ggml_type>(weight_type)) {
     case GGML_TYPE_Q4_K:
@@ -469,7 +468,8 @@ static int moe_vector_projection(const char* tag, int weight_type, const void* W
                                  const void* X_q8 = nullptr,
                                  bool dense_rows = false) {
   const auto type = static_cast<ggml_type>(weight_type);
-  if (!qfn_mmq_moe_gated_type(weight_type) && type != GGML_TYPE_Q5_1) {
+  if (!qfn_mmq_moe_gated_type(weight_type) && type != GGML_TYPE_Q5_1 &&
+      type != GGML_TYPE_Q5_0) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -682,8 +682,8 @@ static int dense_vector_projection(const char* tag, int weight_type,
                                    const void* W, const float* X_f32,
                                    const void* X_q8, float* out_f32, int M,
                                    int N, int K, hipStream_t stream) {
-  // Same formats as qfn_mmq_dense: the routed set without Q5_1 (down
-  // projections only), so decode and prefill accept one dense set.
+  // Same formats as qfn_mmq_dense: the routed set without Q5_0 and Q5_1,
+  // so decode and prefill accept one dense set.
   if (!qfn_mmq_moe_gated_type(weight_type)) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
@@ -730,6 +730,10 @@ static int moe_mmq_projection(int weight_type, const char* tag, const void* W,
                               hipStream_t stream, const void* W_b,
                               float* out_b, const float* X_up = nullptr) {
   switch (static_cast<ggml_type>(weight_type)) {
+    case GGML_TYPE_Q5_0:
+      return qfn_mmq_moe_impl<GGML_TYPE_Q5_0>(
+          tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
+          stream, W_b, out_b, X_up);
     case GGML_TYPE_Q4_K:
       return qfn_mmq_moe_impl<GGML_TYPE_Q4_K>(
           tag, W, X_f32, ids, out_f32, M, K, n_tokens, n_experts, n_expert_used,
@@ -972,6 +976,8 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q5_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);

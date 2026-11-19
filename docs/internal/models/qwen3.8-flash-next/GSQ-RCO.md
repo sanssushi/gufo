@@ -12,12 +12,12 @@ rebased onto upstream `main`.
 
 ## Summary
 
-gufo runs the ISTA-DASLab GSQ-RCO GGUFs of Qwen3.8-Flash-Next: IQ3_XXS
-("xxs", 3.00 bits per weight) and IQ3_S ("s", 3.50 bits per weight). The
-two variants, called mixes below, support the same features as the unsloth
-UD-Q4_K_XL target: AR and MTP generation (with the shared Q8_0 MTP sidecar),
-image input (BF16 mmproj sidecar), the chat template, graph capture, batched
-sessions and serving modes.
+gufo runs three Qwen3.8-Flash-Next targets: ISTA-DASLab GSQ-RCO IQ3_XXS
+("iq3-xxs", 3.00 bits per weight), GSQ-RCO IQ3_S ("iq3-s", 3.50 bits per
+weight) and unsloth UD-IQ4_XS ("iq4-xs"). All three support the same features as
+unsloth UD-Q4_K_XL ("q4"): AR and MTP generation (with the shared Q8_0 MTP
+sidecar), image input (BF16 mmproj sidecar), the chat template, graph capture,
+batched sessions and serving modes.
 
 MTP token generation at a 32768-token context measures the multi-row
 verification forward pass when prompt-lookup drafts bypass the neural draft
@@ -78,22 +78,37 @@ expert runs on a second stream beside the routed experts; the epilogue waits
 for the Z rows before it reads them. Q8_0 shared experts also overlap routed
 experts in decode when startup calibration selects that layout.
 
+The executor uses permanent narrow scratch and demand-mapped wide scratch for
+lone prefill passes. Both sets reserve padded BF16 mixer norm rows when needed
+and share the fixed zero expert IDs used by decode. Wide scratch is released
+before decoding and when the runner becomes idle.
+
 ## Targets and artifacts
 
 | Item | Description |
 | --- | --- |
-| GSQ-RCO GGUFs | [ISTA-DASLab GSQ-RCO releases](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) of Qwen3.8-Flash-Next: IQ3_XXS ("xxs", 3.00 bits per weight) and IQ3_S ("s", 3.50 bits per weight), each with the BF16 mmproj sidecar; these repos have no MTP file, so the shared Q8_0 MTP sidecar comes from unsloth's repo |
-| Control | unsloth UD-Q4_K_XL (4 shards): the speed and quality baseline for this feature |
+| iq3-xxs | [ISTA-DASLab GSQ-RCO IQ3_XXS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), installed as `qfn-iq3-xxs` with the BF16 mmproj and shared Q8_0 MTP sidecars |
+| iq3-s | [ISTA-DASLab GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), installed as `qfn-iq3-s` with the BF16 mmproj and shared Q8_0 MTP sidecars |
+| iq4-xs | [unsloth UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (4 shards), installed as `qfn-iq4-xs` with the shared MTP and image sidecars |
+| q4 control | unsloth UD-Q4_K_XL (4 shards): the speed and quality baseline |
 | Reference implementation | GSQHalo.cpp (a llama.cpp fork): read-only reference for the formats and kernel ideas |
+
+Install a target with `gufo model install qfn-iq3-xxs`,
+`gufo model install qfn-iq3-s` or `gufo model install qfn-iq4-xs`.
+Pass its ID to `--model`, or use the path of a separately downloaded GGUF.
+The install output gives the sidecar paths for `--mtp-model` and `--mmproj`.
 
 Facts that shape the implementation:
 
 - Shard 2 of a GSQ mix contains a single tensor, the per-layer token-embedding
   (PLE) table (`per_layer_token_embd.weight`, IQ4_NL); shard discovery
   handles this unbalanced layout.
-- Images and MTP use the shared Q8_0 and BF16 sidecars. These attach by
-  identity keys, not by weight type, so they work with GSQ targets.
-- Each mix stores these types per role:
+- Images and MTP use the shared BF16 and Q8_0 sidecars. These attach by
+  identity keys, not by weight type, so they work with iq3-xxs, iq3-s and iq4-xs.
+- UD-IQ4_XS has a metadata-only first shard; its experts mix IQ3_XXS,
+  IQ2_S and IQ4_XS gate/up projections with Q5_0, Q2_0 and IQ4_NL down
+  projections. Its token embedding is IQ4_XS and its output is Q6_K.
+- The two GSQ mixes store these types per role:
 
 | Role | Types |
 | --- | --- |
@@ -102,23 +117,23 @@ Facts that shape the implementation:
 | routed experts | Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS |
 | PLE key/value | BF16 |
 | hyper-connection mixers (`hc_*`) | BF16 |
-| `token_embd` | IQ3_S (xxs) or IQ4_XS (s) |
-| `output` | Q5_K (xxs) or Q6_K (s) |
+| `token_embd` | IQ3_S (iq3-xxs) or IQ4_XS (iq3-s) |
+| `output` | Q5_K (iq3-xxs) or Q6_K (iq3-s) |
 | `ple_conv1d` | F16 |
 | router, `ffn_gate_inp_shexp` and GDN alpha/beta | BF16 |
 
-- Only 4 of 12 attention layers in xxs and 5 of 12 in s, plus 9 of 36 SSM
-  layers in xxs and 12 of 36 in s, have all their projections in one
-  quantization type. Attention and SSM stacking therefore merges only those
-  groups (see "Stacked attention and SSM projections").
+- Only 4 of 12 attention layers in iq3-xxs and 5 of 12 in iq3-s, plus 9 of 36
+  SSM layers in iq3-xxs and 12 of 36 in iq3-s, have all their projections in
+  one quantization type. Attention and SSM stacking therefore merges only
+  those groups (see "Stacked attention and SSM projections").
 
 ## Type layer (`src/core`)
 
 - `gguf_reader.hpp` `GgmlType` includes `kIQ2_XS = 17`, `kIQ3_XXS = 18`,
   `kIQ2_S = 22` and `kQ2_0 = 42`. The numbers are GGUF type ids; all other
-  ids keep their values (never renumber). Q2_0 has no upstream id and follows
-  GSQHalo's `block_q2_0` layout: an fp16 scale, 16 code bytes and 64 weights
-  per block. Keep it isolated in the quant layer.
+  ids keep their values (never renumber). Q2_0 uses the same id and
+  `block_q2_0` layout as GSQHalo and current llama.cpp: an fp16 scale,
+  16 code bytes and 64 weights per block. Keep it isolated in the quant layer.
 - `quant/ggml_dequant.{hpp,cpp}` defines the block structs, row sizes, CPU
   dequantization and f32 dot products for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
   IQ3_S, IQ4_NL, IQ4_XS and Q2_0. Its grid and sign tables match GSQHalo's
@@ -140,13 +155,13 @@ Facts that shape the implementation:
 `src/models/qwen38_flash_next/weights.cpp`:
 
 - `FormatOf` maps each type to its block geometry (elements and bytes):
-  Q2_0 {64,18}, IQ2_XXS {256,66}, IQ2_XS {256,74}, IQ2_S {256,82},
+  Q5_0 {32,22}, Q2_0 {64,18}, IQ2_XXS {256,66}, IQ2_XS {256,74}, IQ2_S {256,82},
   IQ3_XXS {256,98}, IQ3_S {256,110}, IQ4_XS {256,136}. The values duplicate
   `quant::QuantizedBlockElements`/`QuantizedRowBytes`; the two definitions
   agree.
-- Per-role allowed-type lists. Each list is exactly the union of the types
-  used in the two mixes' per-tensor allocation maps plus the types accepted
-  for UD-Q4_K_XL, and no wider. The GSQ types by role are:
+- Per-role allowed-type lists. The lists cover the GSQ mixes, UD-Q4_K_XL
+  and UD-IQ4_XS. Q5_0 is accepted for routed down projections only. The
+  GSQ types by role are:
 
 | Role | Types |
 | --- | --- |
@@ -154,7 +169,7 @@ Facts that shape the implementation:
 | shared expert (ffn_*_shexp) | Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ4_NL, Q2_0 |
 | experts (ffn_*_exps) | IQ4_NL, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS |
 | embd (token_embd) | IQ3_S, IQ4_XS |
-| output | Q5_K (xxs), Q6_K (s) |
+| output | Q5_K (iq3-xxs), Q6_K (iq3-s) |
 | router, ffn_gate_inp_shexp, GDN alpha/beta | BF16 |
 | ple_conv1d | F16 |
 | hc_*, ssm_alpha/beta | BF16 |
@@ -177,9 +192,9 @@ Facts that shape the implementation:
   zeroed tail too.
 - `qwen38_flash_next.weights` checks each role's accepted types and that
   disallowed types are rejected.
-- The provider probe accepts the supported GSQ expert formats and declines
-  unsupported canonical trunk expert formats. `qwen38_flash_next.probe`
-  checks each supported format and the rejected and ignored tensor cases.
+- The provider probe accepts the supported GSQ expert formats and Q5_0 down
+  projections, and declines unsupported trunk expert formats.
+  `qwen38_flash_next.probe` checks accepted and rejected roles.
 
 ## GPU execution paths
 
@@ -196,11 +211,11 @@ vendored code is re-imported (see "Vendored-code obligations").
 
 - Gate/up projections use IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS
   or Q2_0 (plus Q4_K, Q5_K, Q5_1 and Q8_0). Down projections
-  use IQ4_NL or Q2_0 (plus Q5_K, Q5_1 and Q8_0).
+  use IQ4_NL, Q2_0 or Q5_0 (plus Q5_K, Q5_1 and Q8_0).
 - Small batches (up to 8 rows) use MMVQ. `moe_vector_projection` covers every
   routed format; its supported set is the set defined by
-  `qfn_mmq_moe_gated_type`, plus Q5_1. The fused SwiGLU gated vector path in
-  `mmvq.hip.cpp` supports every routed format except Q5_1 and handles up to
+  `qfn_mmq_moe_gated_type`, plus Q5_0 and Q5_1. The fused SwiGLU gated vector path in
+  `mmvq.hip.cpp` excludes Q5_0 and Q5_1 and handles up to
   eight rows, apart from the formats that take the grouped batch below. For a
   group's shared expert, the grouped gated kernel decodes a weight fragment
   once per row and K block, then reuses it for every token in the group.
@@ -211,12 +226,13 @@ vendored code is re-imported (see "Vendored-code obligations").
   through `qfn_mmq.h`); the executor's `GatedMoeType` delegates to it, so the
   two sets cannot differ.
 - A verification batch wider than eight rows groups its rows by expert.
-  `group_moe_batch` compacts every slot of every row into groups of up to
-  eight tokens that share one expert, in one device-side list that the
-  kernels consume without downloading its count. Q4_K keeps its wave64 batch
-  kernel. The low-bit IQ gate/up formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  The device-side lists hold groups of up to eight tokens sharing one expert,
+  and the kernels consume them without downloading their counts. Q4_K uses
+  `group_moe_batch_split` and the wave32 batch kernels, with separate lists for
+  single-token and multi-token groups. The low-bit IQ gate/up formats
+  (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
   IQ3_S, IQ4_XS) run `mul_mat_vec_moe_batch_groups` in `mmvq.hip.cpp`: two
-  block rows walk the list and the gate and up halves stay in separate
+  block rows walk the list from `group_moe_batch` and the gate and up halves stay in separate
   waves. The five IQ2/IQ3 formats decode each group's `IqMoeFragment` once
   per row and K block and apply it to every token of the group; IQ4_XS
   applies its vector dot product per token. Groups with one active token
@@ -227,7 +243,7 @@ vendored code is re-imported (see "Vendored-code obligations").
   vector waves, and every other gated format keeps them at every width.
 - `MoeBatch` takes that route when the gate and up projections share a format
   and shape, that format is a grouped one, and the batch uses at most 32
-  experts per token. It then runs one gate/up launch over the whole batch,
+  experts per token. It then runs grouped gate/up over the whole batch,
   one vector down call over the batch's `rows x experts_used` slot rows, and
   one epilogue. Any other routed format keeps the eight-row `MoeExperts`
   chunks. The multi-token single-expert waves belong to the dense entry
@@ -256,7 +272,7 @@ vendored code is re-imported (see "Vendored-code obligations").
   tile streams and re-decodes a full slice of a weight row.
 - For the low-bit expert formats, the main prefill path is the F16-tile WMMA
   route. `RoutedF16GEMMKernel` uses `kLowBit` sub-block staging to dequantize
-  rows of the eight low-bit expert formats into F16 tiles with the shared
+  rows of the nine low-bit expert formats into F16 tiles with the shared
   `DecodeQuantSub16` decoders (`src/families/qwen/hip_common/quant_ops.hpp`). The
   paired gate/up SwiGLU fusion runs in the same pass. The IQ2/IQ3 sub-block
   decoders build four signed-byte words from the grid entries one group at
@@ -287,9 +303,12 @@ vendored code is re-imported (see "Vendored-code obligations").
   `RoutedDownF16Kernel` owns 128 output rows per block over the 128-token
   map, sixteen rows per wave, and each lane decodes its own 16-element
   sub-block of both K32 blocks of a stage. Q5_1 and Q8_0 read their stored
-  block forms; Q2_0 and IQ4_NL decode through `DecodeQuantSub16` and take the
-  sub-block's half-rounded `(scale, -offset)` pair with the signed-byte
-  magic. The partner lane supplies the other K16 half of each K32 block
+  block forms; Q5_0 loads its packed codes and high bits ahead of compute,
+  then expands four codes at a time. Its 1040 F16 magic maps unsigned codes
+  to the same signed values as the separate projection. Q2_0 and IQ4_NL
+  decode through `DecodeQuantSub16` and take the sub-block's half-rounded
+  `(scale, -offset)` pair with the signed-byte magic. The partner lane supplies
+  the other K16 half of each K32 block
   (`SwapHalves`), the two K16 WMMA per block run in K order, and the F16
   results are stored once per row. Every output keeps the separate
   projections' bytes at every tile height. The other low-bit down formats
@@ -313,8 +332,7 @@ vendored code is re-imported (see "Vendored-code obligations").
   a Q8_0 tile so the Q8_0 vector dot products apply; and the
   `mmq_type_traits` and tile/DS-layout cases in
   `mmq.hpp`/`common.hpp`/`vecdotq.hpp`.
-- `moe_wave64.hip.cpp` needs no changes: it is a Q4_K-only batch kernel with
-  no type check.
+- `moe_wave32.hip.cpp` implements the Q4_K grouped batch kernels.
 
 ### Dense projections, heads and embeddings
 
@@ -323,8 +341,8 @@ vendored code is re-imported (see "Vendored-code obligations").
   IQ4_NL and IQ4_XS. `qfn_mmq_dense_vec(M, N, K)` (same argument order as
   its siblings) routes through `moe_vector_projection` with
   `n_experts = n_expert_used = 1` and a pool-allocated zeroed ids buffer. It
-  accepts the same formats as the gated path; Q5_1 is rejected by both, so
-  decode and prefill cannot disagree. The single-expert entry keeps the
+  accepts the same formats as the gated path; Q5_0 and Q5_1 are rejected by
+  both, so decode and prefill cannot disagree. The single-expert entry keeps the
   eight-row waves for a decode-width batch; a wider batch runs every full
   group in one grid (`blockIdx.y`) and the ragged tail on the narrower
   specializations, up to the wide verification width.
@@ -625,7 +643,7 @@ Breaking any of them silently breaks session or audit replay.
 
 - Operator tests compare each type and role (dense, routed, paired, gated,
   head, embedding) exactly against F64 references computed by CPU
-  dequantization. The 28 `qwen38_flash_next.*` ctest suites are 18 HIP
+  dequantization. The 29 `qwen38_flash_next.*` ctest suites are 18 HIP
   suites — the 15 operator suites (`mtp_ops`, `blaslt_ops`, `hc_mix_ops`,
   `hc_route_ops`, `gdn_ops`, `attention_ops`, `moe_epilogue_ops`,
   `moe_ids_ops`, `ple_ops`, `projection_ops`, `routed_wmma_ops`, `select_ops`,
@@ -633,7 +651,7 @@ Breaking any of them silently breaks session or audit replay.
   `decode_graph`, `in_pass_checkpoints` and `layered_prefill`, which check
   graph replay, checkpoint frontiers and interleaved prefill — plus the CPU suites (`runner_options`, `config`,
   `continuation_layout`, `ngram`, `mtp_sampling`, `probe`, `prompt_lookup`,
-  `rope_scaling`, `rope_scaling_oracle`, `weights`).
+  `rope_scaling`, `rope_scaling_oracle`, `weights`, `catalog`).
 - FMA and accumulation: every shared MMQ vector-dot accumulation is pinned
   with `__fadd_rn`/`__fmaf_rn` (`mmq.hpp` typed cases and `vecdotq.hpp`).
   Tests pin chunk-width exactness and the dense MMQ tile width. The Q6_K
@@ -823,7 +841,7 @@ Breaking any of them silently breaks session or audit replay.
   deferred (`kPrior`) and separate paths; a split form diverges at Q8
   rounding boundaries in this compilation context. The
   routed SwiGLU-in-down-quantize codes are bit-identical to `SwigluKernel`
-  followed by the plain entry for all thirteen routed formats
+  followed by the plain entry for all fourteen routed formats
   (`CheckSiluDownMmq`). The grouped gated vector's IQ2/IQ3 fragment reuse
   keeps each format's integer scale formula, `dp4a` order and float scale
   product. The float scale product uses the same multiplication order as the
@@ -845,21 +863,26 @@ Breaking any of them silently breaks session or audit replay.
 - Whole-block rules: MMQ entry points require whole weight blocks
   (`K % block_elements == 0`); Q2_0's 64-weight block with K ≡ 32 mod 64
   must fail, not truncate. Q2_0 tail cases at k=64 and k=320, and dense
-  tight-K cases, carry zeroed weight tails. Tests verify that Q5_1 and Q4_0
-  are rejected at the executor probe and at both dense entry points.
+  tight-K cases, carry zeroed weight tails. Tests verify that Q5_0, Q5_1 and
+  Q4_0 are rejected at the executor probe and both dense entry points with
+  valid device buffers.
 - MTP audit: `--mtp-audit` pins the reference check's down-projection inputs
   to the GPU's SwiGLU outputs (`stage_inputs`), with loose stage comparisons
   (2e-3) and a tight `ffn-experts` comparison (5e-5). Without this,
   ulp-level GPU-vs-F64 noise flips one Q8_1 code and amplifies to 5e-4
   divergence. This is a property of the probe only; production runs on the
-  GPU alone and is deterministic.
+  GPU alone and is deterministic. The scalar injection projection uses
+  unquantized activations, matching the GPU's F32-expanded injection weights.
+  The audit sums every scalar inject partial and compares it with the
+  independent projection; wide traces use the vectorized partial layout.
 - Draft-vocabulary checks compare the small-head greedy continuation and
   final logits byte-exactly with full-head AR. The MTP audit compares real
-  table-row scores and remapped rare-token IDs with an independent full-head
-  projection, including empty-slot masking, table replacement, scalar heads,
-  all-small-head batches and mixed full/small-head batches. Its one-row
-  prefix guarantees rare-token candidate coverage independently of generated
-  language or neural-draft acceptance rate.
+  table-row scores and remapped rare-token IDs with a full-head projection;
+  it checks the prefix against the draft projection when the prefix is Q4.
+  It covers empty-slot masking, table replacement, scalar heads, all-small-head
+  batches and mixed full/small-head batches. Its one-row prefix guarantees
+  rare-token candidate coverage independently of generated language or
+  neural-draft acceptance rate.
 - Determinism: at depth 32768 the completion SHA-256 is
   `d856f78e53b98c09031ee55f8a76ba0b49acde5e1186a8330e007361cfd73b57`.
   MTP uses 10 cycles, with 118 drafted and accepted tokens and 108 prompt
@@ -873,13 +896,12 @@ Breaking any of them silently breaks session or audit replay.
 
 ## Verification
 
-From a clone with the GSQ-RCO GGUFs (and, for control comparisons, the
-unsloth UD-Q4_K_XL GGUFs):
+From a clone with the iq3-xxs, iq3-s, iq4-xs and q4 GGUFs:
 
 ```sh
 # Tests (RelWithDebInfo + assertions)
 cmake --preset gpu-test && cmake --build --preset gpu-test
-ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 28 suites
+ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 29 suites
 ctest --preset gpu-full -R 'ggml_dequant_test|ggml_gemm_parity_test|qwen_gemm_route_test'
 # In-pass checkpoint suite (needs the model and MTP shard paths):
 QWEN38_FLASH_NEXT_MODEL=FIRST.gguf QWEN38_FLASH_NEXT_MTP_MODEL=MTP.gguf \
@@ -890,43 +912,52 @@ cmake --preset release && cmake --build --preset release   # -> build/release/gu
 ```
 
 - Session replay: `qwen38_flash_next_session_test` runs with a model path:
-  `session_test --model FIRST.gguf --mtp-model MTP.gguf` on xxs/s/q4. It
-  covers prefill chunking, image prefill, graph capture/replay, batched
-  sessions and serving modes; focused flags exist for each area.
+  `session_test --model FIRST.gguf --mtp-model MTP.gguf` on
+  iq3-xxs/iq3-s/q4/iq4-xs. It covers prefill chunking, image prefill, graph
+  capture/replay, batched sessions and serving modes; focused flags exist for
+  each area.
 - MTP audit: `gpu_probe --model FIRST_SHARD.gguf --prompt TEXT --mtp-model
-  MTP.gguf --mtp-audit` on xxs/s/q4.
+  MTP.gguf --mtp-audit` on iq3-xxs/iq3-s/q4/iq4-xs.
 - Reference probe: `gpu_probe --model … --prompt … --reference`.
 - Functional API baselines: `tests/functional/run.py --record-baseline`
   then compare; suites `discovery responses conversation batch
   sampling-defaults state-edges`, modes `off` and `mtp` (`off` = zero
   drafts, `mtp` = real draft execution).
+- iq4-xs verification covers AR and MTP, session replay, in-pass checkpoints,
+  the reference probe and `pp2048/tg128` at depths 0 and 32768.
 
 ## Performance state
 
-The measurements below are from November 2026 on AMD Strix Halo (`gfx1151`).
+The speed ratios below use AMD Strix Halo (`gfx1151`).
 Component measurements describe the measured shapes.
 
-Benchmark setup: `gufo bench`, greedy, `-p 2048 -n 128 -d 0,32768 -r 1 -v`,
-single user. Depth (`d`) is the number of context tokens before generation;
+As of November 2026, the benchmark setup is `gufo bench`, greedy,
+`-p 2048 -n 128 -d 0,32768 -r 1 -v`, single user. Depth (`d`) is the number
+of context tokens before generation;
 `tg128` is 128 generated tokens and `pp2048` is a 2048-token prompt.
 The shared Q8_0 MTP sidecar is attached in MTP mode for the MTP measurements
-and detached (`--speculative off`) for the AR measurements. One binary runs
-all three models. Each cell uses the better of the two same-round matched
-deltas (the mix against that round's control). Depth-0
-cells are advisory and follow run noise and, for MTP, the draft acceptance
+and detached (`--speculative none`) for the AR measurements. Each cell
+compares a target and q4 on the same binary and uses the better of the two
+same-round matched deltas. Depth-0 cells are advisory and follow run noise
+and, for MTP, the draft acceptance
 rate; the depth-32768 cells compare the stable long-context path. Negative
-values mean the GSQ mix is slower than the control.
+values mean the target is slower than the control.
+All cells use four-target rounds.
 
-| Mode | Test | xxs vs q4 | s vs q4 |
-| --- | --- | ---: | ---: |
-| AR | pp2048, d0 | -6.07% | -7.64% |
-| AR | pp2048, d32768 | -5.92% | -6.36% |
-| AR | tg128, d0 | +18.70% | +11.74% |
-| AR | tg128, d32768 | +1.33% | -4.08% |
-| MTP | pp2048, d0 | -6.10% | -6.74% |
-| MTP | pp2048, d32768 | -5.55% | -6.21% |
-| MTP | tg128, d0 | +19.37% | -21.28% |
-| MTP | tg128, d32768 | -1.58% | -5.41% |
+| Mode | Test | iq3-xxs vs q4 | iq3-s vs q4 | iq4-xs vs q4 |
+| --- | --- | ---: | ---: | ---: |
+| AR | pp2048, d0 | -7.01% | -7.28% | -7.45% |
+| AR | pp2048, d32768 | -5.98% | -6.73% | -5.87% |
+| AR | tg128, d0 | +22.10% | +13.92% | +30.83% |
+| AR | tg128, d32768 | +5.37% | -1.59% | +10.88% |
+| MTP | pp2048, d0 | -7.46% | -6.78% | -9.05% |
+| MTP | pp2048, d32768 | -5.72% | -6.45% | -6.07% |
+| MTP | tg128, d0 | +3.20% | -21.15% | -17.82% |
+| MTP | tg128, d32768 | +6.40% | -0.90% | +0.17% |
+
+MTP pp2048/d32768 q4/iq4-xs pairs measure 1467.04/1378.01 and
+1465.50/1301.59 tok/s. The AR depth-0 Q4 decode control is
+24.07 and 27.88 tok/s across the two rounds. Both cells vary across rounds.
 
 ### Decode
 
@@ -936,7 +967,7 @@ values mean the GSQ mix is slower than the control.
   waves; from sixteen rows they reuse each weight row across the group with
   exact lane-partial integer WMMA at about twice the eight-row Q5_K
   throughput and above the eight-row Q6_K throughput on the production dense
-  and head shapes, below the control's Q8_0 integer-WMMA batch path. The s
+  and head shapes, below the control's Q8_0 integer-WMMA batch path. The iq3-s
   Q6_K head at those widths moves 2.6 GB in 22.1 ms (118 GB/s) against
   196 GB/s for the same run's eight-row head calls and the 216 GB/s measured
   peak, so the sixteen-token head has bandwidth headroom; per token it
@@ -993,6 +1024,10 @@ values mean the GSQ mix is slower than the control.
   epilogues. Depth-0 throughput differences are advisory; their spread
   follows run noise and the control's own depth-0 rate and does not
   indicate a different dispatch path.
+- The Q5_0 routed down projection measures 4.12–4.14 ms on a synthetic
+  pp2048 expert layer. The independent routed operator checks cover the
+  Q5_0 F16 route at 16-, 48-, 64- and 128-token tiles and pin its output
+  against the separate projection and CPU-dequantized reference.
 
 ### Rejected options
 
@@ -1015,8 +1050,8 @@ values mean the GSQ mix is slower than the control.
   multiplies BF16-to-F16 weight staging per token, and at 128 tokens the
   halved barrier count does not offset the larger stage. The register-held
   weight path for SSM projections is Q8_0-only. The register variant
-  measures 53.9-54.3 ms (xxs) and 70.2 ms (s) on the warmed pp2048 forward
-  pass, against 48.7-49.2 and 66.2 ms with LDS staging. The half-wave
+  measures 53.9-54.3 ms (iq3-xxs) and 70.2 ms (iq3-s) on the warmed pp2048
+  forward pass, against 48.7-49.2 and 66.2 ms with LDS staging. The half-wave
   exchange costs sixteen lane permutes per K32 block, where the staged path
   costs twelve LDS instructions, and the low-bit decode itself requires the
   LDS round trip.
@@ -1025,7 +1060,7 @@ values mean the GSQ mix is slower than the control.
   instructions but leaves the complete projection and whole-model prefill
   unchanged: the 28-call padded SSM output stays flat within run noise, the
   11 contiguous attention output calls do not improve, and the dense family
-  is not the s-mix residual. The signed-byte decoder stays.
+  is not the iq3-s residual. The signed-byte decoder stays.
 - The 64-row narrow tile and the BK=2/WM=8/WN=1 plan are slower for the
   K-quant/IQ dense route. At 2048 tokens the narrow tile reads 4.6-4.7 ms
   against 3.8 ms for the 512-row K/V and indexer projections and is flat at
@@ -1047,7 +1082,7 @@ values mean the GSQ mix is slower than the control.
   hyper-connection bytes and the exactness contract. The exact BF16 F16 path
   stays.
 - Expert-ordered quantization and scatter for the routed IQ4_NL down
-  projection (39 of 48 s layers) measures a 2.5% shorter down stage (186.4
+  projection (39 of 48 iq3-s layers) measures a 2.5% shorter down stage (186.4
   to 181.7 ms over the 32K verification) and no whole-request gain
   (control-corrected -0.58% and -0.12% in alternating rounds). About 25% of
   the width-8 slot rows repeat an expert, but those weight rows are already
@@ -1082,14 +1117,64 @@ values mean the GSQ mix is slower than the control.
   cache already serves the byte-grid loads, so the added expansion costs
   more than the narrower entries save. The byte-grid decoders stay, and the
   routed low-bit gate/up stage is format-bound.
+- Packed IQ2/IQ3 sign negation with XOR and per-byte increments matches
+  32,512 independent byte-level cases and the synthetic routed-output hashes,
+  but its 2,048-token gate/up timings overlap the existing IQ3_XXS timings
+  and are slower for IQ2_S. The existing sign path stays.
+- Issuing the next activation loads before low-bit weight decoding in the
+  routed pair preserves the routed operator checks but does not improve the
+  synthetic 2,048-token gate/up stage. IQ3_XXS measures 7.11/6.88 ms against
+  7.37/6.93 ms; IQ2_S measures 7.47/7.55 ms against 7.54/7.63 ms. The
+  existing fetch order stays.
+- Staging the IQ3_XXS grid in each routed-pair block's LDS preserves the
+  routed operator checks but leaves the synthetic 2,048-token gate/up stage
+  essentially unchanged: 7.158/7.155 ms against 7.145/7.149 ms. The existing
+  device-grid reads stay.
+- An IQ3_XXS signed-grid lookup uses a 16 KiB table indexed by grid code and
+  four sign bits. All 4,096 words match an independent byte formula and the
+  routed operator checks pass, but the synthetic 2,048-token gate/up stage
+  measures 6.985/7.163 ms against 6.831/7.034 ms. The magnitude-grid and
+  sign-application path stays.
+- A 16-entry sign-mask lookup for the IQ2_S and IQ3_XXS routed pair passes
+  an independent byte-sign oracle and the routed operator checks, but
+  synthetic gate/up and real-model prefill screens show no stable gain.
+  The existing sign-mask expansion stays.
+- Iterative-ILP scheduling on a standalone Q6_K sixteen-token verification
+  tile preserves finite output bytes on the real [6144,2560] projection and
+  [248320,2560] head at 16 and 20 rows. The projection measures 104.04/151.75
+  µs against 102.80/151.20 µs; the head measures 4123.02/6531.22 µs against
+  4111.10/6533.74 µs. The production scheduling stays.
+- Four-lane reduction of the Q6_K sixteen-token tile preserves the original
+  32-partial FP32 tree and matches the real-weight output bytes, but measures
+  slower at widths 16 and 20 on both the [6144,2560] projection and
+  [248320,2560] head. The one-thread-per-output reduction stays.
+- Separate single-token IQ expert groups in short verification are slower
+  for synthetic IQ3_XXS mixed routing at widths 4 and 8 and for IQ2_S
+  mixed routing at width 4. IQ2_S at width 8 gains 2.4–2.8% on mixed
+  routing but loses 1.1–3.2% on disjoint routing. The existing grouped
+  route stays.
+- A 64-row compact-list grid for wide IQ gate/up groups measures 2.47–4.28%
+  slower for synthetic IQ2_S mixed routing at widths 16 and 20; IQ3_XXS is
+  flat or slower. A width-20 spread route with repeated experts is slower for
+  both types. The 32-row grid stays.
+- Two independent integer dot chains per IQ3_XXS fragment preserve the
+  synthetic grouped-output bytes. Width-8 disjoint routing measures
+  0.53–0.69% faster, while mixed routing is flat and shared routing is
+  0.18–0.43% slower. The single chain stays.
+- A combined IQ3_XXS two-chain dot, width-8 IQ2_S singleton split, IQ2_S
+  and IQ3_XXS prefill sign-mask lookup, and Q6_K iterative scheduling show
+  mixed deep iq3-s timings across alternating comparisons. One depth-0
+  decode outlier has an identical completion and draft trajectory; its cause
+  is unknown. The existing paths stay.
 - Mixed-type SSM and attention launch fusion: one block-uniform launch over
   the 16384-row SSM stack or the 13312-row attention stack does not pay for
   itself. With one type on both sides, so only the launch structure differs,
   the SSM form gains 0.12-0.23 ms per layer for Q4_K/Q5_K/Q6_K and about
   zero for IQ4_XS; the attention form gains 0.7-0.9 ms per layer for
   Q4_K/Q5_K/Q6_K but loses 1.2-1.7 ms for IQ4_XS/IQ3_S. Weighted by the
-  mixed layers, the SSM gain is 3.5 ms (xxs) / 3.7 ms (s) and the attention
-  change is -5.8 ms (xxs) / -1.5 ms (s). The separate launches stay.
+  mixed layers, the SSM gain is 3.5 ms (iq3-xxs) / 3.7 ms (iq3-s) and the
+  attention change is -5.8 ms (iq3-xxs) / -1.5 ms (iq3-s). The separate
+  launches stay.
 - F32 expansion and F16 pre-conversion of the BF16 small projections:
   storing the BF16 small-K weights as F32 is exact, but the SGEMM route
   measures 41.8 ms on [10240,2560] at 2,048 tokens against 5.2 ms for the
@@ -1105,11 +1190,11 @@ values mean the GSQ mix is slower than the control.
 ### Control
 
 - At depth 32768, UD-Q4_K_XL on the fork and `main` produces the same
-  completion hash and MTP trajectory. AR pp2048 measures 1548.87/1550.42
-  tokens/s on the fork and 1548.27/1552.48 tokens/s on `main`; AR tg128
-  measures 27.75/27.78 and 27.74/27.74 tokens/s. MTP pp2048 measures
-  1494.43/1496.75 and 1492.51/1494.34 tokens/s; MTP tg128 measures
-  110.93/110.96 and 110.46/110.32 tokens/s. The paired comparisons meet
+  completion hash and MTP trajectory. AR pp2048 measures 1555.30/1547.44
+  tokens/s on the fork and 1556.18/1544.30 tokens/s on `main`; AR tg128
+  measures 27.69/27.65 and 27.65/27.65 tokens/s. MTP pp2048 measures
+  1480.36/1480.60 and 1481.56/1480.34 tokens/s; MTP tg128 measures
+  109.70/109.89 and 104.28/109.44 tokens/s. The paired comparisons meet
   the control timing bounds.
 
 ## Vendored-code obligations
@@ -1137,7 +1222,7 @@ re-imports must re-apply the recorded blocks.
 - `weights.cpp` `FormatOf` block geometry duplicates
   `quant::QuantizedBlockElements`/`QuantizedRowBytes`; this is an intentional
   duplicate and the values agree.
-- Q2_0 is a non-upstream type id (42); keep it isolated in the quant layer.
+- Q2_0 uses type id 42; keep its format handling isolated in the quant layer.
 - Multi-session batched decode keeps eight-row dense waves: the adapter's
   quantized formats group their full rows in one launch, while the
   unquantized matrices (except the grouped BF16 hyper-connection down
@@ -1167,7 +1252,7 @@ re-imports must re-apply the recorded blocks.
 | Vendored MMQ | `kernels/rocm/mmq/{mmq.hpp, mmvq.hpp, vecdotq.hpp, common.hpp, ggml-common.h, …}`, `VENDOR.md` |
 | Shared decoders | `src/families/qwen/hip_common/quant_ops.hpp` (`DecodeQuantSub16`, IQ2/IQ3 grid-group decode) |
 | Executor / dispatch | `src/models/qwen38_flash_next/kernels/rocm/executor.cpp`, `batch.cpp` |
-| Other kernels | `kernels.hip.cpp` (`DenseF16GEMMKernel`/`UnquantizedF16Gemm`, `HcDownF16SiluGemm`, `AttentionF16Gemm`/`AttentionMixedF16Gemm`, `DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmKernel`, `SmallGemmWideKernel`/`SmallGemmWideBatch`), `w8a8_wave64.hip` (`KQuantWmmaType`), `moe_wave64.hip.cpp` (Q4_K-only, no type check), small-batch/prefill waves under `src/families/qwen/kernels/` |
+| Other kernels | `kernels.hip.cpp` (`DenseF16GEMMKernel`/`UnquantizedF16Gemm`, `HcDownF16SiluGemm`, `AttentionF16Gemm`/`AttentionMixedF16Gemm`, `DenseQuantF16SsmGemm`/`SsmConvBoundaryKernel`, `SmallGemmKernel`, `SmallGemmWideKernel`/`SmallGemmWideBatch`), `w8a8_wave64.hip` (`KQuantWmmaType`), `moe_wave32.hip.cpp` (Q4_K grouped batch), small-batch/prefill waves under `src/families/qwen/kernels/` |
 | Operator tests | `tests/models/qwen38_flash_next/*_test.cpp`, `mtp_audit.cpp`, `gpu_probe.cpp`, `reference_probe.cpp` |
 | Core quant tests | `tests/core/ggml_dequant_test.cpp` |
 | Benchmark and profiling tools | `tools/bench/`, `tools/prof/prof.py`, `tools/prof/isa_mix.py` |

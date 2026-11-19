@@ -8,17 +8,21 @@ sources with HIP for AMD Strix Halo (`gfx1151`).
 `qfn_mmq.h` is the public adapter. It supplies dense, shexpert and head
 projections for Q8_0, Q2_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S,
 IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, and routed expert projections for the
-same formats plus Q5_1, including the paired gate/up and fused SwiGLU vector
-paths. `qfn_ggml_stubs.*` supplies the minimal context and
+same formats plus Q5_0 and Q5_1. Q5_0 is accepted only for down projections;
+the fused SwiGLU gate/up vector path excludes Q5_0 and Q5_1.
+`qfn_ggml_stubs.*` supplies the minimal context and
 scratch pool without the ggml graph runtime. Gufo owns scheduling and HIP graphs.
+`mmvq.hip.cpp` dispatches Q5_0 through its existing Q5_0 vector-dot helper
+and block geometry for routed down projections.
 
 Local additions beyond the import (GSQ-RCO support) live beside their
 upstream neighbors: `block_q2_0` plus `QK2_0`/`QI2_0`/`QR2_0` in
 `ggml-common.h`, `load_tiles_q2_0` and the `mmq_type_traits` case in
 `mmq.hpp`, `vec_dot_q2_0_q8_1` with `VDR_Q2_0_Q8_1_MMVQ`/`VDR_Q2_0_Q8_1_MMQ`
 in `vecdotq.hpp`, and the `ggml_hip_type_traits` case in `common.hpp`. Q2_0
-(GGUF type id 42) is not an upstream llama.cpp id; `QI2_0` counts vec-dot
-chunks, not packed int32s. The Q6_K MMVQ vec-dot
+(GGUF type id 42) is absent from the pinned llama.cpp revision; current
+llama.cpp uses the same id and block layout. `QI2_0` counts vec-dot chunks,
+not packed int32s. The Q6_K MMVQ vec-dot
 (`vec_dot_q6_K_q8_1_impl_mmvq`) converts each group of unsigned six-bit
 codes to signed bytes with one packed add of `0x60606060` and an XOR of
 `0x80808080`; the codes are in [0, 63], so the add cannot carry between

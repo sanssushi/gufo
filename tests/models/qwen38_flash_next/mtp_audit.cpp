@@ -14,9 +14,9 @@
 #include <string>
 #include <vector>
 
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/cpu_ops.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -50,7 +50,7 @@ struct Trace {
       ffn_output, ffn_gate, ffn_shared, moe_router, moe_ids, moe_weights,
       moe_shared, moe_inject;
   q::MtpTrace spans;
-  explicit Trace(const q::Config& c)
+  explicit Trace(const q::Config& c, bool wide_inject = false)
       : norm(c.HcDim()),
         fused(c.HcDim()),
         attention(c.HcDim()),
@@ -65,7 +65,8 @@ struct Trace {
         moe_weights(c.num_experts_used),
         moe_shared(c.hidden_size),
         moe_inject(std::size_t{c.hc_count} *
-                   q::rocm::HcInjectPartsVec4(c.hidden_size)),
+                   (wide_inject ? q::rocm::HcInjectPartsVec4(c.hidden_size)
+                                : q::rocm::HcInjectParts(c.hidden_size))),
         spans{norm,      fused,       attention,  hidden,     head,
               ffn_input, ffn_output,  ffn_gate,   ffn_shared, moe_router,
               moe_ids,   moe_weights, moe_shared, moe_inject} {}
@@ -204,6 +205,32 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       Require(references[sequence]->MtpStep(mtp, token, initial, {}, &cpu.spans,
                                             &rope, &error, &gpu.spans),
               error);
+      // The device expands inject weights to F32, so this projection uses
+      // unquantized normalized activations even when the GGUF stores Q8_0.
+      std::vector<float> inject_norm(gpu.attention), inject(c.hc_count);
+      const auto* gamma = static_cast<const float*>(mtp.block.hc_ffn.norm.data);
+      for (std::uint32_t s = 0; s < c.hc_count; ++s)
+        q::cpu::RmsNorm(
+            std::span(inject_norm)
+                .subspan(std::size_t{s} * c.hidden_size, c.hidden_size),
+            gamma + std::size_t{s} * c.hidden_size, c.rms_eps);
+      q::cpu::MatVec(mtp.block.hc_ffn.inject, 0, inject_norm, inject);
+      const auto parts = q::rocm::HcInjectParts(c.hidden_size);
+      Require(gpu.moe_inject.size() == std::size_t{c.hc_count} * parts,
+              "scalar MTP trace omits inject partials");
+      std::vector<float> traced_inject(c.hc_count);
+      for (std::uint32_t s = 0; s < c.hc_count; ++s)
+        for (std::uint32_t p = 0; p < parts; ++p)
+          traced_inject[s] += gpu.moe_inject[std::size_t{s} * parts + p];
+      Compare(traced_inject, inject, "scalar-inject-trace", 2e-5);
+      std::vector<float> expected_carry(gpu.attention);
+      for (std::uint32_t s = 0; s < c.hc_count; ++s) {
+        const float scale = 2.0F * q::cpu::Sigmoid(inject[s] / c.hc_count);
+        for (std::uint32_t i = 0; i < c.hidden_size; ++i)
+          expected_carry[std::size_t{s} * c.hidden_size + i] +=
+              cpu.ffn_output[i] * scale;
+      }
+      Compare(cpu.hidden, expected_carry, "reference-f32-inject", 2e-6);
       initial = gpu.hidden;
       std::printf("MTP oracle sequence=%u step=%u image=%u\n", sequence, step,
                   sequence);
@@ -251,16 +278,27 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
         Require(candidates.ids[i] == ids[i] &&
                     candidates.logits[i] == all_logits[ids[i]],
                 "MTP candidates differ from full Q8 head");
-      // Direct table oracle: the full projection supplies each real row's
-      // score. A one-row prefix guarantees rare candidates without assuming
-      // anything about a generated continuation. Reverse table order between
-      // steps and replace a larger table to exercise stale-slot masking.
+      // Table rows use the full head; a Q8 head's prefix has its own Q4 copy.
+      // A one-row prefix guarantees rare candidates independently of text.
       Require(device.draft_output().rows == 1, "table oracle needs prefix=1");
+      std::vector<float> subset_logits(all_logits);
+      if (device.draft_output().data != device.output().data) {
+        auto* expert = arena.Make<std::int32_t>(1);
+        Hip(hipMemsetAsync(expert, 0, sizeof(*expert), stream));
+        Require(qfn_mmq_moe_vec(static_cast<int>(device.draft_output().type),
+                                device.draft_output().data, head_input, expert,
+                                logits, 1, c.hidden_size, 1, 1, 1, stream) == 0,
+                "draft prefix oracle projection failed");
+        Hip(hipMemcpyAsync(subset_logits.data(), logits, sizeof(float),
+                           hipMemcpyDeviceToHost, stream));
+        Hip(hipStreamSynchronize(stream));
+      }
       std::vector<std::int32_t> table(q::kMtpCandidates + 17);
       for (std::size_t i = 0; i < table.size(); ++i)
         table[i] = static_cast<std::int32_t>(
-            q::kMtpDraftVocab + (i * 7919 + step * 31 + sequence) %
-                                    (c.vocab_size - q::kMtpDraftVocab));
+            gufo::speculative::kDraftVocabPrefix +
+            (i * 7919 + step * 31 + sequence) %
+                (c.vocab_size - gufo::speculative::kDraftVocabPrefix));
       table.front() = c.vocab_size - 1;
       for (auto* session : {sessions[sequence].get(), serial[sequence].get()})
         Require(exec.AppendDraftRows(*session, 0, table, &error), error);
@@ -274,7 +312,7 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       std::vector<std::uint32_t> subset{0};
       subset.insert(subset.end(), table.begin(), table.end());
       std::stable_sort(subset.begin(), subset.end(), [&](auto a, auto b) {
-        return all_logits[a] > all_logits[b];
+        return subset_logits[a] > subset_logits[b];
       });
       const auto check_table = [&](const q::MtpCandidateLogits& actual,
                                    std::int32_t token) {
@@ -283,7 +321,7 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
                 "draft table argmax differs from full projection");
         for (std::size_t i = 0; i < actual.size; ++i)
           Require(actual.ids[i] == subset[i] &&
-                      actual.logits[i] == all_logits[subset[i]],
+                      actual.logits[i] == subset_logits[subset[i]],
                   "draft table IDs or scores differ from full projection");
       };
       for (const unsigned width : {1U, 2U}) {
@@ -496,7 +534,7 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
           Compare(actual, expected, stage, 0.0);
         }
       };
-      Trace full_row(c), tail_row(c);
+      Trace full_row(c, true), tail_row(c, true);
       q::MtpCandidateLogits expected, actual;
       Require(
           exec.MtpForward(*full, tokens, 0,
@@ -543,8 +581,8 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   }
   std::puts(
       "MTP oracle PASS: full-width norm, byte-exact split, attention, FFN "
-      "mix, FFN gate, FFN shared, FFN experts, recursive carry, "
-      "full-vocabulary head, image IDs and independent batches");
+      "mix, FFN gate, FFN shared, FFN experts, scalar inject trace, recursive "
+      "carry, full-vocabulary head, image IDs and independent batches");
 }
 
 // Model-level cost calibration. Restore identical real states for every

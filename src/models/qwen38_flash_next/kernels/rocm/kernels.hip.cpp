@@ -5740,10 +5740,11 @@ __launch_bounds__(256) __global__
   // The GSQ-RCO mixes: packed codes staged as int8 (the QuantSub16 codes)
   // with one (scale, -offset) pair per 16-element sub-block.
   constexpr bool kLowBit =
-      kType == WeightType::kQ2_0 || kType == WeightType::kIQ2_XXS ||
-      kType == WeightType::kIQ2_XS || kType == WeightType::kIQ2_S ||
-      kType == WeightType::kIQ3_XXS || kType == WeightType::kIQ3_S ||
-      kType == WeightType::kIQ4_NL || kType == WeightType::kIQ4_XS;
+      kType == WeightType::kQ5_0 || kType == WeightType::kQ2_0 ||
+      kType == WeightType::kIQ2_XXS || kType == WeightType::kIQ2_XS ||
+      kType == WeightType::kIQ2_S || kType == WeightType::kIQ3_XXS ||
+      kType == WeightType::kIQ3_S || kType == WeightType::kIQ4_NL ||
+      kType == WeightType::kIQ4_XS;
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
   // two nibble blocks are two, Q8_0's two byte blocks are four (and so are
   // the low-bit formats' two int8 sub-blocks).
@@ -6261,10 +6262,10 @@ __launch_bounds__(256) __global__
   }
 }
 
-// Wide routed down projection (Q5_1 / Q8_0 / Q2_0 / IQ4_NL weights, F16 rows
-// in and out) over 128-token tiles: RoutedF16GEMMKernel's arithmetic, laid
-// out like the paired gate/up waves. Each wave owns sixteen rows and keeps
-// their codes in registers; activations are the only LDS stage.
+// Wide routed down projection (Q5_0 / Q5_1 / Q8_0 / Q2_0 / IQ4_NL weights,
+// F16 rows in and out) over 128-token tiles: RoutedF16GEMMKernel's arithmetic,
+// laid out like the paired gate/up waves. Each wave owns sixteen rows and
+// keeps their codes in registers; activations are the only LDS stage.
 //
 // A gfx1151 WMMA reads the A operand of row r from one lane only: lane r for
 // even rows, lane r + 16 for odd ones (the other copy is ignored). So each
@@ -6299,8 +6300,9 @@ __launch_bounds__(256) __global__
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
   // The GSQ-RCO down formats: one (scale, -offset) pair per 16-element
   // sub-block, decoded from the family grid decoders in registers.
-  constexpr bool kLowBit =
-      kType == WeightType::kQ2_0 || kType == WeightType::kIQ4_NL;
+  constexpr bool kLowBit = kType == WeightType::kQ5_0 ||
+                           kType == WeightType::kQ2_0 ||
+                           kType == WeightType::kIQ4_NL;
   constexpr int kBlockBytes = kQ5 ? 24 : 34;
   // Activation stage: [kb][16-element quarter][token][16 B], as in
   // RoutedF16GEMMKernel, one padding slot per quarter plane.
@@ -6376,7 +6378,27 @@ __launch_bounds__(256) __global__
   const auto fetch_stage = [&]<int S>(int kb0) {
 #pragma unroll
     for (int b = 0; b < BK; ++b) {
-      if constexpr (kLowBit) {
+      if constexpr (kType == WeightType::kQ5_0) {
+        const int kb = kb0 + b;
+        if (kb < num_kb) {
+          const std::uint8_t* blk = w_row + kb * 22;
+          std::uint16_t d;
+          __builtin_memcpy(&d, blk, 2);
+          __builtin_memcpy(&w_high[S][b], blk + 2, 4);
+          __builtin_memcpy(&w_codes[S][b], blk + 6, 16);
+          w_head[S][b] =
+              row_live
+                  ? __builtin_bit_cast(
+                        std::uint32_t,
+                        __floats2half2_rn(
+                            __half2float(__builtin_bit_cast(__half, d)), -0.0F))
+                  : 0U;
+        } else {
+          w_high[S][b] = 0U;
+          w_codes[S][b] = make_uint4(0U, 0U, 0U, 0U);
+          w_head[S][b] = 0U;
+        }
+      } else if constexpr (kLowBit) {
         // This lane's own 16-element sub-block of the K32 block, with its
         // half-rounded (scale, -offset) pair.
         gufo::hip::QuantSub16 sub;
@@ -6416,7 +6438,10 @@ __launch_bounds__(256) __global__
   for (int j = 0; j < kTokTiles; ++j)
     acc[j] = v8f{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
 
-  constexpr float kMagic = kQ5 ? -1024.0F : -1152.0F;
+  // Q5_0's unsigned codes become the same signed values with 1040 instead
+  // of subtracting 16 from each byte before the usual 1152 conversion.
+  constexpr float kMagic =
+      kQ5 ? -1024.0F : (kType == WeightType::kQ5_0 ? -1040.0F : -1152.0F);
   const __half2 magic = __floats2half2_rn(kMagic, kMagic);
   const auto compute_stage = [&]<int S>() {
 #pragma unroll
@@ -6435,7 +6460,7 @@ __launch_bounds__(256) __global__
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         std::uint32_t nib;
-        if constexpr (kQ5) {
+        if constexpr (kQ5 || kType == WeightType::kQ5_0) {
           nib = ((words[i] >> (4U * f_c)) & 0x0F0F0F0FU) |
                 SpreadHighBits((w_high[S][kb] >> (16 * f_c + 4 * i)) & 0xFU);
         } else {
@@ -8713,6 +8738,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
   constexpr int kBK = 2;
   const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
   switch (type) {
+    case WeightType::kQ5_0:
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_0, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k);
+      return true;
     case WeightType::kQ4_K:
       if constexpr (BN > 48) {
         return false;
@@ -8811,6 +8842,7 @@ std::size_t RoutedF16BlockElems(WeightType type) {
     case WeightType::kIQ3_S:
     case WeightType::kIQ4_XS:
       return 256;
+    case WeightType::kQ5_0:
     case WeightType::kQ5_1:
     case WeightType::kQ8_0:
     case WeightType::kQ2_0:
@@ -8863,7 +8895,8 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
         return false;
       const dim3 grid(static_cast<unsigned int>((m + 127) / 128), n_tiles);
       const auto kernel =
-          type == WeightType::kQ5_1   ? RoutedDownF16Kernel<WeightType::kQ5_1>
+          type == WeightType::kQ5_0   ? RoutedDownF16Kernel<WeightType::kQ5_0>
+          : type == WeightType::kQ5_1 ? RoutedDownF16Kernel<WeightType::kQ5_1>
           : type == WeightType::kQ8_0 ? RoutedDownF16Kernel<WeightType::kQ8_0>
           : type == WeightType::kQ2_0 ? RoutedDownF16Kernel<WeightType::kQ2_0>
           : type == WeightType::kIQ4_NL

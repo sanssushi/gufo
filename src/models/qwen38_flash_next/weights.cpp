@@ -25,6 +25,8 @@ struct Format {
       return {1, 2};
     case GgmlType::kQ8_0:
       return {32, 34};
+    case GgmlType::kQ5_0:
+      return {32, 22};
     case GgmlType::kQ5_1:
       return {32, 24};
     case GgmlType::kIQ4_NL:
@@ -165,6 +167,12 @@ struct Binder {
         GgmlType::kQ2_0,  GgmlType::kIQ2_XXS, GgmlType::kIQ2_XS,
         GgmlType::kIQ2_S, GgmlType::kIQ3_XXS, GgmlType::kIQ3_S,
         GgmlType::kIQ4_XS};
+    const auto down_experts = {
+        GgmlType::kQ4_K,   GgmlType::kQ5_K,  GgmlType::kQ6_K,
+        GgmlType::kQ5_0,   GgmlType::kQ5_1,  GgmlType::kQ8_0,
+        GgmlType::kIQ4_NL, GgmlType::kQ2_0,  GgmlType::kIQ2_XXS,
+        GgmlType::kIQ2_XS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
+        GgmlType::kIQ3_S,  GgmlType::kIQ4_XS};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -228,7 +236,7 @@ struct Binder {
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,
                         c.num_experts, experts);
     l.ffn_down_exps = Get(p + "ffn_down_exps.weight", c.expert_ff, hidden,
-                          c.num_experts, experts);
+                          c.num_experts, down_experts);
     l.shexp_gate_inp = Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1,
                            {GgmlType::kF32, GgmlType::kBF16});
     l.shexp_gate =

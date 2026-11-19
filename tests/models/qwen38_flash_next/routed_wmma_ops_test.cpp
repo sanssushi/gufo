@@ -20,6 +20,12 @@
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
 
+constexpr auto kQ5_0 = q::WeightType::kQ5_0;
+static_assert(static_cast<std::uint32_t>(kQ5_0) ==
+              static_cast<std::uint32_t>(gufo::core::GgmlType::kQ5_0));
+static_assert(static_cast<std::uint32_t>(kQ5_0) ==
+              static_cast<std::uint32_t>(GGML_TYPE_Q5_0));
+
 // WeightType, core::GgmlType and the adapter's ggml_type share GGUF ids and
 // are bridged here by raw cast; every WeightType value is pinned against both
 // so the mirror cannot drift silently.
@@ -239,6 +245,30 @@ Experts MakeQ5K(std::size_t e, std::size_t m, std::size_t k,
   return w;
 }
 
+/// Random Q5_0 blocks, decoded independently with both signs of scale.
+Experts MakeQ5_0(std::size_t e, std::size_t m, std::size_t k,
+                 std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 22);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    auto* blk = w.packed.data() + b * 22;
+    const __half d = __float2half(Uniform(&seed, 0.03F));
+    std::memcpy(blk, &d, 2);
+    const std::uint32_t qh = NextRandom(&seed);
+    std::memcpy(blk + 2, &qh, 4);
+    for (int j = 0; j < 16; ++j)
+      blk[6 + j] = static_cast<std::uint8_t>(NextRandom(&seed));
+    for (int j = 0; j < 32; ++j) {
+      const int low = (blk[6 + j % 16] >> (j < 16 ? 0 : 4)) & 15;
+      const int code = low | (static_cast<int>((qh >> j) & 1U) << 4);
+      w.values[b * 32 + j] = __half2float(d) * static_cast<float>(code - 16);
+    }
+  }
+  return w;
+}
+
 /// Random Q5_1 blocks: d, m, 32 high bits, 16 packed low nibbles.
 Experts MakeQ5_1(std::size_t e, std::size_t m, std::size_t k,
                  std::uint32_t seed) {
@@ -339,13 +369,15 @@ Experts MakeQ8_0(std::size_t e, std::size_t m, std::size_t k,
 }
 
 std::size_t QuantBlockElements(q::WeightType type) {
-  return type == q::WeightType::kQ2_0     ? 64
-         : type == q::WeightType::kIQ4_NL ? 32
-                                          : 256;
+  return type == q::WeightType::kQ2_0                      ? 64
+         : type == q::WeightType::kIQ4_NL || type == kQ5_0 ? 32
+                                                           : 256;
 }
 
 std::size_t QuantBlockBytes(q::WeightType type) {
   switch (type) {
+    case kQ5_0:
+      return 22;
     case q::WeightType::kQ2_0:
     case q::WeightType::kIQ4_NL:
       return 18;
@@ -402,6 +434,8 @@ Experts MakeQuant(q::WeightType type, std::size_t e, std::size_t m,
 Experts MakeExperts(q::WeightType type, std::size_t e, std::size_t m,
                     std::size_t k, std::uint32_t seed) {
   switch (type) {
+    case kQ5_0:
+      return MakeQ5_0(e, m, k, seed);
     case q::WeightType::kQ4_K:
       return MakeQ4K(e, m, k, seed);
     case q::WeightType::kQ5_K:
@@ -417,6 +451,8 @@ Experts MakeExperts(q::WeightType type, std::size_t e, std::size_t m,
 
 const char* TypeName(q::WeightType type) {
   switch (type) {
+    case kQ5_0:
+      return "Q5_0";
     case q::WeightType::kQ4_K:
       return "Q4_K";
     case q::WeightType::kQ5_K:
@@ -609,7 +645,7 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   // Prefill pairs gate/up for buckets the separate 16- and 48-row tiles take,
   // on every format but the down-only Q5_1/Q8_0.
   if ((tile_rows == 16 || tile_rows == 48) && type != q::WeightType::kQ5_1 &&
-      type != q::WeightType::kQ8_0) {
+      type != q::WeightType::kQ8_0 && type != kQ5_0) {
     // Different gate/up weights, with the up scale small enough that these
     // deliberately large synthetic weights do not overflow the F16 output:
     // the paired SwiGLU writes silu(gate) * up in F16, so the up rows carry
@@ -878,7 +914,7 @@ bool OkQuantized(const Result& r) {
 Result RunLowBit(q::WeightType type, std::size_t n_tokens, std::size_t used,
                  std::size_t experts, std::size_t m, std::size_t k,
                  std::uint32_t seed) {
-  const Experts w = MakeQuant(type, experts, m, k, seed);
+  const Experts w = MakeExperts(type, experts, m, k, seed);
   const std::size_t slots = n_tokens * used;
   std::vector<std::int32_t> ids(slots);
   std::uint32_t state = seed ^ 0x5A5A5A5AU;
@@ -2082,6 +2118,16 @@ bool CheckPassRoutes(q::WeightType gate_type, q::WeightType down_type,
 
 int main() {
   try {
+    if (!OkQuantized(RunLowBit(kQ5_0, 17, 1, 8, 129, 640, 0x51500000U)))
+      throw std::runtime_error("Q5_0 routed vector/MMQ differs from reference");
+    for (const auto tile : {16U, 48U, 64U, 128U}) {
+      if (!Ok(Run(kQ5_0, 97, 1, 8, 129, 640, 0x51500001U, tile)))
+        throw std::runtime_error("Q5_0 routed F16 differs from reference");
+    }
+    CheckSiluDownMmq(kQ5_0);
+    CheckMoeWidthExact(kQ5_0, 136, 3, 8, 64, 640, 0x51500002U);
+    if (!CheckPassRoutes(q::WeightType::kIQ3_XXS, kQ5_0, nullptr, nullptr, 64))
+      throw std::runtime_error("mixed IQ3_XXS/Q5_0 pass routes differ");
     CheckGatedDecodeShape();
     bool routes = true;
     for (const auto gate : {q::WeightType::kQ4_K, q::WeightType::kQ5_K})

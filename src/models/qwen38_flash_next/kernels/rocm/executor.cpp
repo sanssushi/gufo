@@ -94,7 +94,7 @@ WeightType SmallType(GgmlType type) {
 }
 
 // The fused gate/up SwiGLU vector path covers every routed expert format
-// except Q5_1 (down projections only); the adapter owns that set.
+// except Q5_0 and Q5_1; the adapter owns that set.
 bool GatedMoeType(GgmlType type) {
   return qfn_mmq_moe_gated_type(static_cast<int>(type)) != 0;
 }

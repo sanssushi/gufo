@@ -86,6 +86,15 @@ void CheckExpertFormats() {
   Require(!Probe({{"blk.0.ffn_gate_exps.weight", GgmlType::kQ4_K},
                   {"blk.47.ffn_down_exps.weight", GgmlType::kQ2_K}}),
           "unsupported later expert missed after a supported expert");
+  Require(Probe({{"blk.0.ffn_down_exps.weight", GgmlType::kQ5_0},
+                 {"blk.1.ffn_gate_exps.weight", GgmlType::kIQ3_XXS},
+                 {"blk.8.ffn_down_exps.weight", GgmlType::kQ2_0},
+                 {"blk.47.ffn_up_exps.weight", GgmlType::kIQ4_XS}}),
+          "UD-IQ4_XS mixed expert formats declined");
+  Require(!Probe({{"blk.0.ffn_gate_exps.weight", GgmlType::kQ5_0}}),
+          "unimplemented Q5_0 gate format claimed");
+  Require(!Probe({{"blk.0.ffn_up_exps.weight", GgmlType::kQ5_0}}),
+          "unimplemented Q5_0 up format claimed");
 }
 
 void CheckIgnoredTensors() {

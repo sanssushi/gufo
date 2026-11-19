@@ -71,7 +71,7 @@ int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
                                hipStream_t stream);
 
 // Non-zero when qfn_mmq_moe_gated_vec supports this routed expert format:
-// every one except Q5_1 (down projections only).
+// every one except Q5_0 and Q5_1.
 int qfn_mmq_moe_gated_type(int weight_type);
 
 // Non-zero when qfn_mmq_moe_gated_vec groups a batch wider than eight rows by

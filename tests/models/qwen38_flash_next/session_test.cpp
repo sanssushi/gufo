@@ -411,7 +411,7 @@ void CheckUnalignedContinuationPasses(
     unaligned += position % ratio != 0;
     std::vector<std::size_t> ends;
     while (!second.prefill_complete()) {
-      position += second.Prefill(prompt.size()).consumed_tokens;
+      position += second.Prefill(model->PrefillCapacity()).consumed_tokens;
       Require(position == prompt.size() || position % ratio == 0,
               "capacity-limited prefill step ended off the selection block: " +
                   std::to_string(position));

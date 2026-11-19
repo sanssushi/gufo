@@ -42,6 +42,7 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
+  kQ5_0 = 6,
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
@@ -442,10 +443,10 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
-/// or 128 for the prefill down projection (Q5_1/Q8_0/Q2_0/IQ4_NL, F16 output
-/// and no `swiglu_gate`), and 64 for the GSQ low-bit formats. Every tile height
-/// gives each row the same bits. `RoutedF16Type` defines the accepted
-/// formats and their K block rules.
+/// or 128 for the prefill down projection (Q5_0/Q5_1/Q8_0/Q2_0/IQ4_NL,
+/// F16 output and no `swiglu_gate`), and 64 for the GSQ low-bit formats.
+/// Every tile height gives each row the same bits. `RoutedF16Type` defines the
+/// accepted formats and their K block rules.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
                    std::uint32_t tile_rows, const std::int32_t* pad_bounds,

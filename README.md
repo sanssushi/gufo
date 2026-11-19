@@ -1,10 +1,11 @@
 > [!NOTE]
-> This fork adds **GSQ-RCO** weight support for **Qwen3.8-Flash-Next**.
+> This fork adds **GSQ-RCO** and **UD-IQ4_XS** weight support for **Qwen3.8-Flash-Next**.
 >
-> Tested weights:
->
-> - ISTA-DASLab's [IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_S) (84 GB), [IQ3_XXS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS) (76 GB), and the corresponding [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) variant
-> - unsloth's [shared-Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) MTP model
+> | Weights | Download | Install |
+> | --- | --- | --- |
+> | ISTA-DASLab **IQ3_XXS** (76 GB) | [GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS), [MTP](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf), [mmproj](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-BF16.gguf) | `gufo model install qfn-iq3-xxs` |
+> | ISTA-DASLab **IQ3_S** (84 GB) | [GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_S), [MTP](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf), [mmproj](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-BF16.gguf) | `gufo model install qfn-iq3-s` |
+> | unsloth **UD-IQ4_XS** (94 GB) | [GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ4_XS), [MTP](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf), [mmproj](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/mmproj-BF16.gguf) | `gufo model install qfn-iq4-xs` |
 >
 > Branch `feat/gsq-rco` is kept rebased onto upstream `main`, so every sync rewrites its history. The solution is informed by [Aristo94/GSQHalo.cpp](https://github.com/Aristo94/GSQHalo.cpp).
 > For details, see [docs/internal/models/qwen3.8-flash-next/GSQ-RCO.md](docs/internal/models/qwen3.8-flash-next/GSQ-RCO.md).
