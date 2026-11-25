@@ -18,6 +18,7 @@
 // NgramTable::OpenEncoded with a decoder of the GGUF rows; a last load
 // builds the serving runner from the non-GGUF entry point.
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -67,6 +68,34 @@ struct Format {
 };
 
 struct Counters {
+  ~Counters() {
+    if (mixed_f32 != nullptr)
+      (void)hipHostFree(mixed_f32);
+    if (mixed_f16 != nullptr)
+      (void)hipHostFree(mixed_f16);
+  }
+
+  void PrepareMixed(std::size_t cols) {
+    mixed_cols = cols;
+    Require(hipHostMalloc(&mixed_f32, cols * sizeof(float)) == hipSuccess,
+            "allocate mixed F32 capture");
+    Require(hipHostMalloc(&mixed_f16, cols * sizeof(__half)) == hipSuccess,
+            "allocate mixed F16 capture");
+  }
+
+  bool MixedValid() const {
+    if (!mixed_checked || !mixed_copied || hipDeviceSynchronize() != hipSuccess)
+      return false;
+    for (std::size_t i = 0; i < mixed_cols; ++i) {
+      const float narrowed = __half2float(mixed_f16[i]);
+      if (!std::isfinite(mixed_f32[i]) ||
+          std::fabs(mixed_f32[i] - narrowed) >
+              0.02F + 0.002F * std::fabs(mixed_f32[i]))
+        return false;
+    }
+    return true;
+  }
+
   std::atomic<int> ngram_rows{0};
   mutable int native_context_reads{0};
   int validated{0};
@@ -80,6 +109,11 @@ struct Counters {
   int prompt_rows_missing{0};
   int moe_on_prompt_copy{0};
   int linear_with_layer{0};
+  float* mixed_f32{nullptr};
+  __half* mixed_f16{nullptr};
+  std::size_t mixed_cols{0};
+  bool mixed_checked{false};
+  bool mixed_copied{false};
 };
 
 enum class Mode { kNeutral, kRouting };
@@ -303,6 +337,19 @@ public:
   }
   bool MoeFfn(const fn::StageContext& ctx, const fn::MoeRouting& routing,
               const float* x, float* out) override {
+    if (c_.mixed_f32 != nullptr && !c_.mixed_checked &&
+        ctx.phase == fn::Phase::kPrompt && ctx.n_tokens >= 96) {
+      const auto cols = ctx.layer.tensor(fn::TensorId::kRouter).cols();
+      const auto* half =
+          static_cast<const __half*>(ctx.defaults.HalfRows(ctx, x, cols));
+      c_.mixed_checked = true;
+      c_.mixed_copied =
+          cols == c_.mixed_cols && half != nullptr &&
+          hipMemcpyAsync(c_.mixed_f32, x, cols * sizeof(float),
+                         hipMemcpyDeviceToHost, ctx.stream) == hipSuccess &&
+          hipMemcpyAsync(c_.mixed_f16, half, cols * sizeof(__half),
+                         hipMemcpyDeviceToHost, ctx.stream) == hipSuccess;
+    }
     if (ctx.phase == fn::Phase::kPrompt && Edited(ctx.layer.index()) &&
         ctx.layer.tensor(fn::TensorId::kRouter).data() != nullptr)
       ++c_.moe_on_prompt_copy;
@@ -445,6 +492,7 @@ int main() {
       source->draft_identity_.clear();
       // The runner's cache identities, resolved over this source.
       const auto identities = [&](const qfn::Model& loaded) {
+        c.PrepareMixed(loaded.config().hidden_size);
         std::string error;
         qfn::FlashNextCacheIdentities own;
         const std::string seed = loaded.ArtifactIdentity() + ":mtp";
@@ -486,6 +534,7 @@ int main() {
                 c.prompt_rows_missing == 0,
             "neutral,prompt_layer_hook");
       check(c.moe_on_prompt_copy > 0, "neutral,prompt_copy_layer_handle");
+      check(c.MixedValid(), "neutral,moe_f32_input");
       check(c.validated == 1, "neutral,config_validated");
       check(c.upload_walks_done == 2, "neutral,upload_done");
       check(c.ngram_rows.load() > 0, "neutral,encoded_ngram_rows");

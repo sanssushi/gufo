@@ -466,14 +466,53 @@ __global__ void HcMixEpilogueVec4Kernel(const XnT* xn, const float* gate,
     const std::size_t w = static_cast<std::size_t>(o) * hc_dim;
     float dot = 0.0F;
     if (i < hidden) {
+      if constexpr (std::is_same_v<XnT, float>) {
+        float4 q[kStreams];
 #pragma unroll
-      for (std::uint32_t s = 0; s < kStreams; ++s) {
-        const float4 q = InjectLoad4<kInjBf16>(
-            inject_w, w + static_cast<std::size_t>(s) * hidden + i);
-        dot = __fmaf_rn(q.x, v[s].x, dot);
-        dot = __fmaf_rn(q.y, v[s].y, dot);
-        dot = __fmaf_rn(q.z, v[s].z, dot);
-        dot = __fmaf_rn(q.w, v[s].w, dot);
+        for (std::uint32_t s = 0; s < kStreams; ++s)
+          q[s] = InjectLoad4<kInjBf16>(
+              inject_w, w + static_cast<std::size_t>(s) * hidden + i);
+        // Preserve the control model's compiled F32 inject order.
+        if (o < 3) {
+          dot = __fmul_rn(q[0].y, v[0].y);
+          dot = __fmaf_rn(q[0].x, v[0].x, dot);
+          dot = __fmaf_rn(q[0].z, v[0].z, dot);
+          dot = __fmaf_rn(q[0].w, v[0].w, dot);
+#pragma unroll
+          for (std::uint32_t s = 1; s < kStreams; ++s) {
+            dot = __fmaf_rn(q[s].x, v[s].x, dot);
+            dot = __fmaf_rn(q[s].y, v[s].y, dot);
+            dot = __fmaf_rn(q[s].z, v[s].z, dot);
+            dot = __fmaf_rn(q[s].w, v[s].w, dot);
+          }
+        } else {
+          dot = __fmul_rn(q[1].w, v[1].w);
+          dot = __fmaf_rn(q[0].w, v[0].w, dot);
+          dot = __fmaf_rn(q[2].w, v[2].w, dot);
+          dot = __fmaf_rn(q[3].w, v[3].w, dot);
+          dot = __fmaf_rn(q[1].y, v[1].y, dot);
+          dot = __fmaf_rn(q[0].y, v[0].y, dot);
+          dot = __fmaf_rn(q[2].y, v[2].y, dot);
+          dot = __fmaf_rn(q[3].y, v[3].y, dot);
+          dot = __fmaf_rn(q[1].z, v[1].z, dot);
+          dot = __fmaf_rn(q[0].z, v[0].z, dot);
+          dot = __fmaf_rn(q[2].z, v[2].z, dot);
+          dot = __fmaf_rn(q[3].z, v[3].z, dot);
+          dot = __fmaf_rn(q[1].x, v[1].x, dot);
+          dot = __fmaf_rn(q[0].x, v[0].x, dot);
+          dot = __fmaf_rn(q[2].x, v[2].x, dot);
+          dot = __fmaf_rn(q[3].x, v[3].x, dot);
+        }
+      } else {
+#pragma unroll
+        for (std::uint32_t s = 0; s < kStreams; ++s) {
+          const float4 q = InjectLoad4<kInjBf16>(
+              inject_w, w + static_cast<std::size_t>(s) * hidden + i);
+          dot = __fmaf_rn(q.x, v[s].x, dot);
+          dot = __fmaf_rn(q.y, v[s].y, dot);
+          dot = __fmaf_rn(q.z, v[s].z, dot);
+          dot = __fmaf_rn(q.w, v[s].w, dot);
+        }
       }
     }
     dot = WaveSum(dot);

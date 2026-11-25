@@ -4901,7 +4901,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
     // The K-quant/IQ projections and 16-bit alpha/beta/indexer matrices read
     // the same producer-written F16 rows as the Q8_0 stacks' F16 route.
-    const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+    const bool half_only = options_.stages == nullptr && WidePrefill(n) &&
+                           n <= options_.max_batch &&
                            ((l.linear && DenseF16Route(l.ssm_in, n) &&
                              l.ssm_alpha_beta.type == GgmlType::kF16 &&
                              l.ssm_alpha_beta.cols == l.ssm_in.cols) ||
@@ -4961,7 +4962,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // experts) and tiled Q8 rows (shared expert). The GSQ mixes' BF16
       // router and K-quant/IQ shared-expert pair read those same F16 rows.
       const bool no_f32 =
-          prefill_phase && defer_residual_ && rows <= options_.max_batch &&
+          options_.stages == nullptr && prefill_phase && defer_residual_ &&
+          rows <= options_.max_batch &&
           ((l.router.type == GgmlType::kF16 &&
             l.shexp_gate.type == GgmlType::kQ8_0 &&
             l.shexp_up.type == GgmlType::kQ8_0) ||

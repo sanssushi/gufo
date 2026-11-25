@@ -82,6 +82,8 @@ The executor uses permanent narrow scratch and demand-mapped wide scratch for
 lone prefill passes. Both sets reserve padded BF16 mixer norm rows when needed
 and share the fixed zero expert IDs used by decode. Wide scratch is released
 before decoding and when the runner becomes idle.
+Custom attention, SSM and MoE stages receive the F32 mixer output even when
+the default path can use F16 rows alone.
 
 ## Targets and artifacts
 
@@ -557,9 +559,10 @@ Three fused paths accept BF16 weights, where UD-Q4_K_XL stores Q8_0:
   following Q8_0 dense projection consumes it and `hidden <= max_q8_cols`.
   A GSQ upload without the Q8_0 MTP sidecar has `max_q8_cols == 0`, which
   is how the probe runs; chat attaches the sidecar automatically. The
-  epilogue's mix and inject FMAs are pinned with `__fmaf_rn`, because the
-  build uses `-ffast-math` and reassociation would break the
-  byte-exactness contracts.
+  epilogue's mix and inject operations are pinned because the build uses
+  `-ffast-math` and reassociation would break the byte-exactness contracts.
+  The F32 vec4 inject uses the control model's per-output accumulation order
+  for F32 and BF16 weights. F16-input paths retain their separate order.
 - The wide combine writes the next mixer's F16 norm for every consumer and
   its tiled Q8 copy only when that mixer's down projection is Q8_0; the GSQ
   BF16 down projections read the F16 norm. The decode combine writes the
@@ -643,13 +646,14 @@ Breaking any of them silently breaks session or audit replay.
 
 - Operator tests compare each type and role (dense, routed, paired, gated,
   head, embedding) exactly against F64 references computed by CPU
-  dequantization. The 29 `qwen38_flash_next.*` ctest suites are 18 HIP
+  dequantization. The 30 `qwen38_flash_next.*` ctest suites are 19 HIP
   suites — the 15 operator suites (`mtp_ops`, `blaslt_ops`, `hc_mix_ops`,
   `hc_route_ops`, `gdn_ops`, `attention_ops`, `moe_epilogue_ops`,
   `moe_ids_ops`, `ple_ops`, `projection_ops`, `routed_wmma_ops`, `select_ops`,
   `snapshot_copy`, `verification_sampling`, `wide_verification`) and
-  `decode_graph`, `in_pass_checkpoints` and `layered_prefill`, which check
-  graph replay, checkpoint frontiers and interleaved prefill — plus the CPU suites (`runner_options`, `config`,
+  `decode_graph`, `in_pass_checkpoints`, `layered_prefill` and `stage_seam`,
+  which check graph replay, checkpoint frontiers, interleaved prefill and
+  stage overrides — plus the CPU suites (`runner_options`, `config`,
   `continuation_layout`, `ngram`, `mtp_sampling`, `probe`, `prompt_lookup`,
   `rope_scaling`, `rope_scaling_oracle`, `weights`, `catalog`).
 - FMA and accumulation: every shared MMQ vector-dot accumulation is pinned
@@ -786,6 +790,10 @@ Breaking any of them silently breaks session or audit replay.
   padded down route is rejected below 1,024 tokens. `moe_epilogue_ops` pins
   the F16- and F32-expert MoE combines' padded norms against their packed
   form at 1,024 and 2,049 tokens.
+- F32 inject: `hc_mix_ops` checks unsaturated vec4 inputs against an
+  independent CPU reconstruction of each lane's rounded products and FMAs
+  and the wave reduction. The F32 and expanded-BF16 weights produce identical
+  partials when their values match.
 - Shared decode Q8_1 rows: `projection_ops` pins the prequantized dense
   entry byte-identical to the F32 entry for every adapter format at widths
   1-8, with output guards and the padded row stride. The attention output
@@ -901,7 +909,7 @@ From a clone with the iq3-xxs, iq3-s, iq4-xs and q4 GGUFs:
 ```sh
 # Tests (RelWithDebInfo + assertions)
 cmake --preset gpu-test && cmake --build --preset gpu-test
-ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 29 suites
+ctest --preset gpu-full -R '^qwen38_flash_next\.' --output-on-failure   # 30 suites
 ctest --preset gpu-full -R 'ggml_dequant_test|ggml_gemm_parity_test|qwen_gemm_route_test'
 # In-pass checkpoint suite (needs the model and MTP shard paths):
 QWEN38_FLASH_NEXT_MODEL=FIRST.gguf QWEN38_FLASH_NEXT_MTP_MODEL=MTP.gguf \
@@ -925,13 +933,21 @@ cmake --preset release && cmake --build --preset release   # -> build/release/gu
   drafts, `mtp` = real draft execution).
 - iq4-xs verification covers AR and MTP, session replay, in-pass checkpoints,
   the reference probe and `pp2048/tg128` at depths 0 and 32768.
+- The stage-seam test passes for iq3-xxs, q4 and iq4-xs, including tagged
+  routing and the F32 input supplied to custom stages.
+- For a 426-token q4 prompt and a fixed two-token continuation, both complete
+  logit rows match the control model byte for byte. Broader output parity
+  remains unqualified.
+- The iq3-xxs layered-prefill test has an intermittent exact log-probability
+  mismatch with three batched AR decoders. This case remains unqualified.
 
 ## Performance state
 
-The speed ratios below use AMD Strix Halo (`gfx1151`).
+The speed ratios below were measured on November 25, 2026, on AMD Strix Halo
+(`gfx1151`).
 Component measurements describe the measured shapes.
 
-As of November 2026, the benchmark setup is `gufo bench`, greedy,
+The benchmark setup is `gufo bench`, greedy,
 `-p 2048 -n 128 -d 0,32768 -r 1 -v`, single user. Depth (`d`) is the number
 of context tokens before generation;
 `tg128` is 128 generated tokens and `pp2048` is a 2048-token prompt.
@@ -946,18 +962,19 @@ All cells use four-target rounds.
 
 | Mode | Test | iq3-xxs vs q4 | iq3-s vs q4 | iq4-xs vs q4 |
 | --- | --- | ---: | ---: | ---: |
-| AR | pp2048, d0 | -7.01% | -7.28% | -7.45% |
-| AR | pp2048, d32768 | -5.98% | -6.73% | -5.87% |
-| AR | tg128, d0 | +22.10% | +13.92% | +30.83% |
-| AR | tg128, d32768 | +5.37% | -1.59% | +10.88% |
-| MTP | pp2048, d0 | -7.46% | -6.78% | -9.05% |
-| MTP | pp2048, d32768 | -5.72% | -6.45% | -6.07% |
-| MTP | tg128, d0 | +3.20% | -21.15% | -17.82% |
-| MTP | tg128, d32768 | +6.40% | -0.90% | +0.17% |
+| AR | pp2048, d0 | -6.53% | -6.79% | -6.76% |
+| AR | pp2048, d32768 | -6.14% | -6.61% | -5.71% |
+| AR | tg128, d0 | +18.26% | +10.26% | +24.78% |
+| AR | tg128, d32768 | +5.26% | -1.41% | +11.17% |
+| MTP | pp2048, d0 | -6.01% | -7.17% | -5.69% |
+| MTP | pp2048, d32768 | -5.29% | -5.92% | -5.27% |
+| MTP | tg128, d0 | -3.79% | -23.42% | +19.75% |
+| MTP | tg128, d32768 | +5.83% | -0.86% | -0.73% |
 
-MTP pp2048/d32768 q4/iq4-xs pairs measure 1467.04/1378.01 and
-1465.50/1301.59 tok/s. The AR depth-0 Q4 decode control is
-24.07 and 27.88 tok/s across the two rounds. Both cells vary across rounds.
+MTP pp2048/d32768 q4/iq3-xxs pairs measure 1471.16/1391.01 and
+1460.26/1382.94 tok/s. The AR depth-0 q4 decode control is 28.31 and
+25.14 tok/s; the MTP depth-0 q4 control is 58.94 and 58.62 tok/s. These
+cells vary across rounds.
 
 ### Decode
 

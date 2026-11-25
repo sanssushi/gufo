@@ -316,6 +316,82 @@ void CheckFusedInjectPartials(std::uint32_t tokens) {
   }
 }
 
+// The F32 vec4 inject preserves the control model's per-output FP32 order.
+// Inputs are unsaturated and the CPU reconstructs each lane and wave sum.
+void CheckF32InjectControl() {
+  constexpr std::uint32_t kRows = 3;
+  constexpr std::uint32_t kThreads = 256;
+  constexpr std::uint32_t kWave = 32;
+  constexpr std::uint32_t kFirstComponents[] = {1, 0, 2, 3};
+  constexpr std::uint32_t kLastStreams[] = {1, 0, 2, 3};
+  constexpr std::uint32_t kLastComponents[] = {3, 1, 2, 0};
+  const std::uint32_t parts = q::HcInjectPartsVec4(kHidden);
+  std::vector<float> xn(kRows * kStreams * kHidden), gate(xn.size());
+  std::vector<float> w(kStreams * kStreams * kHidden);
+  std::uint32_t seed = 0x51CE4321U;
+  const auto fill = [&](std::vector<float>& values, float scale) {
+    for (float& value : values)
+      value = scale *
+              static_cast<float>(static_cast<int>(NextRandom(&seed) & 0xFFFFU) -
+                                 32768) /
+              32768.0F;
+  };
+  fill(xn, 0.5F);
+  fill(gate, 2.0F);
+  fill(w, 0.1F);
+  HipBuffer<float> d_xn(xn.size()), d_gate(gate.size()), d_w(w.size());
+  HipBuffer<float> d_mixed(kRows * kHidden);
+  HipBuffer<float> d_inject(kRows * kStreams * parts);
+  Upload(&d_xn, xn);
+  Upload(&d_gate, gate);
+  Upload(&d_w, w);
+  q::HcMixEpilogueVec4(d_xn.get(), d_gate.get(), d_w.get(), d_mixed.get(),
+                       d_inject.get(), kRows, kHidden, kStreams, nullptr);
+  const auto actual = Download(&d_inject, kRows * kStreams * parts);
+  std::size_t mismatches = 0;
+  for (std::uint32_t t = 0; t < kRows; ++t) {
+    for (std::uint32_t o = 0; o < kStreams; ++o) {
+      for (std::uint32_t part = 0; part < parts; ++part) {
+        float lanes[kThreads]{};
+        for (std::uint32_t lane = 0; lane < kThreads; ++lane) {
+          const std::uint32_t col = (part * kThreads + lane) * 4;
+          if (col >= kHidden)
+            continue;
+          float dot = 0.0F;
+          for (std::uint32_t term = 0; term < 16; ++term) {
+            const std::uint32_t s = o < 3 ? term / 4 : kLastStreams[term % 4];
+            const std::uint32_t j =
+                o < 3 ? (term < 4 ? kFirstComponents[term] : term % 4)
+                      : kLastComponents[term / 4];
+            const std::size_t xi =
+                (static_cast<std::size_t>(t) * kStreams + s) * kHidden + col +
+                j;
+            const std::size_t wi =
+                (static_cast<std::size_t>(o) * kStreams + s) * kHidden + col +
+                j;
+            dot = std::fma(w[wi], xn[xi], dot);
+          }
+          lanes[lane] = dot;
+        }
+        float total = 0.0F;
+        for (std::uint32_t wave = 0; wave < kThreads; wave += kWave) {
+          for (std::uint32_t offset = 16; offset != 0; offset >>= 1)
+            for (std::uint32_t lane = 0; lane < offset; ++lane)
+              lanes[wave + lane] += lanes[wave + lane + offset];
+          total += lanes[wave];
+        }
+        const float got = actual[(t * kStreams + o) * parts + part];
+        mismatches += !std::isfinite(got) ||
+                      std::memcmp(&total, &got, sizeof(float)) != 0;
+      }
+    }
+  }
+  std::cout << "HC F32 inject control mismatches " << mismatches << " of "
+            << actual.size() << '\n';
+  if (mismatches != 0)
+    throw std::runtime_error("HC F32 inject differs from the control order");
+}
+
 std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
   std::vector<std::uint8_t> weights(blocks * 34);
   for (std::size_t block = 0; block < blocks; ++block) {
@@ -2003,6 +2079,7 @@ void CheckBatchedReadyQ8(std::uint32_t rows, bool inject, float scale) {
 
 int main() {
   try {
+    CheckF32InjectControl();
     for (std::uint32_t n = 1; n <= 8; ++n) {
       CheckFusedDecodeMixer(n, true);
     }
